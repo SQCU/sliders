@@ -1,106 +1,95 @@
-# Concept Sliders
-###  [Project Website](https://sliders.baulab.info) | [Arxiv Preprint](https://arxiv.org/pdf/2311.12092.pdf) | [Trained Sliders](https://sliders.baulab.info/weights/xl_sliders/) | [Colab Demo](https://colab.research.google.com/github/rohitgandikota/sliders/blob/main/demo_concept_sliders.ipynb) | [Huggingface Demo](https://huggingface.co/spaces/baulab/ConceptSliders) <br>
-Official code implementation of "Concept Sliders: LoRA Adaptors for Precise Control in Diffusion Models", European Conference on Computer Vision (ECCV 2024).
+# fractional visual semantic offsets and beyond: a messy extension of Concept Sliders
+###  [Upstream Project Website](https://sliders.baulab.info) | [Arxiv Preprint](https://arxiv.org/pdf/2311.12092.pdf) | <br>
+built from Official code implementation of "Concept Sliders: LoRA Adaptors for Precise Control in Diffusion Models", European Conference on Computer Vision (ECCV 2024).
 
-## 🎉 LATEST UPDATE: SliderSpace 🎉
-Experience the next evolution in concept sliders! **SliderSpace** automatically extracts hundreds of sliders from diffusion models' creative knowledge - no training required! Unlock unprecedented creativity with zero effort.  <br> 
-[Check out SliderSpace repo](https://github.com/baulab/sliderspace) 🚀🎨✨
-<div align='center'>
-<img src = 'images/main_figure.png'>
-</div>
-
-## Colab Demo
-Try out our colab demo here [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rohitgandikota/sliders/blob/main/demo_concept_sliders.ipynb)
-
-## FLUX Support 🚀🚀🚀
-You can train sliders for FLUX-1 models. Right now it is experimental! Please be patient if it doesn't work as good as SDXL. FLUX is not designed the same way as SDXL. <br>
-
-To play with flux sliders you need to update your packages. 
+## setup:
 ```
-pip install -r flux-sliders/flux-requirements.txt
+uv init
+uv venv
+#uv add torch torchvision torchaudio --index pytorch=https://download.pytorch.org/whl/cu124
+uv add https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl
+uv add setuptools
+uv add flash-attn==2.7.2.post1
+#MANUALLY OVERWRITE PYPROJECT.TOML WITH REAL INDEXES
+uv add torch torchvision torchaudio
+uv add -r requirements-loose.txt
+uv add bitsandbytes>=0.43.0
+uv add lycoris-lora?
 ```
+`uv run trainscripts/imagesliders/train_lora-scale-xl.py *args ...`
+if you know how to install uv, i trust you. i trust you to understand how to reach inside of the pyproject.toml and lockfile... and add the appropriate lines to use the right indices for bsd, apple-mps, linux, and even system-v. you're gonna make it. it's gonna be okay. 
 
-Now just open the notebook present in the folder `flux-sliders` and have fun! 
+remember that pyprojects and lockfiles are there to *increase* the scope of support and reproducibility of software projects, not to induce playground arguments about whether ALGOLS or LISPS are gonna be the machines of the future. 
 
-## UPDATE
-You can now use GPT-4 (or any other openAI model) to create prompts for your text sliders. All you need to do is describe what slider you want to create (e.g: "i want to make people look happy"). <br>
-Please refer to the [GPT-notebook](https://github.com/rohitgandikota/sliders/blob/main/GPT_prompt_helper.ipynb)
-
-## Setup
-To set up your python environment:
+## config: 
+edit f"config-xl-{your_experiment}.yaml" to:
 ```
-conda create -n sliders python=3.9
-conda activate sliders
-
-git  clone https://github.com/rohitgandikota/sliders.git
-cd sliders
-pip install -r requirements.txt
+network:
+  type: "c3lier" # or "c3lier" or "lierla"
+  rank: 64
+  alpha: 16.0
+  training_method: "noxattn"
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  iterations: 4000
+  lr: 0.00012
+  optimizer: "AdamW"
+  lr_scheduler: "cosine"  #or "constant" or "cosine"
+  max_denoising_steps: 850
 ```
-If you are running on Windows - please refer to these Windows setup guidelines [here](https://github.com/rohitgandikota/sliders/issues/27#issuecomment-1833572579)
-## Textual Concept Sliders
-### Training SD-1.x and SD-2.x LoRa
-To train an age slider - go to `train-scripts/textsliders/data/prompts.yaml` and edit the `target=person` and `positive=old person` and `unconditional=young person` (opposite of positive) and `neutral=person` and `action=enhance` with `guidance=4`. <br>
-If you do not want your edit to be targetted to person replace it with any target you want (eg. dog) or if you need it global replace `person` with `""`  <br>
-Finally, run the command:
+edit f"prompts-xl-dilora-{your_experiment}.yaml
+to be either:
 ```
-python trainscripts/textsliders/train_lora.py --attributes 'male, female' --name 'ageslider' --rank 4 --alpha 1 --config_file 'trainscripts/textsliders/data/config.yaml'
+- target: "" # what word for erasing the positive concept from
+  positive: "" # concept to erase
+  unconditional: "" # word to take the difference from the positive concept
+  neutral: "" # starting point for conditioning the target
+  action: "enhance" # erase or enhance
+  guidance_scale: 4
+  resolution: 1024
+  dynamic_resolution: false
+  batch_size: 1
 ```
-
-`--attributes` argument is used to disentangle concepts from the slider. For instance age slider makes all old people male (so instead add the `"female, male"` attributes to allow disentanglement)
-
-
-#### Evaluate 
-To evaluate your trained models use the notebook `SD1-sliders-inference.ipynb`
-
-
-### Training SD-XL
-To train sliders for SD-XL, use the script `train_lora_xl.py`. The setup is same as SDv1.4
-
+or
 ```
-python trainscripts/textsliders/train_lora_xl.py --attributes 'male, female' --name 'agesliderXL' --rank 4 --alpha 1 --config_file 'trainscripts/textsliders/data/config-xl.yaml'
+- target: f"{invariant in images}" # what word for erasing the positive concept from
+  positive: f"{invariant in images}, {thing ur varying on purpose}" # concept to erase
+  unconditional: f"{invariant in images}" # word to take the difference from the positive concept
+  neutral: f"{invariant in images}" # starting point for conditioning the target
+  action: f"enhance" # erase or enhance
+  guidance_scale: 4
+  resolution: 1024
+  dynamic_resolution: false
+  batch_size: 1
 ```
+datasets must be made of images with identical filenames spread across every folder you include in a list of argparse operands to `trainscripts/imagesliders/train_lora-scale-xl.py`
 
-#### Evaluate 
-To evaluate your trained models use the notebook `XL-sliders-inference.ipynb`
-
-
-## Visual Concept Sliders
-### Training SD-1.x and SD-2.x LoRa
-To train image based sliders, you need to create a ~4-6 pairs of image dataset (before/after edit for desired concept). Save the before images and after images separately. You can also create a dataset with varied intensity effect and save them differently. 
-
-To train an image slider for eye size - go to `train-scripts/imagesliders/data/config.yaml` and edit the `target=eye` and `itive='eye'` and `unconditional=''` and `neutral=eye` and `action=enhance` with `guidance=4`. <br>
-If you want the diffusion model to figure out the edit concept - leave `target, positive, unconditional, neutral` as `''`<br>
-Finally, run the command:
+refactoring *that* weird choice (to other sorts of datasets made of directed graphs) is a refactor so obvious and tempting we are totally refusing to do it. other deadlines press...
+our suggested training template:
 ```
-python trainscripts/imagesliders/train_lora-scale.py --name 'eyeslider' --rank 4 --alpha 1 --config_file 'trainscripts/imagesliders/data/config.yaml' --folder_main 'datasets/eyesize/' --folders 'bigsize, smallsize' --scales '1, -1' 
+--name 'sldr_dilora_frsht_robe_III' 
+--rank 96 --alpha 48 
+--config_file 'trainscripts/imagesliders/data/config-xl-{your_experiment}.yaml'
+--folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus, base_k' --scales 0.67, 1, 1.3, 2.0
 ```
-For this to work - you need to store your before images in `smallsize` and after images in `bigsize`. The corresponding paired files in both the folders should have same names. Both these subfolders should be under `datasets/eyesize`. Feel free to make your own datasets in your own named conventions.
-### Training SD-XL
-To train image sliders for SD-XL, use the script `train-lora-scale-xl.py`. The setup is same as SDv1.4
+the names are helpful clues for how to use this approach but are not necessary to program operation.
 
-```
-python trainscripts/imagesliders/train_lora-scale-xl.py --name 'eyesliderXL' --rank 4 --alpha 1 --config_file 'trainscripts/imagesliders/data/config-xl.yaml' --folder_main '/share/u/rohit/imageXLdataset/eyesize_data/'
-```
+the 'scales' *are* semantically meaningful: changing the interval between these numbers changes how the 'slider' learns to separate and fuse visual ideas in very definite ways.
 
-## Editing Real Images
-Concept sliders can be used to edit real images. We use null inversion to edit the images - instead of prompt, we use sliders! <br>
-Checkout - `demo_image_editing.ipynb` for mode details.
+argparse operands override everything that looks like a related parameter in the yaml config files. this is inherited from upstream. think of this as a bug-for-bug reproduction of the upstream sliders implementation, to make it more obvious how little *must* be changed to extend the behavior of this sort of loss function.
 
-## Running Gradio Demo Locally
-You can also run the HF hosted gradio slider tool (huge shoutout to gradio and HF team) locally using the following scripts
-```
-git lfs install
-git clone https://huggingface.co/spaces/baulab/ConceptSliders
-cd ConceptSliders
-pip install requirements.txt
-python app.py
-```
-For more inference time gradio demos please refer to Cameduru's repo [here](https://github.com/camenduru/sliders-colab)
+## eval and inference:
+if you use comfyui i am very sorry and i hope you recover, someday, somehow.
+maybe if just 12 more video essayists and 3 more dormant non-programmer patreons pick up your preferred 'workflow' you'll finally figure out the obvious and very smart deployment case that makes your text2image so unique and interesting and different from everyone else's all this time...?
 
-## Running with ControlNet Integration
-Our user community is amazing! Here is the resource that integrates ControlNet: https://github.com/rohitgandikota/sliders/issues/76#issuecomment-2099766893
-## Citing our work
-The preprint can be cited as follows
+for everyone else: the `dynamic prompts` extension to the automatic-like webuis supports really easy scripting.
+`{<slider:0>|<slider:0.8>|<slider:1.1>|<slider:2.7>} w/ fixed seeds and combinatorial generation will make it very easy to sample your 'fractional differences' & explore the transitions between slider-multiplier-conditioned model behavior. 
+
+if you are rolling your own inference, this is even easier! i think i've said it all with 'combinatorial generation and fixed seeds', haven't i?
+
+## Citing the upstream work:
+The upstream's preprint can be cited as follows
 ```
 @inproceedings{gandikota2023erasing,
   title={Erasing Concepts from Diffusion Models},
@@ -110,3 +99,6 @@ The preprint can be cited as follows
   year={2024}
 }
 ```
+
+## citing this work:
+huh?
