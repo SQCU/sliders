@@ -20,8 +20,8 @@ UNET_TARGET_REPLACE_MODULE_CONV = [
     "ResnetBlock2D",
     "Downsample2D",
     "Upsample2D",
-    #     "DownBlock2D",
-    #     "UpBlock2D"
+    #"DownBlock2D",
+    #"UpBlock2D"
 ]  # locon, 3clier
 
 LORA_PREFIX_UNET = "lora_unet"
@@ -119,12 +119,16 @@ class LoRANetwork(nn.Module):
         multiplier: float = 1.0,
         alpha: float = 1.0,
         train_method: TRAINING_METHODS = "full",
+        target_replace = DEFAULT_TARGET_REPLACE,
     ) -> None:
         super().__init__()
         self.lora_scale = 1
         self.multiplier = multiplier
         self.lora_dim = rank
         self.alpha = alpha
+        self.messageblast = None
+        self.messagebuf = None
+        self.target_replace = target_replace
 
         # LoRAのみ
         self.module = LoRAModule
@@ -133,7 +137,7 @@ class LoRANetwork(nn.Module):
         self.unet_loras = self.create_modules(
             LORA_PREFIX_UNET,
             unet,
-            DEFAULT_TARGET_REPLACE,
+            self.target_replace,
             self.lora_dim,
             self.multiplier,
             train_method=train_method,
@@ -215,7 +219,7 @@ class LoRANetwork(nn.Module):
 #         print(f'@@@@@@@@@@@@@@@@@@@@@@@@@@@@ \n {names}')
         return loras
 
-    def prepare_optimizer_params(self):
+    def prepare_optimizer_params(self,lr=None):
         all_params = []
 
         if self.unet_loras:  # 実質これしかない
@@ -248,8 +252,19 @@ class LoRANetwork(nn.Module):
         self.lora_scale = scale
 
     def __enter__(self):
+        if self.messageblast is None:
+            self.messageblast = 0
+
         for lora in self.unet_loras:
+            if self.messageblast <= 16:
+                printstr =f"__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:{lora.multiplier}*{self.lora_scale}"
+                if self.messagebuf != printstr:
+                    self.messagebuf = printstr
+                    mblast = f"mblast{self.messageblast}/16"
+                    print(printstr+mblast)
+                    self.messageblast +=1
             lora.multiplier = 1.0 * self.lora_scale
+
 
     def __exit__(self, exc_type, exc_value, tb):
         for lora in self.unet_loras:

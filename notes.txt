@@ -1,0 +1,44 @@
+notes.txt
+
+uv init
+uv venv
+#uv add torch torchvision torchaudio --index pytorch=https://download.pytorch.org/whl/cu124
+uv add https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl
+uv add setuptools
+uv add flash-attn==2.7.2.post1
+#MANUALLY OVERWRITE PYPROJECT.TOML WITH REAL INDEXES
+uv add torch torchvision torchaudio
+uv add -r requirements-loose.txt
+uv add bitsandbytes>=0.43.0
+uv add lycoris-lora?
+
+python trainscripts/imagesliders/train_lora-scale.py --name 'eyeslider' --rank 4 --alpha 1 --config_file 'trainscripts/imagesliders/data/config.yaml' --folder_main 'datasets/eyesize/' --folders 'bigsize, smallsize' --scales '1, -1' 
+
+#xl trial run
+#wow that was hard.
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'IL' --rank 4 --alpha 1 --config_file 'trainscripts/imagesliders/data/config-xl-IL.yaml' --folder_main 'datasets/IL/' --folders 'before, after' --scales '1, -1' 
+
+#using 5 gets 'error index 0 is out of bounds for axis 0 with size 0'
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'slider_a4' --rank 16 --alpha 4 --config_file 'trainscripts/imagesliders/data/config-xl-IL.yaml' --folder_main 'datasets/trls/' --folders '1, 0,-1,-3' --scales '1, 0,-1,-3' 
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'slider_a4' --rank 16 --alpha 4 --config_file 'trainscripts/imagesliders/data/config-xl-IL.yaml' --folder_main 'datasets/trls/' --folders '1, 0,-1,-2,-3' --scales '1, 0,-2,-1,-3'
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'slider_a4_psr' --rank 16 --alpha 4 --config_file 'trainscripts/imagesliders/data/config-xl-psr.yaml' --folder_main 'datasets/trls/' --folders '1, 0,-1,-2,-3' --scales '1, 0,-2,-1,-3'
+
+
+#non-alt is better.
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'sldr_dilora_frsht_robe' --rank 32 --alpha 8 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus,base_k' --scales '0.5, 1, 1.5, 2'
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'sldr_dilora_alt_frsht_robe' --rank 32 --alpha 8 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus,base_k' --scales '1, 2, 3, 4'
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'sldr_dilora_alt2_frsht_robe' --rank 32 --alpha 8 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one, base_one_plus,base_k' --scales '1, 3, 4'
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'sldr_dilora_bracket' --rank 32 --alpha 8 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales '0, 1, 2'
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'sldr_dilora_bracket_III' --rank 32 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales '0, 1, 2'
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'sldr_dilora_bracket_VI' --rank 32 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales '0, 1, 2'
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'sldr_dilora_bracket_VII' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales '1, 2, 3'
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'sldr_diglora_bracket_VII' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-diglora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales '1, 2, 3'
+#first diglora is a dud. maybe set_multiplier(0) broke it. dunno.
+#removing that is still a dud. try later.
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'sldr_dilora_bracket_VIII' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales 0, 1, 2
+#fixing nparray argparse stuff didn't make regular loras a dud.

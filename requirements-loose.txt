@@ -1,0 +1,25 @@
+#bitsandbytes
+dadaptation
+diffusers
+ipython
+lion_pytorch
+lpips
+matplotlib
+numpy
+opencv_python
+opencv_python_headless
+pandas
+Pillow
+prodigyopt
+pydantic
+PyYAML
+Requests
+safetensors
+#dont put these in requirements i beg you
+#torch
+#torchvision
+tqdm
+transformers
+wandb
+#xformers==0.0.21
+accelerate

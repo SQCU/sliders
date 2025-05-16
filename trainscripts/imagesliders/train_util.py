@@ -6,7 +6,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import UNet2DConditionModel, SchedulerMixin
 from diffusers.image_processor import VaeImageProcessor
 from model_util import SDXL_TEXT_ENCODER_TYPE
-from diffusers.utils import randn_tensor
+from diffusers.utils.torch_utils import randn_tensor
 
 from tqdm import tqdm
 
@@ -211,9 +211,9 @@ def get_noisy_image(
 ):
     # latents_steps = []
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
-    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor,do_convert_rgb=True)
 
-    image = img
+    image = img#.convert('RGB')
     im_orig = image
     device = vae.device
     image = image_processor.preprocess(image).to(device)

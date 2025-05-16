@@ -55,6 +55,11 @@ class LoggingConfig(BaseModel):
 
 class OtherConfig(BaseModel):
     use_xformers: bool = False
+    use_pytorch_SDPA: bool = True
+    torch_compile: bool = False
+    lycorisize:bool = False
+    gradient_checkpointing: bool = False
+    torch_amp: bool = False
 
 
 class RootConfig(BaseModel):

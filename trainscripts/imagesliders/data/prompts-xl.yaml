@@ -122,9 +122,9 @@
   neutral: "" # starting point for conditioning the target
   action: "enhance" # erase or enhance
   guidance_scale: 4
-  resolution: 512
+  resolution: 1024
   dynamic_resolution: false
-  batch_size: 1
+  batch_size: 2
 ####################################################################################################### IMAGE SLIDER
 # - target: "food" # what word for erasing the positive concept from
 #   positive: "food, expensive and fine dining" # concept to erase
