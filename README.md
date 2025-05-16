@@ -66,6 +66,7 @@ or
 datasets must be made of images with identical filenames spread across every folder you include in a list of argparse operands to `trainscripts/imagesliders/train_lora-scale-xl.py`
 
 refactoring *that* weird choice (to other sorts of datasets made of directed graphs) is a refactor so obvious and tempting we are totally refusing to do it. other deadlines press...
+
 our suggested training template:
 ```
 --name 'sldr_dilora_frsht_robe_III' 
