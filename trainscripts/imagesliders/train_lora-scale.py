@@ -2,6 +2,8 @@
 # - https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L566
 # - https://huggingface.co/spaces/baulab/Erasing-Concepts-In-Diffusion/blob/main/train.py
 
+# Written by Gemini 2.5, under review
+
 from typing import List, Optional
 import argparse
 import ast
@@ -11,6 +13,7 @@ import gc
 import torch
 from tqdm import tqdm
 import os, glob
+from torchvision import transforms
 
 from lora import LoRANetwork, DEFAULT_TARGET_REPLACE, UNET_TARGET_REPLACE_MODULE_CONV
 import train_util
@@ -24,19 +27,11 @@ import random
 import numpy as np
 import wandb
 from PIL import Image
+from data_preprocessing import create_dataloader
 
 def flush():
     torch.cuda.empty_cache()
     gc.collect()
-def prev_step(model_output, timestep, scheduler, sample):
-    prev_timestep = timestep - scheduler.config.num_train_timesteps // scheduler.num_inference_steps
-    alpha_prod_t =scheduler.alphas_cumprod[timestep]
-    alpha_prod_t_prev = scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else scheduler.final_alpha_cumprod
-    beta_prod_t = 1 - alpha_prod_t
-    pred_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
-    pred_sample_direction = (1 - alpha_prod_t_prev) ** 0.5 * model_output
-    prev_sample = alpha_prod_t_prev ** 0.5 * pred_original_sample + pred_sample_direction
-    return prev_sample
 
 def train(
     config: RootConfig,
@@ -46,9 +41,12 @@ def train(
     folders,
     scales,
 ):
-    scales = np.array(scales)
-    folders = np.array(folders)
-    scales_unique = list(scales)
+    # Create the dataloader
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+    ])
+    dataloader = create_dataloader(folder_main, folders, scales, config.train.batch_size, transform)
 
     metadata = {
         "prompts": ",".join([prompt.json() for prompt in prompts]),
@@ -84,7 +82,7 @@ def train(
     unet.requires_grad_(False)
     unet.eval()
     
-    vae.to(device)
+    vae.to(device, dtype=weight_dtype)
     vae.requires_grad_(False)
     vae.eval()
 
@@ -97,7 +95,6 @@ def train(
     ).to(device, dtype=weight_dtype)
 
     optimizer_module = train_util.get_optimizer(config.train.optimizer)
-    #optimizer_args
     optimizer_kwargs = {}
     if config.train.optimizer_args is not None and len(config.train.optimizer_args) > 0:
         for arg in config.train.optimizer_args.split(" "):
@@ -118,7 +115,6 @@ def train(
     for settings in prompts:
         print(settings)
 
-    # debug
     debug_util.check_requires_grad(network)
     debug_util.check_training_mode(network)
 
@@ -134,7 +130,6 @@ def train(
                 settings.neutral,
                 settings.unconditional,
             ]:
-                print(prompt)
                 if isinstance(prompt, list):
                     if prompt == settings.positive:
                         key_setting = 'positive'
@@ -171,176 +166,42 @@ def train(
 
     pbar = tqdm(range(config.train.iterations))
     for i in pbar:
-        with torch.no_grad():
-            noise_scheduler.set_timesteps(
-                config.train.max_denoising_steps, device=device
-            )
-
-            optimizer.zero_grad()
+        optimizer.zero_grad()
+        
+        for (img1_batch, scale1_batch), (img2_batch, scale2_batch) in dataloader:
+            img1_batch = img1_batch.to(device, dtype=weight_dtype)
+            img2_batch = img2_batch.to(device, dtype=weight_dtype)
 
             prompt_pair: PromptEmbedsPair = prompt_pairs[
                 torch.randint(0, len(prompt_pairs), (1,)).item()
             ]
 
-            # 1 ~ 49 からランダム
-            timesteps_to = torch.randint(
-                1, config.train.max_denoising_steps-1, (1,)
-#                 1, 25, (1,)
-            ).item()
-
-            height, width = (
-                prompt_pair.resolution,
-                prompt_pair.resolution,
+            loss_high, loss_low = superfunctional_train_step(
+                unet,
+                vae,
+                noise_scheduler,
+                (img1_batch, img2_batch),
+                (scale1_batch, scale2_batch),
+                (prompt_pair.positive, prompt_pair.neutral),
+                prompt_pair,
+                config,
+                network,
+                criteria,
+                device,
+                weight_dtype,
             )
-            if prompt_pair.dynamic_resolution:
-                height, width = train_util.get_random_resolution_in_bucket(
-                    prompt_pair.resolution
+            
+            loss = loss_high + loss_low
+            
+            pbar.set_description(f"Loss*1k: {loss.item()*1000:.4f}")
+            if config.logging.use_wandb:
+                wandb.log(
+                    {"loss": loss, "iteration": i, "lr": lr_scheduler.get_last_lr()[0]}
                 )
 
-            if config.logging.verbose:
-                print("guidance_scale:", prompt_pair.guidance_scale)
-                print("resolution:", prompt_pair.resolution)
-                print("dynamic_resolution:", prompt_pair.dynamic_resolution)
-                if prompt_pair.dynamic_resolution:
-                    print("bucketed resolution:", (height, width))
-                print("batch_size:", prompt_pair.batch_size)
-
-            
-            
-            
-            scale_to_look = abs(random.choice(list(scales_unique)))
-            folder1 = folders[scales==-scale_to_look][0]
-            folder2 = folders[scales==scale_to_look][0]
-            
-            ims = os.listdir(f'{folder_main}/{folder1}/')
-            ims = [im_ for im_ in ims if '.png' in im_ or '.jpg' in im_ or '.jpeg' in im_ or '.webp' in im_]
-            random_sampler = random.randint(0, len(ims)-1)
-
-            img1 = Image.open(f'{folder_main}/{folder1}/{ims[random_sampler]}').resize((256,256))
-            img2 = Image.open(f'{folder_main}/{folder2}/{ims[random_sampler]}').resize((256,256))
-            
-            seed = random.randint(0,2*15)
-            
-            generator = torch.manual_seed(seed)
-            denoised_latents_low, low_noise = train_util.get_noisy_image(
-                img1,
-                vae,
-                generator,
-                unet,
-                noise_scheduler,
-                start_timesteps=0,
-                total_timesteps=timesteps_to)
-            denoised_latents_low = denoised_latents_low.to(device, dtype=weight_dtype)
-            low_noise = low_noise.to(device, dtype=weight_dtype)
-            
-            generator = torch.manual_seed(seed)
-            denoised_latents_high, high_noise = train_util.get_noisy_image(
-                img2,
-                vae,
-                generator,
-                unet,
-                noise_scheduler,
-                start_timesteps=0,
-                total_timesteps=timesteps_to)
-            denoised_latents_high = denoised_latents_high.to(device, dtype=weight_dtype)
-            high_noise = high_noise.to(device, dtype=weight_dtype)
-            noise_scheduler.set_timesteps(1000)
-
-            current_timestep = noise_scheduler.timesteps[
-                int(timesteps_to * 1000 / config.train.max_denoising_steps)
-            ]
-
-            # with network: の外では空のLoRAのみが有効になる
-            high_latents = train_util.predict_noise(
-                unet,
-                noise_scheduler,
-                current_timestep,
-                denoised_latents_high,
-                train_util.concat_embeddings(
-                    prompt_pair.unconditional,
-                    prompt_pair.positive,
-                    prompt_pair.batch_size,
-                ),
-                guidance_scale=1,
-            ).to("cpu", dtype=torch.float32)
-            # with network: の外では空のLoRAのみが有効になる
-            low_latents = train_util.predict_noise(
-                unet,
-                noise_scheduler,
-                current_timestep,
-                denoised_latents_low,
-                train_util.concat_embeddings(
-                    prompt_pair.unconditional,
-                    prompt_pair.unconditional,
-                    prompt_pair.batch_size,
-                ),
-                guidance_scale=1,
-            ).to("cpu", dtype=torch.float32)
-            if config.logging.verbose:
-                print("positive_latents:", positive_latents[0, 0, :5, :5])
-                print("neutral_latents:", neutral_latents[0, 0, :5, :5])
-                print("unconditional_latents:", unconditional_latents[0, 0, :5, :5])
-        
-        network.set_lora_slider(scale=scale_to_look)
-        with network:
-            target_latents_high = train_util.predict_noise(
-                unet,
-                noise_scheduler,
-                current_timestep,
-                denoised_latents_high,
-                train_util.concat_embeddings(
-                    prompt_pair.unconditional,
-                    prompt_pair.positive,
-                    prompt_pair.batch_size,
-                ),
-                guidance_scale=1,
-            ).to("cpu", dtype=torch.float32)
-            
-            
-        high_latents.requires_grad = False
-        low_latents.requires_grad = False
-        
-        loss_high = criteria(target_latents_high, high_noise.cpu().to(torch.float32))
-        pbar.set_description(f"Loss*1k: {loss_high.item()*1000:.4f}")
-        loss_high.backward()
-        
-        
-        network.set_lora_slider(scale=-scale_to_look)
-        with network:
-            target_latents_low = train_util.predict_noise(
-                unet,
-                noise_scheduler,
-                current_timestep,
-                denoised_latents_low,
-                train_util.concat_embeddings(
-                    prompt_pair.unconditional,
-                    prompt_pair.neutral,
-                    prompt_pair.batch_size,
-                ),
-                guidance_scale=1,
-            ).to("cpu", dtype=torch.float32)
-            
-            
-        high_latents.requires_grad = False
-        low_latents.requires_grad = False
-        
-        loss_low = criteria(target_latents_low, low_noise.cpu().to(torch.float32))
-        pbar.set_description(f"Loss*1k: {loss_low.item()*1000:.4f}")
-        loss_low.backward()
-        
-        ## NOTICE NO zero_grad between these steps (accumulating gradients) 
-        #following guidelines from Ostris (https://github.com/ostris/ai-toolkit)
-        
-        optimizer.step()
-        lr_scheduler.step()
-
-        del (
-            high_latents,
-            low_latents,
-            target_latents_low,
-            target_latents_high,
-        )
-        flush()
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
 
         if (
             i % config.save.per_steps == 0
@@ -371,6 +232,7 @@ def train(
     flush()
 
     print("Done.")
+
 
 
 def main(args):
