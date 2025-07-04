@@ -18,7 +18,8 @@ $Env:TORCH_CUDA_ARCH_LIST = "8.9"
 .venv\scripts\activate
 #if you're stuck on a 4090, this is the only compute capability you can use
 #expect like 30 minutes of total saturation of 7/8 cores on a 7800x3d.
-uv pip install flash-attn==2.7.2.post1 --no-build-isolation
+uv pip install flash-attn==2.7.2.post1 --no-cache-dir --no-build-isolation
+#??? now we need no-cache-dir since we start from a real pyproject.toml???
 #MANUALLY OVERWRITE PYPROJECT.TOML WITH REAL INDEXES
 uv add torch torchvision torchaudio
 uv add -r requirements-loose.txt

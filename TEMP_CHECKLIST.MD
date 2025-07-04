@@ -8,6 +8,13 @@ This checklist summarizes the issues that need to be addressed to improve the pe
     *   [ ] Replace `get_random_resolution_in_bucket()` with a fixed resolution or a pre-defined set of resolutions that can be batched together.
     *   [ ] Ensure that all tensors passed to the UNet have static shapes.
 *   [ ] **Minimize CPU/GPU Synchronization:**
+    *   [ ] **Fix `refactored_training_loop.py` execution:**
+        *   [ ] **Immediate:** Correct `superfunctional_train_step` to use `predict_noise_xl` with `add_time_ids`.
+            *   [ ] Run `uv run python F:/dox/ai/gemmy/sliders/refactored_training_loop.py > refactored_training_loop_test.log 2>&1`.
+            *   [ ] Review `refactored_training_loop_test.log` for errors.
+            *   [ ] Manually apply necessary code changes based on the error.
+        *   [ ] **Intermediate:** Ensure `refactored_training_loop.py` runs without errors.
+        *   [ ] **Final:** Verify refactored loops are float-for-float identical to original.
     *   [ ] Keep all tensors on the GPU as much as possible.
     *   [ ] Move loss calculation to the GPU.
     *   [ ] Remove unnecessary `.to("cpu")` calls.

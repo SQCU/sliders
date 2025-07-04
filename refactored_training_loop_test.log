@@ -1,0 +1,25 @@
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 17001.23it/s]
+Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.62it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.18it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.86it/s]
+create LoRA for U-Net: 280 modules.
+[{'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False, 'batch_size': 1}]
+[{'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False, 'batch_size': 1}]
+1 1
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:1.0*1.0mblast0/16
+Traceback (most recent call last):
+  File "F:\dox\ai\gemmy\sliders\refactored_training_loop.py", line 330, in <module>
+    test_refactored_training_loop()
+  File "F:\dox\ai\gemmy\sliders\refactored_training_loop.py", line 200, in test_refactored_training_loop
+    loss_high_orig, loss_low_orig = original_train_step(
+  File "F:\dox\ai\gemmy\sliders\refactored_training_loop.py", line 296, in original_train_step
+    target_latents_high = train_util.predict_noise(
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\train_util.py", line 160, in predict_noise
+    noise_pred = unet(
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\diffusers\models\unets\unet_2d_condition.py", line 1150, in forward
+    aug_emb = self.get_aug_embed(
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\diffusers\models\unets\unet_2d_condition.py", line 968, in get_aug_embed
+    if "text_embeds" not in added_cond_kwargs:
+TypeError: argument of type 'NoneType' is not iterable

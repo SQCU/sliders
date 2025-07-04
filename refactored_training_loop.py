@@ -6,7 +6,8 @@ import os
 import random
 
 # Assuming the following files are in the same directory
-from trainscripts.imagesliders import train_util, model_util, config_util, lora
+from trainscripts.imagesliders import train_util, model_util, config_util, lora, prompt_util
+from trainscripts.imagesliders.prompt_util import PromptEmbedsXL
 
 def functional_train_step(
     unet,
@@ -21,6 +22,7 @@ def functional_train_step(
     criteria,
     device,
     weight_dtype,
+    add_time_ids,
 ):
     """
     A functional and batch-oriented training step.
@@ -62,16 +64,14 @@ def functional_train_step(
     # High scale
     network.set_lora_slider(scale=scale_to_look)
     with network:
-        target_latents_high = train_util.predict_noise(
+        target_latents_high = train_util.predict_noise_xl(
             unet,
             noise_scheduler,
             current_timestep,
             denoised_latents_high,
-            train_util.concat_embeddings(
-                prompt_pair.unconditional,
-                prompt_pair.positive,
-                prompt_pair.batch_size,
-            ),
+            prompt_pair.positive.text_embeds,
+            prompt_pair.positive.pooled_embeds,
+            add_time_ids,
             guidance_scale=1,
         )
     loss_high = criteria(target_latents_high, high_noise)
@@ -79,16 +79,14 @@ def functional_train_step(
     # Low scale
     network.set_lora_slider(scale=-scale_to_look)
     with network:
-        target_latents_low = train_util.predict_noise(
+        target_latents_low = train_util.predict_noise_xl(
             unet,
             noise_scheduler,
             current_timestep,
             denoised_latents_low,
-            train_util.concat_embeddings(
-                prompt_pair.unconditional,
-                prompt_pair.neutral,
-                prompt_pair.batch_size,
-            ),
+            prompt_pair.neutral.text_embeds,
+            prompt_pair.neutral.pooled_embeds,
+            add_time_ids,
             guidance_scale=1,
         )
     loss_low = criteria(target_latents_low, low_noise)
@@ -109,6 +107,7 @@ def superfunctional_train_step(
     criteria,
     device,
     weight_dtype,
+    add_time_ids,
 ):
     """
     A more functional and compact training step that processes high and low cases concurrently.
@@ -135,16 +134,14 @@ def superfunctional_train_step(
 
         network.set_lora_slider(scale=scale)
         with network:
-            target_latents = train_util.predict_noise(
+            target_latents = train_util.predict_noise_xl(
                 unet,
                 noise_scheduler,
                 current_timestep,
                 denoised_latents,
-                train_util.concat_embeddings(
-                    prompt_pair.unconditional,
-                    embeds,
-                    prompt_pair.batch_size,
-                ),
+                embeds.text_embeds,
+                embeds.pooled_embeds,
+                add_time_ids,
                 guidance_scale=1,
             )
         return criteria(target_latents, noise)
@@ -160,12 +157,10 @@ def test_refactored_training_loop():
     Tests that the refactored training loops are float-for-float identical to the original.
     """
     # Load config and models
-    config = config_util.load_config_from_yaml("data/config-xl-dilora.yaml")
-    tokenizer, text_encoder, unet, noise_scheduler, vae = model_util.load_models(
+    config = config_util.load_config_from_yaml("trainscripts/imagesliders/data/config-xl-dilora.yaml")
+    tokenizers, text_encoders, unet, noise_scheduler, vae = model_util.load_models_xl(
         config.pretrained_model.name_or_path,
         scheduler_name=config.train.noise_scheduler,
-        v2=config.pretrained_model.v2,
-        v_pred=config.pretrained_model.v_pred,
     )
     device = torch.device("cuda:0")
     weight_dtype = config_util.parse_precision(config.train.precision)
@@ -186,10 +181,10 @@ def test_refactored_training_loop():
     prompts = prompt_util.load_prompts_from_yaml(config.prompts_file, [])
     prompt_pair = prompt_util.PromptEmbedsPair(
         torch.nn.MSELoss(),
-        train_util.encode_prompts(tokenizer, text_encoder, [prompts[0].target]),
-        train_util.encode_prompts(tokenizer, text_encoder, [prompts[0].positive]),
-        train_util.encode_prompts(tokenizer, text_encoder, [prompts[0].unconditional]),
-        train_util.encode_prompts(tokenizer, text_encoder, [prompts[0].neutral]),
+        PromptEmbedsXL(*train_util.encode_prompts_xl(tokenizers, text_encoders, [prompts[0].target])),
+        PromptEmbedsXL(*train_util.encode_prompts_xl(tokenizers, text_encoders, [prompts[0].positive])),
+        PromptEmbedsXL(*train_util.encode_prompts_xl(tokenizers, text_encoders, [prompts[0].unconditional])),
+        PromptEmbedsXL(*train_util.encode_prompts_xl(tokenizers, text_encoders, [prompts[0].neutral])),
         prompts[0],
     )
 
@@ -198,9 +193,13 @@ def test_refactored_training_loop():
     img1 = Image.new("RGB", (256, 256), color="red")
     img2 = Image.new("RGB", (256, 256), color="blue")
 
+    add_time_ids = train_util.get_add_time_ids(
+        prompts[0].resolution, prompts[0].resolution, prompts[0].dynamic_crops, weight_dtype
+    ).to(device)
+
     # Original implementation
     loss_high_orig, loss_low_orig = original_train_step(
-        unet, vae, noise_scheduler, img1, img2, 1.0, prompt_pair, config, network, torch.nn.MSELoss(), device, weight_dtype
+        unet, vae, noise_scheduler, img1, img2, 1.0, prompt_pair, config, network, torch.nn.MSELoss(), device, weight_dtype, add_time_ids
     )
 
     # Refactored implementation
@@ -217,6 +216,7 @@ def test_refactored_training_loop():
         torch.nn.MSELoss(),
         device,
         weight_dtype,
+        add_time_ids
     )
 
     # Super-functional implementation
@@ -233,6 +233,7 @@ def test_refactored_training_loop():
         torch.nn.MSELoss(),
         device,
         weight_dtype,
+        add_time_ids
     )
 
     # Assert that the losses are identical
@@ -257,6 +258,7 @@ def original_train_step(
     criteria,
     device,
     weight_dtype,
+    add_time_ids,
 ):
     """
     A recreation of the original training step for comparison.
@@ -295,32 +297,28 @@ def original_train_step(
 
     network.set_lora_slider(scale=scale_to_look)
     with network:
-        target_latents_high = train_util.predict_noise(
+        target_latents_high = train_util.predict_noise_xl(
             unet,
             noise_scheduler,
             current_timestep,
             denoised_latents_high,
-            train_util.concat_embeddings(
-                prompt_pair.unconditional,
-                prompt_pair.positive,
-                prompt_pair.batch_size,
-            ),
+            prompt_pair.positive.text_embeds,
+            prompt_pair.positive.pooled_embeds,
+            add_time_ids,
             guidance_scale=1,
         ).to("cpu", dtype=torch.float32)
     loss_high = criteria(target_latents_high, high_noise.cpu().to(torch.float32))
 
     network.set_lora_slider(scale=-scale_to_look)
     with network:
-        target_latents_low = train_util.predict_noise(
+        target_latents_low = train_util.predict_noise_xl(
             unet,
             noise_scheduler,
             current_timestep,
             denoised_latents_low,
-            train_util.concat_embeddings(
-                prompt_pair.unconditional,
-                prompt_pair.neutral,
-                prompt_pair.batch_size,
-            ),
+            prompt_pair.neutral.text_embeds,
+            prompt_pair.neutral.pooled_embeds,
+            add_time_ids,
             guidance_scale=1,
         ).to("cpu", dtype=torch.float32)
     loss_low = criteria(target_latents_low, low_noise.cpu().to(torch.float32))
