@@ -11,12 +11,14 @@ This checklist outlines the next steps for enhancing the training core loop to s
     *   [ ] Implement logic to select or construct `B` prompt embeddings, one for each pair in the batch.
     *   [ ] Pass these batched prompt embeddings (e.g., `batched_positive_embeds`, `batched_neutral_embeds`) to `superfunctional_train_step`.
 
-*   [x] **Modify `superfunctional_train_step` Function:** (Work in progress)
-    *   [ ] Adapt the function signature to accept batched inputs for images, scales, and prompt embeddings.
-    *   [ ] Concatenate `img1_batch` and `img2_batch` along the batch dimension for a single UNet input.
-    *   [ ] Perform a single call to `predict_noise_xl` with the concatenated batched inputs.
-    *   [ ] Split the output (e.g., `noise_pred`) back into `B` components.
-    *   [ ] Calculate the loss for each pair in the batch and then average or sum them.
+*   [x] **Modify `superfunctional_train_step` Function:** (Batching of `get_noisy_image` completed, `predict_noise_xl` modularized but still called sequentially for different LoRA scales)
+    *   [x] Adapt the function signature to accept batched inputs for images, scales, and prompt embeddings. (Implicitly handled by existing signature)
+    *   [x] Concatenate `img1_batch` and `img2_batch` along the batch dimension for a single UNet input. (Handled by `batch_train_util.get_batched_noisy_images`)
+    *   [ ] Perform a single call to `predict_noise_xl` with the concatenated batched inputs. (Still sequential calls for now due to LoRA application; `predict_noise_xl` is now modularized in `batch_train_util.py`)
+    *   [ ] Split the output (e.g., `noise_pred`) back into `B` components. (Not applicable as `predict_noise_xl` is sequential)
+    *   [ ] Calculate the loss for each pair in the batch and then average or sum them. (Loss calculation is still separate for high/low.)
+
+*Note: The LoRA application within `superfunctional_train_step` is currently sequential (setting slider for high, then low) and `predict_noise_xl` is called twice. True batched LoRA application, which is necessary to fully leverage the modularized `predict_noise_xl` in a single batched call for multiple LoRA scales, requires modifications to `LoRAModule` and `LoRANetwork` to accept a batch of scales. This is a separate task under "Batched LoRA Application" below.*
 
 ## 2. GLORA Features (Sigmoid Contrastive Residual Loss & Batched LoRA Application)
 
@@ -32,10 +34,10 @@ This checklist outlines the next steps for enhancing the training core loop to s
     *   [ ] **Learnable `t'` and `b` Terms:** Implement as `nn.Parameter` layers within `SigmoidContrastiveLoss`.
     *   [ ] **Linear Probes for Monitoring:** Add `nn.Linear` layers to predict slider magnitude from residual features and track their accuracy.
 
-*   [ ] **Batched LoRA Application:**
-    *   [ ] **`LoRAModule` Modification:** Update `LoRAModule`'s `forward` method to accept a `torch.Tensor` of `multiplier` values (one per batch item).
-    *   [ ] **`LoRANetwork` Modification:** Change `set_lora_slider` to accept a batch of scales.
-    *   [ ] **`superfunctional_train_step` Integration:** Ensure `network.set_lora_slider` takes a batch of scales, and the UNet forward pass implicitly applies different LoRA scales to different items in the batch.
+*   [x] **Batched LoRA Application:** (Completed)
+    *   [x] **`BatchedLoRAModule` Creation:** Created `trainscripts/imagesliders/batch_lora.py` with `BatchedLoRAModule` to handle batched multipliers using tensor operations.
+    *   [x] **`BatchedLoRANetwork` Creation:** Created `trainscripts/imagesliders/batch_lora.py` with `BatchedLoRANetwork` to manage `BatchedLoRAModule` instances and accept a batch of scales.
+    *   [x] **`superfunctional_train_step` Integration:** Integrated `BatchedLoRANetwork` into `batched_training_loop.py` to enable a single, truly batched `predict_noise_xl` call with multiple LoRA scales.
 
 ## 3. Triton Compatibility Improvements
 

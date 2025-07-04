@@ -17,7 +17,9 @@ import torch.cuda
 from diffusers.image_processor import VaeImageProcessor
 
 # Assuming the following files are in the same directory
-from trainscripts.imagesliders import train_util, model_util, config_util, lora, prompt_util
+from trainscripts.imagesliders import train_util, model_util, config_util, prompt_util
+from trainscripts.imagesliders import batch_lora as lora # Use the new batched lora
+from trainscripts.imagesliders import train_util, batch_train_util # Keep train_util for other functions not yet moved
 from trainscripts.imagesliders.prompt_util import PromptEmbedsXL
 #our new functions live here instead of being rewritten inside of train_util, etc.
 from trainscripts.imagesliders import batch_train_util
@@ -38,7 +40,7 @@ def superfunctional_train_step(
     prompt_embeds: tuple[prompt_util.PromptEmbedsXL, prompt_util.PromptEmbedsXL],
     prompt_pair: prompt_util.PromptEmbedsPair,
     config: config_util.RootConfig,
-    network: lora.LoRANetwork,
+    network: lora.BatchedLoRANetwork,
     criteria: torch.nn.Module,
     device: torch.device,
     weight_dtype: torch.dtype,
@@ -77,29 +79,18 @@ def superfunctional_train_step(
 
     generator = torch.manual_seed(seed)
     
-    # Process images separately to match original behavior for noise generation
-    denoised_latents_high, high_noise = train_util.get_noisy_image(
-        img_batches[0],
+    denoised_latents_high, high_noise, denoised_latents_low, low_noise = batch_train_util.get_batched_noisy_images(
+        img_batches,
         vae,
         generator,
         unet,
         noise_scheduler,
-        start_timesteps=0,
-        total_timesteps=config.train.max_denoising_steps - 1,
+        config,
+        device,
+        weight_dtype,
     )
     denoised_latents_high = denoised_latents_high.to(device, dtype=weight_dtype)
     high_noise = high_noise.to(device, dtype=weight_dtype)
-
-    generator = torch.manual_seed(seed) # Re-seed for the second image to ensure identical noise generation
-    denoised_latents_low, low_noise = train_util.get_noisy_image(
-        img_batches[1],
-        vae,
-        generator,
-        unet,
-        noise_scheduler,
-        start_timesteps=0,
-        total_timesteps=config.train.max_denoising_steps - 1,
-    )
     denoised_latents_low = denoised_latents_low.to(device, dtype=weight_dtype)
     low_noise = low_noise.to(device, dtype=weight_dtype)
 
@@ -166,38 +157,26 @@ def superfunctional_train_step(
     # For now, we'll apply the high scale, run, then apply the low scale, run.
     # This is NOT fully concurrent for the LoRA application, but batches the UNet inference.
 
-    # High scale
-    network.set_lora_slider(scale=scales[0])
-    with network:
-        with torch.no_grad():
-            # Only pass the high latents and corresponding embeddings
-            target_latents_high = train_util.predict_noise_xl(
-                unet,
-                noise_scheduler,
-                current_timestep,
-                combined_denoised_latents_for_noise_pred[0].unsqueeze(0), # High latent
-                text_embeddings_for_noise_pred[0:2], # High uncond and cond
-                pooled_embeds_for_noise_pred[0:2],   # High pooled uncond and cond
-                add_time_ids_for_noise_pred[0:2],    # High add_time_ids uncond and cond
-                guidance_scale=1,
-            )
-    loss_high_per_element = (target_latents_high - high_noise).pow(2).to(torch.float32)
+    # Convert scales to a tensor and set for the batched LoRA network
+    batched_scales = torch.tensor(scales, device=device, dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) # Shape (2, 1, 1, 1) for broadcasting
+    network.set_lora_scales(batched_scales)
 
-    # Low scale
-    network.set_lora_slider(scale=scales[1])
     with network:
         with torch.no_grad():
-            # Only pass the low latents and corresponding embeddings
-            target_latents_low = train_util.predict_noise_xl(
+            # Perform batched predict_noise_xl call for both high and low scales
+            # The BatchedLoRANetwork will now apply the correct scale to each item in the batch
+            target_latents_high, target_latents_low = batch_train_util.batched_predict_noise_xl_modular(
                 unet,
                 noise_scheduler,
                 current_timestep,
-                combined_denoised_latents_for_noise_pred[1].unsqueeze(0), # Low latent
-                text_embeddings_for_noise_pred[2:4], # Low uncond and cond
-                pooled_embeds_for_noise_pred[2:4],   # Low pooled uncond and cond
-                add_time_ids_for_noise_pred[2:4],    # Low add_time_ids uncond and cond
+                combined_denoised_latents_for_noise_pred, # Combined high and low latents
+                text_embeddings_for_noise_pred,
+                pooled_embeds_for_noise_pred,
+                add_time_ids_for_noise_pred,
                 guidance_scale=1,
             )
+
+    loss_high_per_element = (target_latents_high - high_noise).pow(2).to(torch.float32)
     loss_low_per_element = (target_latents_low - low_noise).pow(2).to(torch.float32)
 
     return loss_high_per_element, loss_low_per_element, denoised_latents_high, high_noise, target_latents_high, denoised_latents_low, low_noise, target_latents_low
