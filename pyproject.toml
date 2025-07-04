@@ -36,19 +36,23 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-triton = { url = "https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl" }
-torch = [
-  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+triton = [
+  # For Windows, use the custom pre-built wheel from GitHub releases
+  { url = "https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl", marker = "sys_platform == 'win32'" },
+  # For other platforms (Linux, macOS, etc.), get triton from the default PyPI
+  { index = "pypi", marker = "sys_platform != 'win32'" }, # <-- CHANGED THIS LINE
 ]
-torchvision = [
-  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchaudio = [
-  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
 
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
+name = "pytorch"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
+
+[[tool.uv.index]] # <-- ADDED THIS SECTION
+name = "pypi"
+url = "https://pypi.org/simple/"
+# explicit = false # You can optionally set explicit to false, but it's not strictly necessary if other dependencies aren't globally using this named index.

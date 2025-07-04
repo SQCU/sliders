@@ -5,17 +5,39 @@ built from Official code implementation of "Concept Sliders: LoRA Adaptors for P
 ## setup:
 ```
 uv init
-uv venv
-#uv add torch torchvision torchaudio --index pytorch=https://download.pytorch.org/whl/cu124
+uv python install 3.10
+uv venv --seed --python 3.10
+
+uv pip install torch --index pytorch=https://download.pytorch.org/whl/cu124
 uv add https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl
-uv add setuptools
-uv add flash-attn==2.7.2.post1
+uv pip install psutil
+uv pip install packaging
+uv pip install ninja
+$Env:MAX_JOBS = "7"
+$Env:TORCH_CUDA_ARCH_LIST = "8.9"
+.venv\scripts\activate
+#if you're stuck on a 4090, this is the only compute capability you can use
+#expect like 30 minutes of total saturation of 7/8 cores on a 7800x3d.
+uv pip install flash-attn==2.7.2.post1 --no-build-isolation
 #MANUALLY OVERWRITE PYPROJECT.TOML WITH REAL INDEXES
 uv add torch torchvision torchaudio
 uv add -r requirements-loose.txt
 uv add bitsandbytes>=0.43.0
 uv add lycoris-lora?
 ```
+
+or maybe...
+```
+sudo apt install python3-dev
+...
+uv venv --seed
+source .venv/bin/activate && uv pip install 
+psutil && uv pip install torch && uv pip install flash-attn==2.7.2.post1 --no-build-isolation
+```
+...
+enjoy 'wsl-cuda-bootstrap.sh'!~
+
+## operation:
 `uv run trainscripts/imagesliders/train_lora-scale-xl.py *args ...`
 if you know how to install uv, i trust you. i trust you to understand how to reach inside of the pyproject.toml and lockfile... and add the appropriate lines to use the right indices for bsd, apple-mps, linux, and even system-v. you're gonna make it. it's gonna be okay. 
 

@@ -3,3 +3,7 @@ models/**
 trainscripts/imagesliders/data/**
 trainscripts/textsliders/data/**
 trainscripts/imagesliders/__pycache__/**
+
+uv.lock
+#don't even think about it
+*.deb
