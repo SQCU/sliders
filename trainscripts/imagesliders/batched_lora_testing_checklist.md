@@ -51,7 +51,11 @@
 
 ## Testing Implementation
 
-*   [ ] Create `batched_training_loop_test.py`.
-*   [ ] Import `refactored_training_loop.py` into `batched_training_loop_test.py`.
-*   [ ] Implement logic to execute both the batched and sequential training paths on the same initial conditions and data within `batched_training_loop_test.py`.
-*   [ ] Add assertions or logging to compare losses, predicted noise, and potentially generated images (if a full inference step is included in the test) between the two approaches.
+*   [ ] Read `batched_training_loop.py`.
+*   [ ] Identify missing or miswritten features, and write a new timestamped batched_training_hypothesis statement as file.
+*   [ ] Run `batched_training_loop.py` to test your hypothesis before thinking of any code edits.
+    *   [ ] Write a checklist of revisions, additions, or further tests
+    *   [ ] Check off that checklist before attempting revisions
+    *   [ ] Make revisions by adding new functions to batch_* libraries or adding new batch_* versions of existing libraries, never changing common library function interfaces
+*   [ ] Peace out early if you find yourself skipping steps or writing code line edits that just don't work, appending a little 'peace out notice' to your timestamped hypothesis statement
+*   [ ] Most importantly, have fun!
