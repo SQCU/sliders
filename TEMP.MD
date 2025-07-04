@@ -27,6 +27,23 @@ These issues, while not directly related to Triton, also contribute to the code'
 *   **Manual Batching:** The manual gradient accumulation with a batch size of 1 does not take advantage of the GPU's parallel processing capabilities.
 *   **Hardcoded Parameters:** Hardcoded image resolutions and other parameters make the code inflexible.
 
+## VRAM Optimization Notes
+
+High VRAM usage (observed ~48GB on RTX 4090) is a significant concern, leading to performance degradation due to memory shuffling. Several strategies can be employed to mitigate this:
+
+1.  **Pre-encode and Cache VAE Latents:**
+    *   The VAE encoder is only needed once per image to convert raw image data into latents. These latents can then be cached to disk (e.g., as binary files with associated metadata/checksums) and reused across training runs.
+    *   This requires a `map_data_to_latents` function to handle the encoding and caching process.
+    *   During this pre-encoding phase, the VAE encoder should be loaded with the highest possible batch size, potentially by offloading other models from the GPU temporarily.
+    *   A checksum mechanism (VAE state_dict, image checksum, encoded latent checksum) is crucial to verify cache validity and prevent mismatches.
+
+2.  **VAE Decoder Management:**
+    *   The VAE decoder is only required for post-training analysis (e.g., interpreting loss in post-latent metrics) or image generation. It does not need to be loaded during the core training loop.
+
+3.  **UNet and LoRANetwork Instantiation:**
+    *   There is a suspicion that the UNet model might be inadvertently copied or duplicated during its lifecycle, potentially contributing to VRAM bloat.
+    *   The `LoRANetwork` class constructor takes a UNet as an operand and appears to perform some operations that might involve the UNet. It's important to verify that the UNet is not being duplicated or held onto unnecessarily by the `LoRANetwork` instance, and that garbage collection is occurring as expected.
+
 # Super-Hype Extension: Sigmoid Contrastive Residual Loss
 
 This section outlines a theoretical extension to the slider training methodology, inspired by the principles of SigLIP (Sigmoid-based Language-Image Pre-training). The goal is to introduce a novel regularization loss that operates on the model's internal representations, promoting more consistent and robust conceptual sliders.

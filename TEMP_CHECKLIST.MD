@@ -32,3 +32,15 @@ This checklist summarizes the issues that need to be addressed to improve the pe
     *   [x] Ensure that all operations within the loop are performed on the GPU.
 *   [x] **Make Parameters Configurable:**
     *   [x] Replace hardcoded values (e.g., image resolution) with configurable parameters.
+
+## VRAM Optimization
+
+*   [ ] **Pre-encode and Cache VAE Latents:**
+    *   [ ] Implement `map_data_to_latents` function to encode and cache VAE latents to disk.
+    *   [ ] Ensure VAE encoder is loaded with highest possible batch size during pre-encoding.
+    *   [ ] Implement checksum verification for cached latents (VAE state_dict, image checksum, encoded latent checksum).
+*   [ ] **Optimize VAE Decoder Usage:**
+    *   [ ] Ensure VAE decoder is only loaded when necessary (e.g., for post-training analysis), not during the core training loop.
+*   [ ] **Review UNet and LoRANetwork Instantiation:**
+    *   [ ] Verify that the UNet model is not being inadvertently copied or duplicated.
+    *   [ ] Investigate `LoRANetwork` constructor to ensure proper memory management and garbage collection of UNet instances.

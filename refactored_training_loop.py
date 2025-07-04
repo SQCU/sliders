@@ -4,11 +4,20 @@ import numpy as np
 from PIL import Image
 import os
 import random
+import gc
+import torch.cuda
 from diffusers.image_processor import VaeImageProcessor
 
 # Assuming the following files are in the same directory
 from trainscripts.imagesliders import train_util, model_util, config_util, lora, prompt_util
 from trainscripts.imagesliders.prompt_util import PromptEmbedsXL
+
+def log_vram_usage(step_name):
+    if torch.cuda.is_available():
+        print(f"VRAM usage after {step_name}: {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
+        print(f"Max VRAM usage after {step_name}: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB")
+    else:
+        print(f"VRAM usage after {step_name}: CUDA not available.")
 
 def functional_train_step(
     unet: torch.nn.Module,
@@ -102,7 +111,7 @@ def functional_train_step(
             duplicated_add_time_ids,
             guidance_scale=1,
         )
-    loss_high = criteria(target_latents_high, high_noise)
+    loss_high = criteria(target_latents_high, high_noise).to(torch.float32)
 
     # Low scale
     network.set_lora_slider(scale=-scale_to_look)
@@ -122,7 +131,7 @@ def functional_train_step(
             duplicated_add_time_ids,
             guidance_scale=1,
         )
-    loss_low = criteria(target_latents_low, low_noise)
+    loss_low = criteria(target_latents_low, low_noise).to(torch.float32)
 
     return loss_high, loss_low
 
@@ -204,7 +213,7 @@ def superfunctional_train_step(
                 duplicated_add_time_ids,
                 guidance_scale=1,
             )
-        return criteria(target_latents, noise)
+        return criteria(target_latents, noise).to(torch.float32)
 
     loss_high = process_case(img_batches[0], scales[0], prompt_embeds[0])
     loss_low = process_case(img_batches[1], scales[1], prompt_embeds[1])
@@ -227,6 +236,7 @@ def test_refactored_training_loop():
     
     unet.to(device, dtype=weight_dtype)
     vae.to(device, dtype=weight_dtype)
+    log_vram_usage("model loading")
 
 
     # Create a dummy network and prompt pair
@@ -253,11 +263,12 @@ def test_refactored_training_loop():
     prompt_pair.positive.pooled_embeds = prompt_pair.positive.pooled_embeds.to(device, dtype=weight_dtype)
     prompt_pair.neutral.text_embeds = prompt_pair.neutral.text_embeds.to(device, dtype=weight_dtype)
     prompt_pair.neutral.pooled_embeds = prompt_pair.neutral.pooled_embeds.to(device, dtype=weight_dtype)
+    log_vram_usage("prompt embedding processing")
 
 
-    # Load dummy images
-    img1 = Image.new("RGB", (prompts[0].resolution, prompts[0].resolution), color="red")
-    img2 = Image.new("RGB", (prompts[0].resolution, prompts[0].resolution), color="blue")
+    # Load real images
+    img1 = Image.open("F:\\dox\\ai\\gemmy\\sliders\\datasets\\bracket\\0\\A.png").convert("RGB")
+    img2 = Image.open("F:\\dox\\ai\\gemmy\\sliders\\datasets\\bracket\\0\\B.png").convert("RGB")
 
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
@@ -265,10 +276,12 @@ def test_refactored_training_loop():
     # Convert PIL images to batched tensors
     img1_tensor = image_processor.preprocess(img1).to(device, dtype=weight_dtype)
     img2_tensor = image_processor.preprocess(img2).to(device, dtype=weight_dtype)
+    log_vram_usage("image processing")
 
     add_time_ids = train_util.get_add_time_ids(
         prompts[0].resolution, prompts[0].resolution, prompts[0].dynamic_crops, weight_dtype
     ).to(device, dtype=weight_dtype)
+    log_vram_usage("add_time_ids processing")
 
     # Original implementation
     loss_high_orig, loss_low_orig = original_train_step(
