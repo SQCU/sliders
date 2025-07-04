@@ -1,4 +1,3 @@
-import argparse
 import os
 import hashlib
 from PIL import Image
@@ -147,6 +146,8 @@ def get_latent_for_image(image_path, vae, device, weight_dtype, output_dir, vae_
     return torch.load(latent_path)
 
 if __name__ == "__main__":
+    #scope imports where possible
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", type=str, help="The directory containing the images to cache.")
     parser.add_argument("--model_name", type=str, help="The name of the VAE model to use.")

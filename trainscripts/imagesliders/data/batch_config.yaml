@@ -1,0 +1,5 @@
+obsolete_config:
+  refpath: "trainscripts/imagesliders/data/config-xl-dilora.yaml"
+dset_config: 
+  refpath: "trainscripts/imagesliders/data/bracket_dataset.yaml"
+

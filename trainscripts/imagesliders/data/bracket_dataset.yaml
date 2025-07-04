@@ -1,0 +1,11 @@
+prompts_file: "trainscripts/imagesliders/data/prompts-xl-dilora-bracket.yaml"
+dataset:
+  #these attributes were passed by argparse in upstream
+  #they should be passable by config file!
+  #root folder for dataset
+  folder_main:  "datasets/bracket"
+  #folders with scale-separated subsets.
+  #even if they have numbers for names, they can be assigned any scale
+  folders: "0, 1, 2"
+  #list assigning one magnitude to each subset folder
+  scales: "0.15, 1, 2"

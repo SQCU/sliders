@@ -1,0 +1,346 @@
+import torch
+import numpy as np
+from PIL import Image
+import os
+import random
+import gc
+import torch.cuda
+from diffusers.image_processor import VaeImageProcessor
+from diffusers.optimization import get_scheduler
+
+# Assuming the following files are in the same directory
+from trainscripts.imagesliders import train_util, model_util, config_util, prompt_util
+from trainscripts.imagesliders import batch_lora as lora # Use the new batched lora
+from trainscripts.imagesliders import train_util, batch_train_util # Keep train_util for other functions not yet moved
+from trainscripts.imagesliders.prompt_util import PromptEmbedsXL, PromptEmbedsPair
+#our new functions live here instead of being rewritten inside of train_util, etc.
+#add new batch_... imports as we need to deviate from imagesliders imports.
+from trainscripts.imagesliders import batch_train_util
+
+def log_vram_usage(step_name):
+    if torch.cuda.is_available():
+        print(f"VRAM usage after {step_name}: {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
+        print(f"Max VRAM usage after {step_name}: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB")
+    else:
+        print(f"VRAM usage after {step_name}: CUDA not available.")
+
+
+#this function is suspicious, it's a reference case but you should make it better, simpler.
+#prefer structs or kv dicts for non-ml data and metadata
+#use tensors for absolutely everything interacting with an accelerator.
+#even if older code passes dumb tuples around for no reason.
+def superfunctional_train_step(
+    unet: torch.nn.Module,
+    vae: torch.nn.Module,
+    noise_scheduler,
+    img_batches: tuple[torch.Tensor, torch.Tensor],
+    scales: tuple[float, float],
+    prompt_embeds: tuple[prompt_util.PromptEmbedsXL, prompt_util.PromptEmbedsXL],
+    prompt_pair: prompt_util.PromptEmbedsPair,
+    config: config_util.RootConfig,
+    network: lora.BatchedLoRANetwork,
+    criteria: torch.nn.Module,
+    device: torch.device,
+    weight_dtype: torch.dtype,
+    add_time_ids: torch.Tensor,
+    seed: int,
+):
+    """
+    Performs a single training step for a high/low image pair, leveraging batched operations
+    for internal efficiency.
+
+    This function encapsulates the core logic for:
+    1. Generating noisy latents for both high and low images.
+    2. Preparing and concatenating prompt embeddings for classifier-free guidance.
+    3. Applying LoRA scales using the BatchedLoRANetwork.
+    4. Performing a batched UNet forward pass to predict noise.
+    5. Calculating the loss for both high and low predictions.
+
+    Args:
+        unet (torch.nn.Module): The UNet model for noise prediction.
+        vae (torch.nn.Module): The VAE model for image encoding/decoding.
+        noise_scheduler: The noise scheduler (e.g., DDPMScheduler).
+        img_batches (tuple[torch.Tensor, torch.Tensor]): A tuple containing two tensors,
+            where the first tensor is the batch of 'high' images and the second is
+            the batch of 'low' images. Each tensor is expected to have shape (batch_size, C, H, W).
+            For this function, batch_size is typically 1, representing a single high/low pair.
+        scales (tuple[float, float]): A tuple containing the LoRA scale for the 'high' image
+            and the 'low' image, respectively.
+        prompt_embeds (tuple[prompt_util.PromptEmbedsXL, prompt_util.PromptEmbedsXL]):
+            A tuple where the first element contains prompt embeddings for the 'high' image
+            (positive prompt) and the second for the 'low' image (neutral prompt).
+        prompt_pair (prompt_util.PromptEmbedsPair): A container object holding the
+            positive and neutral prompt embeddings. Used for clarity in some parts.
+        config (config_util.RootConfig): The overall training configuration.
+        network (lora.BatchedLoRANetwork): The batched LoRA network responsible for
+            applying LoRA weights based on the provided scales.
+        criteria (torch.nn.Module): The loss function (e.g., MSELoss).
+        device (torch.device): The device (e.g., 'cuda:0' or 'cpu') to perform computations on.
+        weight_dtype (torch.dtype): The data type for model weights (e.g., torch.float16, torch.bfloat16).
+        add_time_ids (torch.Tensor): Additional time IDs for SDXL models, typically
+            representing original image dimensions.
+        seed (int): The random seed for noise generation.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            A tuple containing:
+            - loss_high_per_element (torch.Tensor): Element-wise loss for the 'high' image.
+            - loss_low_per_element (torch.Tensor): Element-wise loss for the 'low' image.
+            - denoised_latents_high (torch.Tensor): Denoised latents for the 'high' image.
+            - high_noise (torch.Tensor): The noise added to the 'high' image latents.
+            - target_latents_high (torch.Tensor): Predicted noise for the 'high' image.
+            - denoised_latents_low (torch.Tensor): Denoised latents for the 'low' image.
+            - low_noise (torch.Tensor): The noise added to the 'low' image latents.
+            - target_latents_low (torch.Tensor): Predicted noise for the 'low' image.
+    """
+    noise_scheduler.set_timesteps(1000)
+    current_timestep = noise_scheduler.timesteps[
+        int((config.train.max_denoising_steps - 1) * 1000 / config.train.max_denoising_steps)
+    ]
+
+    generator = torch.manual_seed(seed)
+    
+    # Call graph hop 1: get_batched_noisy_images from batch_train_util
+    denoised_latents_high, high_noise, denoised_latents_low, low_noise = batch_train_util.get_batched_noisy_images(
+        img_batches, # This is a tuple of (high_batch, low_batch)
+        vae,
+        generator,
+        unet,
+        noise_scheduler,
+        config,
+        device,
+        weight_dtype,
+    )
+    denoised_latents_high = denoised_latents_high.to(device, dtype=weight_dtype)
+    high_noise = high_noise.to(device, dtype=weight_dtype)
+    denoised_latents_low = denoised_latents_low.to(device, dtype=weight_dtype)
+    low_noise = low_noise.to(device, dtype=weight_dtype)
+
+    # Prepare for batched predict_noise_xl calls
+    # Concatenate text_embeds, pooled_embeds, and add_time_ids for high and low cases
+    # Each needs to be duplicated for classifier-free guidance within predict_noise_xl
+    # So, for a batch of 2 (high and low), we need 4 entries (high_uncond, high_cond, low_uncond, low_cond)
+    # This means we need to prepare the inputs to predict_noise_xl such that when it duplicates them,
+    # it results in the correct pairings.
+
+    # For high scale: prompt_pair.positive
+    # For low scale: prompt_pair.neutral
+
+    # Create the text_embeddings batch: [positive_uncond, positive_cond, neutral_uncond, neutral_cond]
+    text_embeddings_for_noise_pred = torch.cat([
+        prompt_pair.positive.text_embeds, # positive uncond
+        prompt_pair.positive.text_embeds, # positive cond
+        prompt_pair.neutral.text_embeds,  # neutral uncond
+        prompt_pair.neutral.text_embeds   # neutral cond
+    ], dim=0)
+
+    # Create the pooled_embeds batch: [positive_pooled_uncond, positive_pooled_cond, neutral_pooled_uncond, neutral_pooled_cond]
+    pooled_embeds_for_noise_pred = torch.cat([
+        prompt_pair.positive.pooled_embeds, # positive uncond
+        prompt_pair.positive.pooled_embeds, # positive cond
+        prompt_pair.neutral.pooled_embeds,  # neutral uncond
+        prompt_pair.neutral.pooled_embeds   # neutral cond
+    ], dim=0)
+
+    # Create the add_time_ids batch: [add_time_ids_high_uncond, add_time_ids_high_cond, add_time_ids_low_uncond, add_time_ids_low_cond]
+    # Assuming add_time_ids is the same for both high and low, and already duplicated for CFG
+    add_time_ids_for_noise_pred = torch.cat([
+        add_time_ids, # high uncond
+        add_time_ids, # high cond
+        add_time_ids, # low uncond
+        add_time_ids  # low cond
+    ], dim=0)
+
+    # Set LoRA slider for the combined batch.
+    # Convert scales to a tensor and set for the batched LoRA network
+    # The unsqueeze operations are to make the tensor broadcastable to the expected shape
+    # by BatchedLoRANetwork, which expects a (batch_size, 1, 1, 1) tensor.
+    # Here, batch_size is 2 (for high and low).
+    batched_scales = torch.tensor(scales, device=device, dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) # Shape (2, 1, 1, 1) for broadcasting
+    
+    # Call graph hop 2: set_lora_scales from BatchedLoRANetwork
+    network.set_lora_scales(batched_scales)
+
+    with network: # This context manager ensures LoRA weights are applied during the UNet forward pass
+        with torch.no_grad(): # No gradient calculation needed for noise prediction
+            # Perform batched predict_noise_xl call for both high and low scales
+            # The BatchedLoRANetwork will now apply the correct scale to each item in the batch
+            
+            # Concatenate denoised latents for high and low cases for the UNet input
+            combined_denoised_latents_for_noise_pred = torch.cat([denoised_latents_high, denoised_latents_low], dim=0)
+
+            # Call graph hop 3: batched_predict_noise_xl_modular from batch_train_util
+            target_latents_high, target_latents_low = batch_train_util.batched_predict_noise_xl_modular(
+                unet,
+                noise_scheduler,
+                current_timestep,
+                combined_denoised_latents_for_noise_pred, # Combined high and low latents
+                text_embeddings_for_noise_pred,
+                pooled_embeds_for_noise_pred,
+                add_time_ids_for_noise_pred,
+                guidance_scale=1, # Classifier-free guidance is handled internally by predict_noise_xl_modular
+            )
+
+    # Call graph hop 4: Loss calculation (criteria is typically MSELoss)
+    loss_high_per_element = (target_latents_high - high_noise).pow(2).to(torch.float32)
+    loss_low_per_element = (target_latents_low - low_noise).pow(2).to(torch.float32)
+
+    return loss_high_per_element, loss_low_per_element, denoised_latents_high, high_noise, target_latents_high, denoised_latents_low, low_noise, target_latents_low
+
+
+#HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
+def config_io():
+    #if you think that this file is getting a bit too big, 
+    # think about how you could factor out a stateless config input handler
+    # which takes a config argument as input, and returns a training config as output.
+    import argparse
+    #if batch_config_util doesn't exist yet, think about making it ;)
+    import batch_config_util
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batchtrainconfig", "--bconfig", "-c", 
+    type=str, help="path to the batchtrainconfig, which is a config for our revised trainer",
+    default=None)
+    args = parser.parse_args()
+    if args.bconfig ==  None:
+        print("failing over to default config")
+        #if this file isn't real and throws an error, create that file!
+        bcfgdefault = "trainscripts/imagesliders/data/batch_config.yaml"
+        args.bconfig = bcfgdefault
+    #our upstreams used multiple different heterogenous config files scattered throughout project
+    #we will fix this patiently and exactingly, by first wrapping their configs
+    #we can later refactor if we need to. but we likely won't.
+    args.outerconfig = batch_config_util.load_config_from_yaml(args.bconfig)
+
+    #our default batch_config.yaml contains a reference to "trainscripts/imagesliders/data/config-xl-dilora.yaml". we load that.
+
+    args.obsolete_inner_config = batch_config_util.load_config_from_yaml(outerconfig.obsolete_config.refpath)
+    args.dset_config = batch_config_util.load_config_from_yaml(outerconfig.dset_config.refpath)
+    #if you're confused about the contents of these values...
+    #you can add a print(outerconfig.dset_config.refpath), then look at what's inside!
+    return args
+
+#HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
+def dataset_constructor(config):
+    import map_data_to_latents
+    #stub function which does the stuff in map_data_to_latents to a dataset config.
+    #stub continue
+    continue
+
+#HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
+def envsetup(config):
+    #load models, check memory use, load optimizers, 
+    #make sure the right things are nograd and on the right devices.
+    #also make sure to bind the right parameters to the right optimizers.
+
+    #do stuff here to construct environment
+    
+    #okay now bundle up the state we use in training into an environment object
+
+    #okay now return that object
+    #return environment
+    
+    #stub continue
+    continue
+
+#HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
+def training_step(environment, 
+data,
+):  
+    #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
+    #a lot of environment setup and other stuff are wrongly included
+    #in superfunctional_train_step. factor them out to make it stateless!
+
+    #select target cases from dataset
+    
+    #compute model prediction
+
+    #use environment["criterion"] on target,prediction
+    #e.g. comparison = environment["criterion"](target, prediction)
+    #return comparison
+
+    #stub continue
+    continue
+
+#HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
+def training_loop(
+    training_step:python_function,
+    environment:python_object,
+    dataset:some_huggingface_thing_or_whatever
+):  
+    def loss_preconditioning(environment, loss_tensor):
+        #want to do something like a fancy loss weighting as suggested by kingma and karras et al?
+        #you need to implement that *here*.
+        
+        #stub continue
+        continue
+    def gradient_cleanup(environment):
+        #read configuration from environment on extra stuff to do while training.
+        #e.g. constraining maximum gradient norm
+        #e.g. some kind of funky jacobian
+        #e.g. mutate an auxiliary loss's gradient by sign agreement with primary loss
+
+        #stub continue
+        continue
+    def intra_loop_logging(environment):
+        #printing... 
+        # writing to logfiles...
+        # progress bars and stuff...
+        # all of that is handled here...
+
+        #stub continue
+        continue
+    def stopping_condition(environment):
+        #check for early stopping constraints set in environment
+        #if one is triggered you might `break`` or something
+        #e.g. there were two all NaN predictions logged in the last 100 steps, time to cut off training.
+
+        #stub continue
+        continue
+
+    #non-stub real functions you better be using for real.
+    for batch in dataset:
+        optimizer.zero_grad()
+        loss_tensor = training_step(environment,batch)
+        loss_tensor.backward()
+        gradient_cleanup(environment)
+        optimizer.step()
+        lr_scheduler.step()
+        intra_loop_logging(environment)
+        stopping_condition(environment)
+
+    return environment
+
+#HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
+def graceful_shutdown(environment):
+    def traindone_logging(environment):
+        #stub function
+        continue
+    def model_eval(environment):
+        #stub function
+        continue
+    def save_function(environment):
+        #stub function, read appropriate metadata to save trained weights and so on.
+        #by default save trained model even without a full config, loudly complaining with prints
+        continue
+    #this calls at the conclusion of a normal training run where everything is going okay
+    traindone_logging(environment)
+    save_function(environment)
+    model_eval(environment)
+
+
+#HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
+def main():
+    #main execution point for all of our major functions.
+    #don't write anything here that could be an independent function instead.
+    args = config_io()
+    environment = envsetup(args.obsolete_inner_config)
+    dataset = dataset_constructor(args.dset_config)
+    environment = training_loop(stepfunction, environment, dataset)
+    graceful_shutdown(environment)
+    #stub continue
+    continue
+
+if __name__ == "__main__":
+    #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
+    #our entry point if this module is run as a script instead of imported for a step or loop.
+    main()
