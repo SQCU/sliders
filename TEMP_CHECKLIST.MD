@@ -5,8 +5,8 @@ This checklist summarizes the issues that need to be addressed to improve the pe
 ## Triton Compatibility
 
 *   [x] **Remove Dynamic Shapes:**
-    *   [ ] Replace `get_random_resolution_in_bucket()` with a fixed resolution or a pre-defined set of resolutions that can be batched together.
-    *   [ ] Ensure that all tensors passed to the UNet have static shapes.
+    *   [x] Replace `get_random_resolution_in_bucket()` with a fixed resolution or a pre-defined set of resolutions that can be batched together.
+    *   [x] Ensure that all tensors passed to the UNet have static shapes.
 *   [x] **Minimize CPU/GPU Synchronization:**
     *   [x] **Fix `refactored_training_loop.py` execution:**
         *   [x] **Immediate:** Correct `superfunctional_train_step` to use `predict_noise_xl` with `add_time_ids`.
@@ -29,9 +29,9 @@ This checklist summarizes the issues that need to be addressed to improve the pe
     *   [x] Modify the data loading and training loop to handle true batches of data (i.e., tensors with a batch dimension greater than 1).
     *   [x] Remove the manual gradient accumulation.
 *   [x] **Optimize Sequential Tensor Operations:**
-    *   [ ] Identify sequential calls to functions that operate on compatible tensors (e.g., `func(tensor1); func(tensor2)`).
-    *   [ ] Refactor these calls to batch the tensors (e.g., `func(torch.cat([tensor1, tensor2]))`) and process them concurrently as a single execution step, then split results if necessary.
-    *   [ ] Prioritize pairs of identical tensors for this optimization to maximize cache hits and accelerator utilization.
+    *   [x] Identify sequential calls to functions that operate on compatible tensors (e.g., `func(tensor1); func(tensor2)`).
+    *   [x] Refactor these calls to batch the tensors (e.g., `func(torch.cat([tensor1, tensor2]))`) and process them concurrently as a single execution step, then split results if necessary.
+    *   [x] Prioritize pairs of identical tensors for this optimization to maximize cache hits and accelerator utilization.
 *   [x] **Refactor the Training Loop:**
     *   [x] Move all data loading and preprocessing out of the main loop.
     *   [x] Ensure that all operations within the loop are performed on the GPU.
@@ -52,11 +52,12 @@ This checklist summarizes the issues that need to be addressed to improve the pe
     * Integrate Pre-encoded Latents into Training Loop:
        * [x] Add latent_cache_dir to RootConfig in config_util.py (both imagesliders and textsliders).
        * [x] Import map_data_to_latents in train_lora.py and train_lora_xl.py.
-       * [ ] Add image_path: Optional[str] to PromptSettings in prompt_util.py.
-       * [ ] Add image_path: Optional[str] to PromptEmbedsPair class definition in prompt_util.py.
-       * [ ] Update PromptEmbedsPair.__init__ to assign self.image_path = settings.image_path.
-       * [ ] Modify load_prompts_from_yaml to read image_path from the YAML and pass it to PromptSettings.
-       * [ ] Implement logic in train_lora.py and train_lora_xl.py to load latents from config.latent_cache_dir using image_path if available, otherwise generate them.
+       * [x] Add image_path: Optional[str] to PromptSettings in prompt_util.py.
+       * [x] Add image_path: Optional[str] to PromptEmbedsPair class definition in prompt_util.py.
+       * [x] Update PromptEmbedsPair.__init__ to assign self.image_path = settings.image_path.
+       * [x] Modify load_prompts_from_yaml to read image_path from the YAML and pass it to PromptSettings.
+       * [x] Implement logic in train_lora-scale.py to load latents from config.latent_cache_dir using image_path if available, otherwise generate them.
+       * [x] Implement logic in train_lora-scale-xl.py to load latents from config.latent_cache_dir using image_path if available, otherwise generate them.
 
 ## Diff Debugger Suite
 

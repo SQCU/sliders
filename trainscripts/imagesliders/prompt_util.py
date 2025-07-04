@@ -52,6 +52,7 @@ class PromptSettings(BaseModel):  # yaml のやつ
     dynamic_resolution: bool = False  # default is False
     batch_size: int = 1  # default is 1
     dynamic_crops: bool = False  # default is False. only used when model is XL
+    image_path: Optional[str] = None
 
     @root_validator(pre=True)
     def fill_prompts(cls, values):
@@ -79,6 +80,7 @@ class PromptEmbedsPair:
     dynamic_resolution: bool
     batch_size: int
     dynamic_crops: bool
+    image_path: Optional[str]
 
     loss_fn: torch.nn.Module
     action: ACTION_TYPES
@@ -104,6 +106,7 @@ class PromptEmbedsPair:
         self.batch_size = settings.batch_size
         self.dynamic_crops = settings.dynamic_crops
         self.action = settings.action
+        self.image_path = settings.image_path
 
     def _erase(
         self,
@@ -163,6 +166,8 @@ def load_prompts_from_yaml(path, attributes = []):
                 copy_['positive'] = att + ' ' + copy_['positive']
                 copy_['neutral'] = att + ' ' + copy_['neutral']
                 copy_['unconditional'] = att + ' ' + copy_['unconditional']
+                if 'image_path' in prompts[i]:
+                    copy_['image_path'] = prompts[i]['image_path']
                 newprompts.append(copy_)
     else:
         newprompts = copy.deepcopy(prompts)

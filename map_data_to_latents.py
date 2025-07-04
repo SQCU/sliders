@@ -140,6 +140,12 @@ def check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, v
     save_latents_to_disk(latents.squeeze(0), output_dir, image_path, vae_state_dict)
     return False
 
+def get_latent_for_image(image_path, vae, device, weight_dtype, output_dir, vae_state_dict):
+    check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, vae_state_dict)
+    latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
+    latent_path = os.path.join(output_dir, latent_filename)
+    return torch.load(latent_path)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", type=str, help="The directory containing the images to cache.")

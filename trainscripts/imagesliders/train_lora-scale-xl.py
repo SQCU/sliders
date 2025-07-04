@@ -6,6 +6,7 @@ import ast
 from pathlib import Path
 import gc, os
 import numpy as np
+import hashlib
 
 import torch
 from tqdm import tqdm
@@ -27,6 +28,7 @@ from prompt_util import (
 import debug_util
 import config_util
 from config_util import RootConfig
+import map_data_to_latents
 
 import wandb
 
@@ -68,6 +70,32 @@ def train(
     transform = transforms.Compose([
         transforms.ToTensor(),
     ])
+    if config.train.use_latents and config.latent_cache_dir is not None:
+        # Ensure VAE is on the correct device and dtype for encoding
+        vae.to(device, dtype=weight_dtype)
+        vae.requires_grad_(False)
+        vae.eval()
+        vae_checksum = hashlib.sha256(str(vae.state_dict()).encode('utf-8')).hexdigest()
+
+        # Pre-encode and cache latents if not already present and valid
+        all_image_paths = []
+        for folder in folders:
+            current_folder_path = os.path.join(folder_main, folder)
+            for filename in os.listdir(current_folder_path):
+                if filename.endswith((".png", ".jpg", ".jpeg")):
+                    all_image_paths.append(os.path.join(current_folder_path, filename))
+
+        print(f"Checking/encoding latents for {len(all_image_paths)} images...")
+        for image_path in all_image_paths:
+            map_data_to_latents.check_and_encode_latent(image_path, vae, device, weight_dtype, config.latent_cache_dir, vae.state_dict())
+        
+        # Move VAE off GPU after encoding to save VRAM
+        vae.to("cpu")
+        del vae
+        flush()
+    else:
+        vae_checksum = None # No VAE checksum needed if not using latents
+
     dataloader = create_dataloader(folder_main, folders, scales, training_config, use_latents, vae_checksum, transform)
 
     metadata = {

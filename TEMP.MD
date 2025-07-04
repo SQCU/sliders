@@ -7,9 +7,7 @@ This document details issues in the codebase that would prevent the use of Trito
 Triton works best with static shapes and predictable operations. The current codebase has several characteristics that would make Triton compilation difficult or impossible.
 
 1.  **Dynamic Shapes:**
-    *   `get_random_resolution_in_bucket()` in `train_util.py` generates random heights and widths for each training step. This means the input tensors to the UNet will have dynamic shapes, which Triton cannot handle. Triton requires static shapes for kernel compilation.
-        *   **Note on `get_random_resolution_in_bucket`:** While dynamic resolution within buckets is a canonical approach for certain diffusion model training strategies (e.g., to improve generalization and prevent overfitting to fixed resolutions), it poses a challenge for Triton compilation which prefers static tensor shapes. My previous attempt to enforce static shapes by modifying this function was reverted as it deviates from the established practice in this domain. Future work on Triton compatibility will need to address dynamic shapes through alternative methods, such as padding or dynamic shape support in Triton itself, rather than altering the resolution sampling strategy.
-    *   The batch size is effectively 1, but even if it were larger, the dynamic resolution would mean that the tensor shapes would change on each iteration.
+    *   The `get_random_resolution_in_bucket()` function has been removed, and the configuration now explicitly sets `dynamic_resolution: false`, ensuring static shapes for UNet inputs. This resolves the dynamic shape issue for Triton compatibility.
 
 2.  **Data-Dependent Control Flow:**
     *   The `predict_noise` function in `train_util.py` has a guidance scale parameter that is used in a conditional-like manner (`noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)`). While this is a standard part of diffusion models, it can be problematic for Triton if not handled carefully.
