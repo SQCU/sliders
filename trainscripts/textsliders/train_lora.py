@@ -16,6 +16,7 @@ from lora import LoRANetwork, DEFAULT_TARGET_REPLACE, UNET_TARGET_REPLACE_MODULE
 import train_util
 import model_util
 import prompt_util
+import map_data_to_latents
 from prompt_util import PromptEmbedsCache, PromptEmbedsPair, PromptSettings
 import debug_util
 import config_util
@@ -169,21 +170,16 @@ def train(
                 1, config.train.max_denoising_steps, (1,)
             ).item()
 
-            height, width = (
-                prompt_pair.resolution,
-                prompt_pair.resolution,
-            )
-            if prompt_pair.dynamic_resolution:
-                height, width = train_util.get_random_resolution_in_bucket(
-                    prompt_pair.resolution
-                )
+            # Cycle through resolutions if provided, otherwise use the single resolution
+            if prompt_pair.resolutions:
+                resolution_idx = i % len(prompt_pair.resolutions)
+                height = width = prompt_pair.resolutions[resolution_idx]
+            else:
+                height = width = prompt_pair.resolution
 
             if config.logging.verbose:
                 print("guidance_scale:", prompt_pair.guidance_scale)
-                print("resolution:", prompt_pair.resolution)
-                print("dynamic_resolution:", prompt_pair.dynamic_resolution)
-                if prompt_pair.dynamic_resolution:
-                    print("bucketed resolution:", (height, width))
+                print("resolution:", (height, width))
                 print("batch_size:", prompt_pair.batch_size)
 
             latents = train_util.get_initial_latents(

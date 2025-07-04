@@ -8,6 +8,7 @@ Triton works best with static shapes and predictable operations. The current cod
 
 1.  **Dynamic Shapes:**
     *   `get_random_resolution_in_bucket()` in `train_util.py` generates random heights and widths for each training step. This means the input tensors to the UNet will have dynamic shapes, which Triton cannot handle. Triton requires static shapes for kernel compilation.
+        *   **Note on `get_random_resolution_in_bucket`:** While dynamic resolution within buckets is a canonical approach for certain diffusion model training strategies (e.g., to improve generalization and prevent overfitting to fixed resolutions), it poses a challenge for Triton compilation which prefers static tensor shapes. My previous attempt to enforce static shapes by modifying this function was reverted as it deviates from the established practice in this domain. Future work on Triton compatibility will need to address dynamic shapes through alternative methods, such as padding or dynamic shape support in Triton itself, rather than altering the resolution sampling strategy.
     *   The batch size is effectively 1, but even if it were larger, the dynamic resolution would mean that the tensor shapes would change on each iteration.
 
 2.  **Data-Dependent Control Flow:**
@@ -44,7 +45,7 @@ High VRAM usage (observed ~48GB on RTX 4090) is a significant concern, leading t
     *   There is a suspicion that the UNet model might be inadvertently copied or duplicated during its lifecycle, potentially contributing to VRAM bloat.
     *   The `LoRANetwork` class constructor takes a UNet as an operand and appears to perform some operations that might involve the UNet. It's important to verify that the UNet is not being duplicated or held onto unnecessarily by the `LoRANetwork` instance, and that garbage collection is occurring as expected.
 
-# Super-Hype Extension: Sigmoid Contrastive Residual Loss
+## Super-Hype Extension: Sigmoid Contrastive Residual Loss
 
 This section outlines a theoretical extension to the slider training methodology, inspired by the principles of SigLIP (Sigmoid-based Language-Image Pre-training). The goal is to introduce a novel regularization loss that operates on the model's internal representations, promoting more consistent and robust conceptual sliders.
 
@@ -93,3 +94,12 @@ To assess the effectiveness of the SigLIP objective, linear probes can be attach
 
 -   The accuracy of these probes should increase as the SigLIP objective successfully encourages the desired separation and alignment of residual streams.
 -   Conversely, if the SigLIP objective is detrimental or meaningless, the probe accuracy should remain closer to that observed with an otherwise untrained diffusion model, indicating that the internal representations are not effectively capturing the slider concept.
+
+## Future Optimizations
+
+### Batched LoRA Application
+
+Currently, the `superfunctional_train_step` applies LoRA scales sequentially, which limits true concurrent processing. A future optimization would involve modifying the `LoRANetwork` and `LoRAModule` to accept and apply a batch of LoRA scales, enabling a single UNet forward pass with different LoRA scales applied concurrently. This would require:
+1.  **Modifying `LoRAModule`:** Update `self.multiplier` to accept a `torch.Tensor` of multipliers (one per batch item) and adjust the `forward` method for element-wise multiplication.
+2.  **Modifying `LoRANetwork`:** Change `set_lora_slider` to accept a batch of scales and pass these to the `LoRAModule` instances.
+3.  **Modifying `superfunctional_train_step`:** Combine high and low scale inputs into a single batch for `denoised_latents`, `text_embeddings`, `pooled_embeds`, and `add_time_ids`. Call `predict_noise_xl` once with this combined batch and the batched LoRA scales. Then, split the results.

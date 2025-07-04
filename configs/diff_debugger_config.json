@@ -1,0 +1,31 @@
+{
+    "tensor_logs_file": "F:/dox/ai/gemmy/sliders/tensor_logs/diff_debugger_tensors.pt",
+    "output_dir": "F:/dox/ai/gemmy/sliders/tensor_logs",
+    "vae_config_path": "trainscripts/imagesliders/data/config-xl-dilora.yaml",
+    "tensor_groups": [
+        {
+            "name": "Original Tensors",
+            "prefix": "orig",
+            "tensor_types": ["denoised_latents", "noise", "target_latents", "loss_per_element"],
+            "visualization_type": "image"
+        },
+        {
+            "name": "Refactored Tensors",
+            "prefix": "refactored",
+            "tensor_types": ["denoised_latents", "noise", "target_latents", "loss_per_element"],
+            "visualization_type": "image"
+        },
+        {
+            "name": "Superfunctional Tensors",
+            "prefix": "super",
+            "tensor_types": ["denoised_latents", "noise", "target_latents", "loss_per_element"],
+            "visualization_type": "image"
+        },
+        {
+            "name": "Difference Tensors (Absolute)",
+            "prefix": "diff",
+            "tensor_types": ["high_orig_refactored", "low_orig_refactored", "high_orig_super", "low_orig_super"],
+            "visualization_type": "plot"
+        }
+    ]
+}

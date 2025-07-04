@@ -404,16 +404,4 @@ def get_lr_scheduler(
         )
 
 
-def get_random_resolution_in_bucket(bucket_resolution: int = 512) -> tuple[int, int]:
-    max_resolution = bucket_resolution
-    min_resolution = bucket_resolution // 2
 
-    step = 64
-
-    min_step = min_resolution // step
-    max_step = max_resolution // step
-
-    height = torch.randint(min_step, max_step, (1,)).item() * step
-    width = torch.randint(min_step, max_step, (1,)).item() * step
-
-    return height, width

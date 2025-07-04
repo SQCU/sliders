@@ -176,18 +176,16 @@ def train(
                 1, config.train.max_denoising_steps, (1,)
             ).item()
 
-            height, width = prompt_pair.resolution, prompt_pair.resolution
-            if prompt_pair.dynamic_resolution:
-                height, width = train_util.get_random_resolution_in_bucket(
-                    prompt_pair.resolution
-                )
+            # Cycle through resolutions if provided, otherwise use the single resolution
+            if prompt_pair.resolutions:
+                resolution_idx = i % len(prompt_pair.resolutions)
+                height = width = prompt_pair.resolutions[resolution_idx]
+            else:
+                height = width = prompt_pair.resolution
 
             if config.logging.verbose:
                 print("gudance_scale:", prompt_pair.guidance_scale)
-                print("resolution:", prompt_pair.resolution)
-                print("dynamic_resolution:", prompt_pair.dynamic_resolution)
-                if prompt_pair.dynamic_resolution:
-                    print("bucketed resolution:", (height, width))
+                print("resolution:", (height, width))
                 print("batch_size:", prompt_pair.batch_size)
                 print("dynamic_crops:", prompt_pair.dynamic_crops)
 

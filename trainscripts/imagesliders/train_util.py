@@ -1,6 +1,7 @@
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import torch
+from PIL import Image
 
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import UNet2DConditionModel, SchedulerMixin
@@ -199,7 +200,7 @@ def diffusion(
 
 @torch.no_grad()
 def get_noisy_image(
-    img,
+    imgs: Union[Image.Image, List[Image.Image]],
     vae,
     generator,
     unet: UNet2DConditionModel,
@@ -209,29 +210,27 @@ def get_noisy_image(
     
     **kwargs,
 ):
-    # latents_steps = []
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
-    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor,do_convert_rgb=True)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
 
-    image = img#.convert('RGB')
-    im_orig = image
-    device = vae.device
-    image = image_processor.preprocess(image).to(device, dtype=vae.dtype)
+    if isinstance(imgs, Image.Image):
+        imgs = [imgs] # Convert single image to a list for consistent processing
 
-    init_latents = vae.encode(image).latent_dist.sample(None)
+    image_tensors = [image_processor.preprocess(img).to(vae.device, dtype=vae.dtype) for img in imgs]
+    image_batch = torch.cat(image_tensors, dim=0)
+
+    init_latents = vae.encode(image_batch).latent_dist.sample(None)
     init_latents = vae.config.scaling_factor * init_latents
-
-    init_latents = torch.cat([init_latents], dim=0)
 
     shape = init_latents.shape
 
-    noise = randn_tensor(shape, generator=generator, device=device)
+    noise = randn_tensor(shape, generator=generator, device=vae.device) # Use vae.device for noise
 
     time_ = total_timesteps
     timestep = scheduler.timesteps[time_:time_+1]
     # get latents
     init_latents = scheduler.add_noise(init_latents, noise, timestep)
-    
+
     return init_latents, noise
 
 
@@ -443,16 +442,4 @@ def get_lr_scheduler(
         )
 
 
-def get_random_resolution_in_bucket(bucket_resolution: int = 512) -> tuple[int, int]:
-    max_resolution = bucket_resolution
-    min_resolution = bucket_resolution // 2
 
-    step = 64
-
-    min_step = min_resolution // step
-    max_step = max_resolution // step
-
-    height = torch.randint(min_step, max_step, (1,)).item() * step
-    width = torch.randint(min_step, max_step, (1,)).item() * step
-
-    return height, width

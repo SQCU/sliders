@@ -65,6 +65,7 @@ class OtherConfig(BaseModel):
 class RootConfig(BaseModel):
     prompts_file: str
     pretrained_model: PretrainedModelConfig
+    latent_cache_dir: Optional[str] = None
 
     network: NetworkConfig
 

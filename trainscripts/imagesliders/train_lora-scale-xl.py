@@ -33,6 +33,22 @@ import wandb
 NUM_IMAGES_PER_PROMPT = 1
 from lora import LoRANetwork, DEFAULT_TARGET_REPLACE, UNET_TARGET_REPLACE_MODULE_CONV
 
+class EMA:
+    def __init__(self, decay):
+        self.decay = decay
+        self.shadow = {}
+
+    def update(self, name, x):
+        if name not in self.shadow:
+            self.shadow[name] = x.clone().detach()
+        else:
+            self.shadow[name].mul_(self.decay).add_(x, alpha=1 - self.decay)
+        return self.shadow[name]
+
+    def get(self, name):
+        return self.shadow.get(name, None)
+
+
 def flush():
     torch.cuda.empty_cache()
     gc.collect()
@@ -46,12 +62,13 @@ def train(
     folder_main: str,
     folders,
     scales,
+    use_latents: bool = False,
 ):
     # Create the dataloader
     transform = transforms.Compose([
         transforms.ToTensor(),
     ])
-    dataloader = create_dataloader(folder_main, folders, scales, training_config, transform)
+    dataloader = create_dataloader(folder_main, folders, scales, training_config, use_latents, vae_checksum, transform)
 
     metadata = {
         "prompts": ",".join([prompt.json() for prompt in prompts]),
@@ -102,6 +119,10 @@ def train(
     vae.to(device, dtype=weight_dtype)
     vae.requires_grad_(False)
     vae.eval()
+
+    vae_checksum = None
+    if config.train.use_latents:
+        vae_checksum = hashlib.sha256(str(vae.state_dict()).encode('utf-8')).hexdigest()
 
     if config.other.torch_compile:
         unet = torch.compile(unet)
@@ -162,6 +183,8 @@ def train(
 
     cache = PromptEmbedsCache()
     prompt_pairs: list[PromptEmbedsPair] = []
+
+    loss_ema = EMA(decay=0.999) # EMA for loss tracking
 
     with torch.no_grad():
         for settings in prompts:
@@ -233,9 +256,12 @@ def train(
             loss = loss_high + loss_low
             
             pbar.set_description(f"Loss*1k: {loss.item()*1000:.4f}")
+            
+            # Update and log EMA of loss
+            ema_loss = loss_ema.update("loss", loss)
             if config.logging.use_wandb:
                 wandb.log(
-                    {"loss": loss, "iteration": i, "lr": lr_scheduler.get_last_lr()[0]}
+                    {"loss": loss, "ema_loss": ema_loss, "iteration": i, "lr": lr_scheduler.get_last_lr()[0]}
                 )
 
             loss.backward()
@@ -317,9 +343,9 @@ def main(args):
             config.save.name += f'_alpha{args.alpha}'
             config.save.name += f'_rank{config.network.rank }'
             config.save.path = f'models/{config.save.name}'
-            train(config=config, training_config=training_config, prompts=prompts, device=device, folder_main = folder_main, folders = folders, scales = scales)
+            train(config=config, training_config=training_config, prompts=prompts, device=device, folder_main = folder_main, folders = folders, scales = scales, use_latents=args.use_latents)
     else:
-        train(config=config, training_config=training_config, prompts=prompts, device=device, folder_main = args.folder_main, folders = folders, scales = scales)
+        train(config=config, training_config=training_config, prompts=prompts, device=device, folder_main = args.folder_main, folders = folders, scales = scales, use_latents=args.use_latents)
 
 
 if __name__ == "__main__":
@@ -394,6 +420,12 @@ if __name__ == "__main__":
         help="scales for different attribute-scaled images",
     )
     
+    
+    parser.add_argument(
+        "--use_latents",
+        action="store_true",
+        help="Use cached latents instead of images.",
+    )
     
     args = parser.parse_args()
 

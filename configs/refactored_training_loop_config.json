@@ -1,0 +1,4 @@
+{
+    "config_yaml_path": "trainscripts/imagesliders/data/config-xl-dilora.yaml",
+    "tensor_logs_output_dir": "F:/dox/ai/gemmy/sliders/tensor_logs"
+}

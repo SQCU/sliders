@@ -1,6 +1,5 @@
-Running test_refactored_training_loop...
 Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<?, ?it/s]
-Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.65it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.21it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.88it/s]
+Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.48it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.10it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.77it/s]
 VRAM usage after model loading: 5.04 GB
 Max VRAM usage after model loading: 5.04 GB
 create LoRA for U-Net: 280 modules.
@@ -19,14 +18,41 @@ __enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was
 __enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast3/16
 __enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast4/16
 __enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast5/16
-Difference (abs) high_orig vs high_refactored: 0.008086800575256348
-Difference (abs) low_orig vs low_refactored: 0.007089853286743164
-Difference (abs) high_orig vs high_super: 0.00027430057525634766
-Difference (abs) low_orig vs low_super: 0.0007226467132568359
-Difference (L2 norm) high_orig vs high_refactored: 0.008086800575256348
-Difference (L2 norm) low_orig vs low_refactored: 0.007089853286743164
-Difference (L2 norm) high_orig vs high_super: 0.00027430057525634766
-Difference (L2 norm) low_orig vs low_super: 0.0007226467132568359
-Difference tensors saved as .pt files.
+Difference (abs) high_orig vs high_refactored: 0.0
+Difference (abs) low_orig vs low_refactored: 0.0
+Difference (abs) high_orig vs high_super: 0.0
+Difference (abs) low_orig vs low_super: 0.0
+Difference (L2 norm) high_orig vs high_refactored: 0.0
+Difference (L2 norm) low_orig vs low_refactored: 0.0
+Difference (L2 norm) high_orig vs high_super: 0.0
+Difference (L2 norm) low_orig vs low_super: 0.0
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 17029.66it/s]
+Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.62it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.14it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.80it/s]
+VRAM usage after model loading: 5.92 GB
+Max VRAM usage after model loading: 5.99 GB
+create LoRA for U-Net: 280 modules.
+[{'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False, 'batch_size': 1}]
+[{'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False, 'batch_size': 1}]
+1 1
+VRAM usage after prompt embedding processing: 6.00 GB
+Max VRAM usage after prompt embedding processing: 6.00 GB
+VRAM usage after image processing: 6.00 GB
+Max VRAM usage after image processing: 6.01 GB
+VRAM usage after add_time_ids processing: 6.00 GB
+Max VRAM usage after add_time_ids processing: 6.01 GB
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:1.0*1.0mblast0/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast1/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast2/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast3/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast4/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast5/16
+Difference (abs) high_orig vs high_refactored: 0.0
+Difference (abs) low_orig vs low_refactored: 0.0
+Difference (abs) high_orig vs high_super: 0.0
+Difference (abs) low_orig vs low_super: 0.0
+Difference (L2 norm) high_orig vs high_refactored: 0.0
+Difference (L2 norm) low_orig vs low_refactored: 0.0
+Difference (L2 norm) high_orig vs high_super: 0.0
+Difference (L2 norm) low_orig vs low_super: 0.0
+All tensors saved to F:/dox/ai/gemmy/sliders/tensor_logs\diff_debugger_tensors.pt
 All tests completed. Please check the differences and saved tensors.
-Test completed successfully.

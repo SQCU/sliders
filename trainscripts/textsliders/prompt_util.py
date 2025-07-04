@@ -44,12 +44,13 @@ class PromptEmbedsCache:  # 使いまわしたいので
 class PromptSettings(BaseModel):  # yaml のやつ
     target: str
     positive: str = None   # if None, target will be used
+    image_path: Optional[str] = None
     unconditional: str = ""  # default is ""
     neutral: str = None  # if None, unconditional will be used
     action: ACTION_TYPES = "erase"  # default is "erase"
     guidance_scale: float = 1.0  # default is 1.0
     resolution: int = 512  # default is 512
-    dynamic_resolution: bool = False  # default is False
+    resolutions: Optional[List[int]] = None # if not None, use these resolutions in sequence
     batch_size: int = 1  # default is 1
     dynamic_crops: bool = False  # default is False. only used when model is XL
 
@@ -76,9 +77,11 @@ class PromptEmbedsPair:
 
     guidance_scale: float
     resolution: int
-    dynamic_resolution: bool
+    resolutions: Optional[List[int]]
     batch_size: int
     dynamic_crops: bool
+    image_path: Optional[str]
+    image_path: Optional[str]
 
     loss_fn: torch.nn.Module
     action: ACTION_TYPES
@@ -100,7 +103,7 @@ class PromptEmbedsPair:
         
         self.guidance_scale = settings.guidance_scale
         self.resolution = settings.resolution
-        self.dynamic_resolution = settings.dynamic_resolution
+        self.resolutions = settings.resolutions
         self.batch_size = settings.batch_size
         self.dynamic_crops = settings.dynamic_crops
         self.action = settings.action
