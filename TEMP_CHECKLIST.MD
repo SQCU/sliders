@@ -44,3 +44,10 @@ This checklist summarizes the issues that need to be addressed to improve the pe
 *   [ ] **Review UNet and LoRANetwork Instantiation:**
     *   [ ] Verify that the UNet model is not being inadvertently copied or duplicated.
     *   [ ] Investigate `LoRANetwork` constructor to ensure proper memory management and garbage collection of UNet instances.
+
+## Diff Debugger Suite
+
+*   [x] **Basic Statistics:** Implement loading and analysis of difference tensors (min, max, mean, std dev).
+*   [ ] **Tensor Visualization:** Implement functions to convert image-like tensors to displayable formats.
+*   [ ] **Tensor Statistics and EMAs:** Integrate into training loop to track moving averages of tensor statistics.
+*   [ ] **Metadata Labeling:** Enhance analysis with explicit metadata about tensor origin and purpose.

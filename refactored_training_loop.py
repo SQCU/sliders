@@ -112,7 +112,7 @@ def functional_train_step(
                 duplicated_add_time_ids,
                 guidance_scale=1,
             )
-    loss_high = criteria(target_latents_high, high_noise).to(torch.float32)
+    loss_high_per_element = (target_latents_high - high_noise).pow(2).to(torch.float32)
 
     # Low scale
     network.set_lora_slider(scale=-scale_to_look)
@@ -133,9 +133,9 @@ def functional_train_step(
                 duplicated_add_time_ids,
                 guidance_scale=1,
             )
-    loss_low = criteria(target_latents_low, low_noise).to(torch.float32)
+    loss_low_per_element = (target_latents_low - low_noise).pow(2).to(torch.float32)
 
-    return loss_high, loss_low
+    return loss_high_per_element.cpu(), loss_low_per_element.cpu(), denoised_latents_high.cpu(), high_noise.cpu(), target_latents_high.cpu(), denoised_latents_low.cpu(), low_noise.cpu(), target_latents_low.cpu()
 
 
 def superfunctional_train_step(
@@ -216,12 +216,12 @@ def superfunctional_train_step(
                     duplicated_add_time_ids,
                     guidance_scale=1,
                 )
-            return criteria(target_latents, noise).to(torch.float32)
+            return (target_latents - noise).pow(2).to(torch.float32).cpu(), denoised_latents.cpu(), noise.cpu(), target_latents.cpu()
 
-    loss_high = process_case(img_batches[0], scales[0], prompt_embeds[0])
-    loss_low = process_case(img_batches[1], scales[1], prompt_embeds[1])
+    loss_high_per_element, denoised_latents_high, high_noise, target_latents_high = process_case(img_batches[0], scales[0], prompt_embeds[0])
+    loss_low_per_element, denoised_latents_low, low_noise, target_latents_low = process_case(img_batches[1], scales[1], prompt_embeds[1])
 
-    return loss_high, loss_low
+    return loss_high_per_element, loss_low_per_element, denoised_latents_high, high_noise, target_latents_high, denoised_latents_low, low_noise, target_latents_low
 
 
 def test_refactored_training_loop():
@@ -287,12 +287,14 @@ def test_refactored_training_loop():
     log_vram_usage("add_time_ids processing")
 
     # Original implementation
-    loss_high_orig, loss_low_orig = original_train_step(
+    loss_high_orig_per_element, loss_low_orig_per_element, orig_denoised_latents_high, orig_high_noise, orig_target_latents_high, orig_denoised_latents_low, orig_low_noise, orig_target_latents_low = original_train_step(
         unet, vae, noise_scheduler, img1, img2, 1.0, prompt_pair, config, network, torch.nn.MSELoss(), device, weight_dtype, add_time_ids
     )
+    loss_high_orig = loss_high_orig_per_element.mean()
+    loss_low_orig = loss_low_orig_per_element.mean()
 
     # Refactored implementation
-    loss_high_refactored, loss_low_refactored = functional_train_step(
+    loss_high_refactored_per_element, loss_low_refactored_per_element, refactored_denoised_latents_high, refactored_high_noise, refactored_target_latents_high, refactored_denoised_latents_low, refactored_low_noise, refactored_target_latents_low = functional_train_step(
         unet,
         vae,
         noise_scheduler,
@@ -307,9 +309,11 @@ def test_refactored_training_loop():
         weight_dtype,
         add_time_ids
     )
+    loss_high_refactored = loss_high_refactored_per_element.mean()
+    loss_low_refactored = loss_low_refactored_per_element.mean()
 
     # Super-functional implementation
-    loss_high_super, loss_low_super = superfunctional_train_step(
+    loss_high_super_per_element, loss_low_super_per_element, super_denoised_latents_high, super_high_noise, super_target_latents_high, super_denoised_latents_low, super_low_noise, super_target_latents_low = superfunctional_train_step(
         unet,
         vae,
         noise_scheduler,
@@ -324,6 +328,8 @@ def test_refactored_training_loop():
         weight_dtype,
         add_time_ids
     )
+    loss_high_super = loss_high_super_per_element.mean()
+    loss_low_super = loss_low_super_per_element.mean()
 
     # Assert that the losses are identical
     diff_high_orig_refactored = torch.abs(loss_high_orig - loss_high_refactored)
@@ -341,14 +347,41 @@ def test_refactored_training_loop():
     print(f"Difference (L2 norm) high_orig vs high_super: {torch.linalg.norm(diff_high_orig_super).item()}")
     print(f"Difference (L2 norm) low_orig vs low_super: {torch.linalg.norm(diff_low_orig_super).item()}")
 
-    # Save difference tensors for further inspection
-    torch.save(diff_high_orig_refactored, "diff_high_orig_refactored.pt")
-    torch.save(diff_low_orig_refactored, "diff_low_orig_refactored.pt")
-    torch.save(diff_high_orig_super, "diff_high_orig_super.pt")
-    torch.save(diff_low_orig_super, "diff_low_orig_super.pt")
+    # Save all tensors into a single state dictionary
+    output_dir = "F:/dox/ai/gemmy/sliders/tensor_logs"
+    state_dict_filename = os.path.join(output_dir, "diff_debugger_tensors.pt")
+    torch.save({
+        "diff_high_orig_refactored": diff_high_orig_refactored,
+        "diff_low_orig_refactored": diff_low_orig_refactored,
+        "diff_high_orig_super": diff_high_orig_super,
+        "diff_low_orig_super": diff_low_orig_super,
+        "loss_high_orig_per_element": loss_high_orig_per_element,
+        "loss_low_orig_per_element": loss_low_orig_per_element,
+        "loss_high_refactored_per_element": loss_high_refactored_per_element,
+        "loss_low_refactored_per_element": loss_low_refactored_per_element,
+        "loss_high_super_per_element": loss_high_super_per_element,
+        "loss_low_super_per_element": loss_low_super_per_element,
+        "orig_denoised_latents_high": orig_denoised_latents_high,
+        "orig_high_noise": orig_high_noise,
+        "orig_target_latents_high": orig_target_latents_high,
+        "orig_denoised_latents_low": orig_denoised_latents_low,
+        "orig_low_noise": orig_low_noise,
+        "orig_target_latents_low": orig_target_latents_low,
+        "refactored_denoised_latents_high": refactored_denoised_latents_high,
+        "refactored_high_noise": refactored_high_noise,
+        "refactored_target_latents_high": refactored_target_latents_high,
+        "refactored_denoised_latents_low": refactored_denoised_latents_low,
+        "refactored_low_noise": refactored_low_noise,
+        "refactored_target_latents_low": refactored_target_latents_low,
+        "super_denoised_latents_high": super_denoised_latents_high,
+        "super_high_noise": super_high_noise,
+        "super_target_latents_high": super_target_latents_high,
+        "super_denoised_latents_low": super_denoised_latents_low,
+        "super_low_noise": super_low_noise,
+        "super_target_latents_low": super_target_latents_low,
+    }, state_dict_filename)
 
-    print("Difference tensors saved as .pt files.")
-
+    print(f"All tensors saved to {state_dict_filename}")
     print("All tests completed. Please check the differences and saved tensors.")
 
 
@@ -442,7 +475,7 @@ def original_train_step(
                 duplicated_add_time_ids,
                 guidance_scale=1,
             ).to("cpu", dtype=torch.float32)
-    loss_high = criteria(target_latents_high, high_noise.cpu().to(torch.float32))
+    loss_high_per_element = (target_latents_high - high_noise.cpu().to(torch.float32)).pow(2)
 
     network.set_lora_slider(scale=-scale_to_look)
     with network:
@@ -462,9 +495,9 @@ def original_train_step(
                 duplicated_add_time_ids,
                 guidance_scale=1,
             ).to("cpu", dtype=torch.float32)
-    loss_low = criteria(target_latents_low, low_noise.cpu().to(torch.float32))
+    loss_low_per_element = (target_latents_low - low_noise.cpu().to(torch.float32)).pow(2)
 
-    return loss_high, loss_low
+    return loss_high_per_element.cpu(), loss_low_per_element.cpu(), denoised_latents_high.cpu(), high_noise.cpu(), target_latents_high.cpu(), denoised_latents_low.cpu(), low_noise.cpu(), target_latents_low.cpu()
 
 
 if __name__ == "__main__":
