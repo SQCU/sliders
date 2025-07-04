@@ -1,3 +1,28 @@
 Running test_refactored_training_loop...
 Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<?, ?it/s]
-Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.87it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:02<00:00,  2.45it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:02<00:00,  3.03it/s]
+Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.62it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.03it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.55it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.63it/s]
+Traceback (most recent call last):
+  File "F:\dox\ai\gemmy\sliders\run_test_wrapper.py", line 10, in <module>
+    test_refactored_training_loop()
+  File "F:\dox\ai\gemmy\sliders\refactored_training_loop.py", line 329, in test_refactored_training_loop
+    assert torch.allclose(loss_high_orig, loss_high_refactored, rtol=1e-4, atol=1e-4)
+AssertionError
+VRAM usage after model loading: 5.04 GB
+Max VRAM usage after model loading: 5.04 GB
+create LoRA for U-Net: 280 modules.
+[{'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False, 'batch_size': 1}]
+[{'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False, 'batch_size': 1}]
+1 1
+VRAM usage after prompt embedding processing: 5.12 GB
+Max VRAM usage after prompt embedding processing: 5.12 GB
+VRAM usage after image processing: 5.13 GB
+Max VRAM usage after image processing: 5.13 GB
+VRAM usage after add_time_ids processing: 5.13 GB
+Max VRAM usage after add_time_ids processing: 5.13 GB
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:1.0*1.0mblast0/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast1/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast2/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast3/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast4/16
+__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast5/16
+An error occurred during testing: 
