@@ -110,3 +110,11 @@ Currently, the `superfunctional_train_step` applies LoRA scales sequentially, wh
 *   Currently debugging `RuntimeError: The size of tensor a (...) must match the size of tensor b (...) at non-singleton dimension 0` related to batch size mismatches in `predict_noise_xl` due to Classifier-Free Guidance (CFG) duplication.
 *   Identified that `predict_noise_xl` internally handles CFG duplication for `latents`, `text_embeddings`, `add_text_embeddings`, and `add_time_ids`.
 *   Current approach for `superfunctional_train_step` is to ensure that the inputs to `predict_noise_xl` are *not* pre-duplicated for CFG, and that `denoised_latents_high` and `denoised_latents_low` are duplicated *before* being passed to `predict_noise_xl` to match the expected input size for CFG.
+
+## Debugging Tensor Dimension Mismatches
+
+When encountering `RuntimeError: The size of tensor a (...) must match the size of tensor b (...) at non-singleton dimension 0` or similar dimension mismatch errors, follow these steps:
+1.  **Identify the Mismatched Tensors:** Pinpoint the exact tensors involved in the operation causing the error.
+2.  **Print Full Shapes:** Immediately before the problematic operation, print the `.shape` attribute of *all* involved tensors. This provides the actual dimensions at that point in execution.
+3.  **Trace Creation and Content:** For each mismatched tensor, trace back its creation. Show the code snippet where it was initialized or last modified. If feasible and the tensor is small, print its contents (or a representative slice) to understand its data.
+4.  **Avoid Speculation:** Do not immediately theorize *why* the mismatch occurred. Focus solely on presenting the factual information (shapes, creation code, contents) to allow for a data-driven diagnosis.

@@ -198,6 +198,14 @@ def load_checkpoint_model_xl(
     vae = pipe.vae
     del pipe
 
+    for text_encoder in text_encoders:
+        for param in text_encoder.parameters():
+            param.requires_grad = False
+    for param in unet.parameters():
+        param.requires_grad = False
+    for param in vae.parameters():
+        param.requires_grad = False
+
     return tokenizers, text_encoders, unet, vae
 
 
