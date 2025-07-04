@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "F:\dox\ai\gemmy\sliders\test_lora_batching.py", line 125, in <module>
+    test_batched_lora_gradients()
+  File "F:\dox\ai\gemmy\sliders\test_lora_batching.py", line 46, in test_batched_lora_gradients
+    unet_batched, lora_network_batched = setup_models(rank, alpha)
+  File "F:\dox\ai\gemmy\sliders\test_lora_batching.py", line 28, in setup_models
+    lora_network = LoRANetwork(
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\lora.py", line 146, in __init__
+    self.unet_loras = self.create_modules(
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\lora.py", line 221, in create_modules
+    lora = self.module(
+TypeError: LoRAModule.__init__() takes from 3 to 5 positional arguments but 6 were given

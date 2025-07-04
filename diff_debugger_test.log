@@ -1,0 +1,7 @@
+Loading and analyzing difference tensors...
+Traceback (most recent call last):
+  File "F:\dox\ai\gemmy\sliders\diff_debugger.py", line 127, in <module>
+    main()
+  File "F:\dox\ai\gemmy\sliders\diff_debugger.py", line 58, in main
+    vae_config = config_util.load_config_from_yaml(config["vae_config_path"])
+NameError: name 'config_util' is not defined

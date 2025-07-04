@@ -1,2 +1,5 @@
+models/**
 
-remove_files.py
+trainscripts/imagesliders/__pycache__/**
+
+*.deb

@@ -28,6 +28,7 @@ import numpy as np
 import wandb
 from PIL import Image
 from data_preprocessing import create_dataloader
+import map_data_to_latents
 
 def flush():
     torch.cuda.empty_cache()
@@ -175,6 +176,44 @@ def train(
             prompt_pair: PromptEmbedsPair = prompt_pairs[
                 torch.randint(0, len(prompt_pairs), (1,)).item()
             ]
+
+            # Determine if latents should be loaded from cache or generated
+            if prompt_pair.image_path and config.latent_cache_dir:
+                vae_state_dict = vae.state_dict()
+                denoised_latents_low = map_data_to_latents.get_latent_for_image(
+                    prompt_pair.image_path, vae, device, weight_dtype, config.latent_cache_dir, vae_state_dict
+                ).unsqueeze(0) # Add batch dimension
+                low_noise = torch.randn_like(denoised_latents_low) # Generate noise for consistency
+
+                denoised_latents_high = map_data_to_latents.get_latent_for_image(
+                    prompt_pair.image_path, vae, device, weight_dtype, config.latent_cache_dir, vae_state_dict
+                ).unsqueeze(0) # Add batch dimension
+                high_noise = torch.randn_like(denoised_latents_high) # Generate noise for consistency
+            else:
+                # Generate latents if no cache path or image_path is provided
+                denoised_latents_low, low_noise = train_util.get_noisy_image(
+                    img1_batch,
+                    vae,
+                    generator,
+                    unet,
+                    noise_scheduler,
+                    start_timesteps=0,
+                    total_timesteps=config.train.max_denoising_steps -1,
+                )
+                denoised_latents_low = denoised_latents_low.to(device, dtype=weight_dtype)
+                low_noise = low_noise.to(device, dtype=weight_dtype)
+
+                denoised_latents_high, high_noise = train_util.get_noisy_image(
+                    img2_batch,
+                    vae,
+                    generator,
+                    unet,
+                    noise_scheduler,
+                    start_timesteps=0,
+                    total_timesteps=config.train.max_denoising_steps -1,
+                )
+                denoised_latents_high = denoised_latents_high.to(device, dtype=weight_dtype)
+                high_noise = high_noise.to(device, dtype=weight_dtype)
 
             loss_high, loss_low = superfunctional_train_step(
                 unet,

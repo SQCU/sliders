@@ -1,5 +1,5 @@
 Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<?, ?it/s]
-Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.48it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.10it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.77it/s]
+Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.49it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.13it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.79it/s]
 VRAM usage after model loading: 5.04 GB
 Max VRAM usage after model loading: 5.04 GB
 create LoRA for U-Net: 280 modules.
@@ -26,8 +26,8 @@ Difference (L2 norm) high_orig vs high_refactored: 0.0
 Difference (L2 norm) low_orig vs low_refactored: 0.0
 Difference (L2 norm) high_orig vs high_super: 0.0
 Difference (L2 norm) low_orig vs low_super: 0.0
-Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 17029.66it/s]
-Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.62it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.14it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.80it/s]
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 16952.73it/s]
+Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.82it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.18it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.86it/s]
 VRAM usage after model loading: 5.92 GB
 Max VRAM usage after model loading: 5.99 GB
 create LoRA for U-Net: 280 modules.

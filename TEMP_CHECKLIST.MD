@@ -1,67 +1,39 @@
-# Checklist for Code Improvements
+# Checklist for Future Code Improvements
 
-This checklist summarizes the issues that need to be addressed to improve the performance, scalability, and Triton compatibility of the codebase.
+This checklist outlines the next steps for enhancing the training core loop to support batched training and GLORA features.
 
-## Triton Compatibility
+## 1. Batched Training of Multiple Training Pairs
 
-*   [x] **Remove Dynamic Shapes:**
-    *   [x] Replace `get_random_resolution_in_bucket()` with a fixed resolution or a pre-defined set of resolutions that can be batched together.
-    *   [x] Ensure that all tensors passed to the UNet have static shapes.
-*   [x] **Minimize CPU/GPU Synchronization:**
-    *   [x] **Fix `refactored_training_loop.py` execution:**
-        *   [x] **Immediate:** Correct `superfunctional_train_step` to use `predict_noise_xl` with `add_time_ids`.
-            *   [x] Run `uv run python F:/dox/ai/gemmy/sliders/refactored_training_loop.py > refactored_training_loop_test.log 2>&1`.
-            *   [x] Review `refactored_training_loop_test.log` for errors.
-            *   [x] Manually apply necessary code changes based on the error.
-        *   [x] **Intermediate:** Ensure `refactored_training_loop.py` runs without errors.
-        *   [x] **Final:** Verify `functional_train_step` is float-for-float identical to original.
-        *   [x] **Final:** Verify `superfunctional_train_step` is float-for-float identical to original.
-    *   [x] Keep all tensors on the GPU as much as possible.
-    *   [x] Move loss calculation to the GPU.
-    *   [x] Remove unnecessary `.to("cpu")` calls.
+**Goal:** Enable `train_lora-scale-xl.py` to process multiple image pairs within a single forward pass, leveraging GPU parallelism.
 
-## General Performance and Scalability
+*   [ ] **Modify `train_lora-scale-xl.py` (Main Training Loop):**
+    *   [ ] Ensure the `dataloader` provides batches of `(img1_batch, scale1_batch), (img2_batch, scale2_batch)` where `img1_batch` and `img2_batch` have a batch dimension `B > 1`.
+    *   [ ] Implement logic to select or construct `B` prompt embeddings, one for each pair in the batch.
+    *   [ ] Pass these batched prompt embeddings (e.g., `batched_positive_embeds`, `batched_neutral_embeds`) to `superfunctional_train_step`.
 
-*   [x] **Implement a `torch.utils.data.Dataset` and `DataLoader`:**
-    *   [x] Create a custom `Dataset` to load and preprocess images.
-    *   [x] Use a `DataLoader` to load data in a separate process and pre-fetch batches.
-*   [x] **Implement True Batching:**
-    *   [x] Modify the data loading and training loop to handle true batches of data (i.e., tensors with a batch dimension greater than 1).
-    *   [x] Remove the manual gradient accumulation.
-*   [x] **Optimize Sequential Tensor Operations:**
-    *   [x] Identify sequential calls to functions that operate on compatible tensors (e.g., `func(tensor1); func(tensor2)`).
-    *   [x] Refactor these calls to batch the tensors (e.g., `func(torch.cat([tensor1, tensor2]))`) and process them concurrently as a single execution step, then split results if necessary.
-    *   [x] Prioritize pairs of identical tensors for this optimization to maximize cache hits and accelerator utilization.
-*   [x] **Refactor the Training Loop:**
-    *   [x] Move all data loading and preprocessing out of the main loop.
-    *   [x] Ensure that all operations within the loop are performed on the GPU.
-*   [x] **Make Parameters Configurable:**
-    *   [x] Replace hardcoded values (e.g., image resolution) with configurable parameters.
+*   [ ] **Modify `superfunctional_train_step` Function:**
+    *   [ ] Adapt the function signature to accept batched inputs for images, scales, and prompt embeddings.
+    *   [ ] Concatenate `img1_batch` and `img2_batch` along the batch dimension for a single UNet input.
+    *   [ ] Concatenate corresponding batched prompt embeddings and `add_time_ids`.
+    *   [ ] Perform a single call to `predict_noise_xl` with the concatenated batched inputs.
+    *   [ ] Split the output (e.g., `noise_pred`) back into `B` components.
+    *   [ ] Calculate the loss for each pair in the batch and then average or sum them.
 
-## VRAM Optimization
+## 2. GLORA Features (Sigmoid Contrastive Residual Loss & Batched LoRA Application)
 
-*   [x] **Pre-encode and Cache VAE Latents:**
-    *   [x] Implement `map_data_to_latents` function to encode and cache VAE latents to disk.
-    *   [x] Ensure VAE encoder is loaded with highest possible batch size during pre-encoding.
-    *   [x] Implement checksum verification for cached latents (VAE state_dict, image checksum, encoded latent checksum).
-*   [x] **Optimize VAE Decoder Usage:**
-    *   [x] Ensure VAE decoder is only loaded when necessary (e.g., for post-training analysis), not during the core training loop.
-*   [x] **Review UNet and LoRANetwork Instantiation:**
-    *   [x] Verify that the UNet model is not being inadvertently copied or duplicated.
-    *   [x] Investigate `LoRANetwork` constructor to ensure proper memory management and garbage collection of UNet instances.
-    * Integrate Pre-encoded Latents into Training Loop:
-       * [x] Add latent_cache_dir to RootConfig in config_util.py (both imagesliders and textsliders).
-       * [x] Import map_data_to_latents in train_lora.py and train_lora_xl.py.
-       * [x] Add image_path: Optional[str] to PromptSettings in prompt_util.py.
-       * [x] Add image_path: Optional[str] to PromptEmbedsPair class definition in prompt_util.py.
-       * [x] Update PromptEmbedsPair.__init__ to assign self.image_path = settings.image_path.
-       * [x] Modify load_prompts_from_yaml to read image_path from the YAML and pass it to PromptSettings.
-       * [x] Implement logic in train_lora-scale.py to load latents from config.latent_cache_dir using image_path if available, otherwise generate them.
-       * [x] Implement logic in train_lora-scale-xl.py to load latents from config.latent_cache_dir using image_path if available, otherwise generate them.
+**Goal:** Integrate the Sigmoid Contrastive Residual Loss for improved conceptual slider learning and implement batched LoRA application for performance.
 
-## Diff Debugger Suite
+*   [ ] **Sigmoid Contrastive Residual Loss:**
+    *   [ ] **Residual Extraction:** Modify `LoRANetwork` and `LoRAModule` (or UNet forward pass) to expose intermediate activations (residuals) before and after LoRA application.
+    *   [ ] **New Loss Function:** Implement `SigmoidContrastiveLoss` module/function that takes pairs of residual tensors and their "matching" labels.
+    *   [ ] **Integration into Training Loop:**
+        *   [ ] Extract necessary residuals in `superfunctional_train_step`.
+        *   [ ] Form "matched" and "unmatched" pairs of residuals.
+        *   [ ] Calculate `SigmoidContrastiveLoss` and add it to the total loss.
+    *   [ ] **Learnable `t'` and `b` Terms:** Implement as `nn.Parameter` layers within `SigmoidContrastiveLoss`.
+    *   [ ] **Linear Probes for Monitoring:** Add `nn.Linear` layers to predict slider magnitude from residual features and track their accuracy.
 
-*   [x] **Basic Statistics:** Implement loading and analysis of difference tensors (min, max, mean, std dev).
-*   [x] **Tensor Visualization:** Implement functions to convert image-like tensors to displayable formats.
-*   [x] **Tensor Statistics and EMAs:** Integrate into training loop to track moving averages of tensor statistics.
-*   [x] **Metadata Labeling:** Enhance analysis with explicit metadata about tensor origin and purpose.
+*   [ ] **Batched LoRA Application:**
+    *   [ ] **`LoRAModule` Modification:** Update `LoRAModule`'s `forward` method to accept a `torch.Tensor` of `multiplier` values (one per batch item).
+    *   [ ] **`LoRANetwork` Modification:** Change `set_lora_slider` to accept a batch of scales.
+    *   [ ] **`superfunctional_train_step` Integration:** Ensure `network.set_lora_slider` takes a batch of scales, and the UNet forward pass implicitly applies different LoRA scales to different items in the batch.
