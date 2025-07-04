@@ -9,8 +9,8 @@ import torch.cuda
 from diffusers.image_processor import VaeImageProcessor
 
 # Assuming the following files are in the same directory
-from trainscripts.imagesliders import train_util, model_util, config_util, lora, prompt_util
-from trainscripts.imagesliders.prompt_util import PromptEmbedsXL
+from imagesliders import train_util, model_util, config_util, lora, prompt_util
+from imagesliders.prompt_util import PromptEmbedsXL
 
 def log_vram_usage(step_name):
     if torch.cuda.is_available():

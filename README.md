@@ -121,6 +121,23 @@ for everyone else: the `dynamic prompts` extension to the automatic-like webuis 
 
 if you are rolling your own inference, this is even easier! i think i've said it all with 'combinatorial generation and fixed seeds', haven't i?
 
+## Logging and Debugging
+
+### Standardized Logging
+All script executions are now piped to a timestamped log file in the `logs/` directory. This ensures that outputs are captured for later review and debugging.
+
+### Log File Tail Utility
+To easily view the end of log files, a Python utility `tail_log.py` is provided. This script mimics the behavior of the Unix `tail -n` command.
+
+**Usage:**
+```bash
+python tail_log.py <path_to_log_file> -n <number_of_lines>
+```
+**Example:**
+```bash
+python tail_log.py logs/batched_training_loop_2025-07-04_10-30-00.log -n 20
+```
+
 ## Citing the upstream work:
 The upstream's preprint can be cited as follows
 ```

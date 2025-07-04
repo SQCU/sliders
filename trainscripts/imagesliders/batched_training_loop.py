@@ -9,13 +9,13 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 
 # Assuming the following files are in the same directory
-from trainscripts.imagesliders import train_util, model_util, config_util, prompt_util
-from trainscripts.imagesliders import batch_lora as lora # Use the new batched lora
-from trainscripts.imagesliders import train_util, batch_train_util # Keep train_util for other functions not yet moved
-from trainscripts.imagesliders.prompt_util import PromptEmbedsXL, PromptEmbedsPair
+from imagesliders import train_util, model_util, config_util, prompt_util
+from imagesliders import batch_lora as lora # Use the new batched lora
+from imagesliders import train_util, batch_train_util # Keep train_util for other functions not yet moved
+from imagesliders.prompt_util import PromptEmbedsXL, PromptEmbedsPair
 #our new functions live here instead of being rewritten inside of train_util, etc.
 #add new batch_... imports as we need to deviate from imagesliders imports.
-from trainscripts.imagesliders import batch_train_util
+from imagesliders import batch_train_util
 
 def log_vram_usage(step_name):
     if torch.cuda.is_available():
@@ -223,8 +223,8 @@ def config_io():
 def dataset_constructor(config):
     import map_data_to_latents
     #stub function which does the stuff in map_data_to_latents to a dataset config.
-    #stub continue
-    continue
+    #stub pass
+    pass
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def envsetup(config):
@@ -239,8 +239,8 @@ def envsetup(config):
     #okay now return that object
     #return environment
     
-    #stub continue
-    continue
+    #stub pass
+    pass
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def training_step(environment, 
@@ -258,8 +258,8 @@ data,
     #e.g. comparison = environment["criterion"](target, prediction)
     #return comparison
 
-    #stub continue
-    continue
+    #stub pass
+    pass
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def training_loop(
@@ -271,31 +271,31 @@ def training_loop(
         #want to do something like a fancy loss weighting as suggested by kingma and karras et al?
         #you need to implement that *here*.
         
-        #stub continue
-        continue
+        #stub pass
+        pass
     def gradient_cleanup(environment):
         #read configuration from environment on extra stuff to do while training.
         #e.g. constraining maximum gradient norm
         #e.g. some kind of funky jacobian
         #e.g. mutate an auxiliary loss's gradient by sign agreement with primary loss
 
-        #stub continue
-        continue
+        #stub pass
+        pass
     def intra_loop_logging(environment):
         #printing... 
         # writing to logfiles...
         # progress bars and stuff...
         # all of that is handled here...
 
-        #stub continue
-        continue
+        #stub pass
+        pass
     def stopping_condition(environment):
         #check for early stopping constraints set in environment
         #if one is triggered you might `break`` or something
         #e.g. there were two all NaN predictions logged in the last 100 steps, time to cut off training.
 
-        #stub continue
-        continue
+        #stub pass
+        pass
 
     #non-stub real functions you better be using for real.
     for batch in dataset:
@@ -314,14 +314,14 @@ def training_loop(
 def graceful_shutdown(environment):
     def traindone_logging(environment):
         #stub function
-        continue
+        pass
     def model_eval(environment):
         #stub function
-        continue
+        pass
     def save_function(environment):
         #stub function, read appropriate metadata to save trained weights and so on.
         #by default save trained model even without a full config, loudly complaining with prints
-        continue
+        pass
     #this calls at the conclusion of a normal training run where everything is going okay
     traindone_logging(environment)
     save_function(environment)
@@ -337,10 +337,30 @@ def main():
     dataset = dataset_constructor(args.dset_config)
     environment = training_loop(stepfunction, environment, dataset)
     graceful_shutdown(environment)
-    #stub continue
-    continue
+    #stub pass
+    pass
+
+import datetime
+import sys
+
+def setup_logging():
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_filename = os.path.join(log_dir, f"batched_training_loop_{timestamp}.log")
+    sys.stdout = open(log_filename, "w")
+    sys.stderr = sys.stdout # Redirect stderr to the same log file
+    print(f"Logging output to {log_filename}")
+    return log_filename
 
 if __name__ == "__main__":
-    #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
-    #our entry point if this module is run as a script instead of imported for a step or loop.
-    main()
+    # Standard behavior: All script outputs are piped to a timestamped log file.
+    # Use the `tail_log.py` helper script to view the end of the log file.
+    log_file_path = setup_logging()
+    try:
+        main()
+    finally:
+        sys.stdout.close()
+        sys.stdout = sys.__stdout__ # Restore original stdout
+        sys.stderr = sys.__stderr__ # Restore original stderr
+        print(f"Script finished. Log saved to {log_file_path}")

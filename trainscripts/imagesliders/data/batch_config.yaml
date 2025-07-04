@@ -1,5 +1,7 @@
+# This config file recursively defines other config files.
+# This is a bit frustrating for readability and maintainability,
+# but I will leave it in place until the batched trainer works.
 obsolete_config:
   refpath: "trainscripts/imagesliders/data/config-xl-dilora.yaml"
 dset_config: 
   refpath: "trainscripts/imagesliders/data/bracket_dataset.yaml"
-

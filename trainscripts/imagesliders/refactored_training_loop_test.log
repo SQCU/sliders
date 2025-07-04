@@ -1,44 +1,0 @@
-Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 17009.34it/s]
-Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:00<00:00,  6.67it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:01<00:00,  3.16it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:01<00:00,  3.82it/s]
-VRAM usage after model loading: 5.04 GB
-Max VRAM usage after model loading: 5.04 GB
-create LoRA for U-Net: 280 modules.
-[{'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False, 'batch_size': 1}]
-[{'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False, 'batch_size': 1}]
-1 1
-VRAM usage after prompt embedding processing: 5.12 GB
-Max VRAM usage after prompt embedding processing: 5.12 GB
-VRAM usage after image processing: 5.13 GB
-Max VRAM usage after image processing: 5.13 GB
-VRAM usage after add_time_ids processing: 5.13 GB
-Max VRAM usage after add_time_ids processing: 5.13 GB
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:1.0*1.0mblast0/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast1/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast2/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast3/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast4/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast5/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast6/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast7/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast8/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast9/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast10/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast11/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*1.0mblast12/16
-__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:0*-1.0mblast13/16
-Batched High Loss Mean: 0.7603285908699036
-Individual High Loss Mean: 0.7602335810661316
-Batched Low Loss Mean: 0.7615762948989868
-Individual Low Loss Mean: 0.7609750032424927
-Traceback (most recent call last):
-  File "F:\dox\ai\gemmy\sliders\batched_training_loop.py", line 749, in <module>
-    test_refactored_training_loop()
-  File "F:\dox\ai\gemmy\sliders\batched_training_loop.py", line 436, in test_refactored_training_loop
-    batched_loss_high_mean.backward(retain_graph=True)
-  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_tensor.py", line 581, in backward
-    torch.autograd.backward(
-  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\autograd\__init__.py", line 347, in backward
-    _engine_run_backward(
-  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\autograd\graph.py", line 825, in _engine_run_backward
-    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
-RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
