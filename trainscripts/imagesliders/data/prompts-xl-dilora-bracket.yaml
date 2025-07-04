@@ -1,0 +1,11 @@
+####################################################################################################### IMAGE SLIDER
+- target: "simple background " # what word for erasing the positive concept from
+  positive: "bracketed, simple background chalk drawing cartoon sketch" # concept to erase
+  unconditional: "simple background chalk drawing cartoon sketch" # word to take the difference from the positive concept
+  neutral: "simple background" # starting point for conditioning the target
+  action: "enhance" # erase or enhance
+  guidance_scale: 2
+  resolution: 1024
+  dynamic_resolution: false
+  batch_size: 1
+####################################################################################################### IMAGE SLIDER

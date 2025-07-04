@@ -1,6 +1,4 @@
-datasets/**
 models/**
-trainscripts/imagesliders/data/**
 trainscripts/textsliders/data/**
 trainscripts/imagesliders/__pycache__/**
 
