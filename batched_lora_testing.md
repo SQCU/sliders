@@ -37,6 +37,3 @@ Instead of float-for-float identity, the primary goal will be to verify **functi
 *   **Functional Correctness:** Ensure that the batched trainer produces sensible outputs and that the LoRA scales are indeed being applied as intended to their respective batch items. This can be verified by inspecting intermediate tensor shapes and values, and by ensuring the loss behaves as expected.
 *   **Convergence:** The batched trainer should exhibit similar training dynamics (e.g., loss reduction over epochs) and ultimately produce models with comparable performance to the sequential trainer. This is the more important metric for a batched training loop.
 
-## Testing Implementation Note
-
-To compare, `batched_training_loop_test.py` should import `refactored_training_loop.py` and execute both training paths (batched and sequential) on the same initial conditions and data. This will allow for direct comparison of losses, predicted noise, and potentially generated images (if a full inference step is included in the test).

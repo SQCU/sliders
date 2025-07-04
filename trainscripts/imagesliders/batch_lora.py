@@ -149,10 +149,18 @@ class BatchedLoRANetwork(nn.Module):
         for lora_module in self.unet_loras:
             assert lora_module.lora_name not in lora_names, f"Duplicate LoRA name: {lora_module.lora_name}"
             lora_names.add(lora_module.lora_name)
-
+        
+        # from gemini 2.5:
         # The original UNet reference is kept, but its forward methods are now augmented.
         # We don't delete unet here as it's passed in and might be used elsewhere.
         # torch.cuda.empty_cache() # Not necessary here, manage memory externally
+        # from sqcu:
+        # nice try i'm deleting the unet anyways because the reference implementation does that.
+        del unet
+
+        torch.cuda.empty_cache()
+        #if you don't like these lines of code demonstrate an error they introduce in control flow.
+
 
     def _create_and_apply_modules(self, root_module: nn.Module):
         """
@@ -215,19 +223,12 @@ class BatchedLoRANetwork(nn.Module):
         Args:
             scales (torch.Tensor): A tensor of LoRA scales, one for each item in the batch.
         """
-        if scales.ndim == 1:
-            # Reshape scales to be broadcastable with typical (B, C, H, W) or (B, D) tensors
-            # This assumes the batch dimension is the first dimension.
-            # For (B, C, H, W) -> (B, 1, 1, 1)
-            # For (B, D) -> (B, 1)
-            # This needs to be dynamic based on the actual input shape to the LoRA module.
-            # For now, we'll assume a common case and might need refinement.
-            # A more robust solution would involve passing the expected input shape or inferring it.
-            # For now, let's assume the scales tensor will be correctly shaped by the caller.
-            pass # Assume scales is already correctly shaped by the caller.
 
         for lora_module in self.unet_loras:
-            lora_module.current_multiplier = scales.to(lora_module.lora_down.weight.device)
+            #lora_module.current_multiplier = scales.to(lora_module.lora_down.weight.device)
+            #what is this curious and inexplicable gemini 2.5 code saying to do?
+            #the reference lora.py does the same thing i just wrote below btw.
+            lora_module.current_multiplier = scales
 
     def __enter__(self):
         """
@@ -244,7 +245,7 @@ class BatchedLoRANetwork(nn.Module):
         """
         # Reset multipliers to zero to effectively disable LoRA
         for lora_module in self.unet_loras:
-            lora_module.current_multiplier = torch.tensor(0.0).to(lora_module.lora_down.weight.device)
+            lora_module.current_multiplier = torch.tensor(0.0)
 
     def prepare_optimizer_params(self, lr=None):
         """
