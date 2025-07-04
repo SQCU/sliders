@@ -99,5 +99,14 @@ To assess the effectiveness of the SigLIP objective, linear probes can be attach
 
 Currently, the `superfunctional_train_step` applies LoRA scales sequentially, which limits true concurrent processing. A future optimization would involve modifying the `LoRANetwork` and `LoRAModule` to accept and apply a batch of LoRA scales, enabling a single UNet forward pass with different LoRA scales applied concurrently. This would require:
 1.  **Modifying `LoRAModule`:** Update `self.multiplier` to accept a `torch.Tensor` of multipliers (one per batch item) and adjust the `forward` method for element-wise multiplication.
-2.  **Modifying `LoRANetwork`:** Change `set_lora_slider` to accept a batch of scales and pass these to the `LoRAModule` instances.
+2.  **Modifying `LoRANetwork`:** Change `set_lora_slider` to accept a batch of scales.
 3.  **Modifying `superfunctional_train_step`:** Combine high and low scale inputs into a single batch for `denoised_latents`, `text_embeddings`, `pooled_embeds`, and `add_time_ids`. Call `predict_noise_xl` once with this combined batch and the batched LoRA scales. Then, split the results.
+
+## Work in Progress Notes
+
+*   Copied `refactored_training_loop.py` to `batched_training_loop.py`.
+*   Started modifying `superfunctional_train_step` in `batched_training_loop.py` to handle batched inputs for images and prompts.
+*   Debugged `ValueError: embedded null character` related to image paths by using `os.path.normpath`.
+*   Currently debugging `RuntimeError: The size of tensor a (...) must match the size of tensor b (...) at non-singleton dimension 0` related to batch size mismatches in `predict_noise_xl` due to Classifier-Free Guidance (CFG) duplication.
+*   Identified that `predict_noise_xl` internally handles CFG duplication for `latents`, `text_embeddings`, `add_text_embeddings`, and `add_time_ids`.
+*   Current approach for `superfunctional_train_step` is to ensure that the inputs to `predict_noise_xl` are *not* pre-duplicated for CFG, and that `denoised_latents_high` and `denoised_latents_low` are duplicated *before* being passed to `predict_noise_xl` to match the expected input size for CFG.
