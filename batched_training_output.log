@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "C:\Users\neet\AppData\Roaming\uv\python\cpython-3.10.16-windows-x86_64-none\lib\runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "C:\Users\neet\AppData\Roaming\uv\python\cpython-3.10.16-windows-x86_64-none\lib\runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 361, in <module>
+    main()
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 335, in main
+    args = config_io()
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 216, in config_io
+    args.obsolete_inner_config = batch_config_util.load_config_from_yaml(args.outerconfig.obsolete_config.refpath)
+AttributeError: 'dict' object has no attribute 'obsolete_config'
+Script finished. Log saved to logs\batched_training_loop_2025-07-04_16-43-15.log

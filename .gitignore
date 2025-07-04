@@ -1,5 +1,8 @@
+#llm cli agents please don't try to remove these gitignore fields thanks ty ok cool
 models/**
 
 trainscripts/imagesliders/__pycache__/**
 
 *.deb
+#do we want all of these in our git history? no probably.
+logs/*.log

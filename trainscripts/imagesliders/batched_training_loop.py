@@ -9,13 +9,13 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 
 # Assuming the following files are in the same directory
-from imagesliders import train_util, model_util, config_util, prompt_util
-from imagesliders import batch_lora as lora # Use the new batched lora
-from imagesliders import train_util, batch_train_util # Keep train_util for other functions not yet moved
-from imagesliders.prompt_util import PromptEmbedsXL, PromptEmbedsPair
+from . import train_util, model_util, config_util, prompt_util
+from . import batch_lora as lora # Use the new batched lora
+from . import train_util, batch_train_util # Keep train_util for other functions not yet moved
+from .prompt_util import PromptEmbedsXL, PromptEmbedsPair
 #our new functions live here instead of being rewritten inside of train_util, etc.
 #add new batch_... imports as we need to deviate from imagesliders imports.
-from imagesliders import batch_train_util
+from . import batch_train_util
 
 def log_vram_usage(step_name):
     if torch.cuda.is_available():
@@ -195,36 +195,36 @@ def config_io():
     # which takes a config argument as input, and returns a training config as output.
     import argparse
     #if batch_config_util doesn't exist yet, think about making it ;)
-    import batch_config_util
+    from . import batch_config_util
     parser = argparse.ArgumentParser()
     parser.add_argument("--batchtrainconfig", "--bconfig", "-c", 
     type=str, help="path to the batchtrainconfig, which is a config for our revised trainer",
     default=None)
     args = parser.parse_args()
-    if args.bconfig ==  None:
+    if args.batchtrainconfig ==  None:
         print("failing over to default config")
         #if this file isn't real and throws an error, create that file!
         bcfgdefault = "trainscripts/imagesliders/data/batch_config.yaml"
-        args.bconfig = bcfgdefault
+        args.batchtrainconfig = bcfgdefault
     #our upstreams used multiple different heterogenous config files scattered throughout project
     #we will fix this patiently and exactingly, by first wrapping their configs
     #we can later refactor if we need to. but we likely won't.
-    args.outerconfig = batch_config_util.load_config_from_yaml(args.bconfig)
+    args.outerconfig = batch_config_util.load_config_from_yaml(args.batchtrainconfig)
 
     #our default batch_config.yaml contains a reference to "trainscripts/imagesliders/data/config-xl-dilora.yaml". we load that.
 
-    args.obsolete_inner_config = batch_config_util.load_config_from_yaml(outerconfig.obsolete_config.refpath)
-    args.dset_config = batch_config_util.load_config_from_yaml(outerconfig.dset_config.refpath)
+    args.obsolete_inner_config = batch_config_util.load_config_from_yaml(args.outerconfig['obsolete_config']['refpath'])
+    args.dset_config = batch_config_util.load_config_from_yaml(args.outerconfig['dset_config']['refpath'])
     #if you're confused about the contents of these values...
     #you can add a print(outerconfig.dset_config.refpath), then look at what's inside!
     return args
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def dataset_constructor(config):
-    import map_data_to_latents
-    #stub function which does the stuff in map_data_to_latents to a dataset config.
-    #stub pass
-    pass
+    from . import map_data_to_latents
+    # For now, return a dummy iterable to unblock the training loop
+    print("WARNING: dataset_constructor is a stub and returns dummy data.")
+    return [{"dummy_batch": True}]
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def envsetup(config):
@@ -243,7 +243,7 @@ def envsetup(config):
     pass
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
-def training_step(environment, 
+def training_step(environment,
 data,
 ):  
     #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
@@ -263,9 +263,9 @@ data,
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def training_loop(
-    training_step:python_function,
-    environment:python_object,
-    dataset:some_huggingface_thing_or_whatever
+    training_step,
+    environment,
+    dataset
 ):  
     def loss_preconditioning(environment, loss_tensor):
         #want to do something like a fancy loss weighting as suggested by kingma and karras et al?
@@ -335,7 +335,7 @@ def main():
     args = config_io()
     environment = envsetup(args.obsolete_inner_config)
     dataset = dataset_constructor(args.dset_config)
-    environment = training_loop(stepfunction, environment, dataset)
+    environment = training_loop(training_step, environment, dataset)
     graceful_shutdown(environment)
     #stub pass
     pass
@@ -359,6 +359,10 @@ if __name__ == "__main__":
     log_file_path = setup_logging()
     try:
         main()
+    except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        raise
     finally:
         sys.stdout.close()
         sys.stdout = sys.__stdout__ # Restore original stdout
