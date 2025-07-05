@@ -3,7 +3,9 @@
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
-from typing import Tuple
+from typing import Tuple, Union
+from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+from diffusers import UNet2DConditionModel, SchedulerMixin
 
 SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
 

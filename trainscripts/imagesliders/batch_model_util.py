@@ -1,7 +1,8 @@
 import torch
-from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, DDPMScheduler
+from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, DDPMScheduler, SchedulerMixin, DDIMScheduler, LMSDiscreteScheduler, EulerAncestralDiscreteScheduler
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextModelWithProjection
+from typing import Literal, Union
 
 AVAILABLE_SCHEDULERS = Literal["ddim", "ddpm", "lms", "euler_a"]
 

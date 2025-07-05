@@ -7,6 +7,10 @@ import gc
 import torch.cuda
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
+import yaml
+from pathlib import Path
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms as T
 
 # Assuming the following files are in the same directory
 from trainscripts.imagesliders import train_util, model_util, config_util, prompt_util
@@ -166,21 +170,51 @@ def config_io():
     #you can add a print(outerconfig.dset_config.refpath), then look at what's inside!
     return args
 
+class BracketDataset(Dataset):
+    def __init__(self, config, prompts, transform):
+        self.transform = transform
+        self.prompts = prompts
+        self.image_paths = []
+        self.scales = []
+
+        root_folder = Path(config['dataset']['folder_main'])
+        subfolder_names = [f.strip() for f in config['dataset']['folders'].split(',')]
+        scale_values = [float(s.strip()) for s in config['dataset']['scales'].split(',')]
+        
+        for i, folder_name in enumerate(subfolder_names):
+            subfolder_path = root_folder / folder_name
+            scale = scale_values[i]
+            for image_path in subfolder_path.glob("*"):
+                self.image_paths.append(image_path)
+                self.scales.append(scale)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image_path = self.image_paths[idx]
+        image = Image.open(image_path).convert("RGB")
+        image_tensor = self.transform(image)
+        scale = self.scales[idx]
+        return image_tensor, scale, self.prompts
+
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def dataset_constructor(config):
-    #stubbed out:
-    #load a normal debug dataset through normal mechanisms.
-    #construct visual 'prompt pairs' 
-    #(make sure that each dataset sampled from has at least two different magnitudes in batchsize * gradient accumulation)
-    #cast batches to an iterator (hint: a huggingface dataset) for sampling during training 
-    #   also do stuff about vae input scaling:
-    # from diffusers.image_processor import VaeImageProcessor
-    # vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
-    # image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor,do_convert_rgb=True)
-    # image = image_processor.preprocess(image)
-    # init_latents = vae.encode(image).latent_dist.sample(None)
-    # init_latents = vae.config.scaling_factor * init_latents
-    pass
+    with open(config['prompts_file'], 'r') as f:
+        prompts = yaml.safe_load(f)
+
+    # Image transformations
+    transform = T.Compose([
+        T.Resize(1024, interpolation=T.InterpolationMode.BICUBIC),
+        T.CenterCrop(1024),
+        T.ToTensor(),
+        T.Normalize([0.5], [0.5]),
+    ])
+
+    dataset = BracketDataset(config, prompts, transform)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    return dataloader
+
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def envsetup(config):
