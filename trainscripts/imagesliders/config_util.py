@@ -28,6 +28,7 @@ class NetworkConfig(BaseModel):
 
 
 class TrainConfig(BaseModel):
+    batch_size: int = 4
     precision: PRECISION_TYPES = "bfloat16"
     noise_scheduler: Literal["ddim", "ddpm", "lms", "euler_a"] = "ddim"
 

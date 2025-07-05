@@ -56,7 +56,7 @@ def encode_images_to_latents(images, vae, device, weight_dtype):
     image_tensors = [image_processor.preprocess(image).to(device, dtype=weight_dtype) for image in images]
     image_batch = torch.cat(image_tensors, dim=0)
     latents = vae.encode(image_batch).latent_dist.sample(None)
-    return torch.cat(latents, dim=0)
+    return latents
 
 import json
 

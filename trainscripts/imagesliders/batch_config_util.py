@@ -12,6 +12,14 @@ def load_config_from_yaml(filepath):
     with open(filepath, 'r') as f:
         return yaml.safe_load(f)
 
+class AttrDict(dict):
+    def __init__(self, *args, **kwargs):
+        super(AttrDict, self).__init__(*args, **kwargs)
+        self.__dict__ = self
+        for key, value in self.items():
+            if isinstance(value, dict):
+                self[key] = AttrDict(value)
+
 class ImageScaleDataset(Dataset):
     def __init__(self, config, vae, device, weight_dtype, use_latents=True):
         self.config = config
@@ -24,24 +32,26 @@ class ImageScaleDataset(Dataset):
         self.scales = []
         self.latents = []
 
-        self.latent_cache_dir = Path(self.config['dataset_config']['dataset']['folder_main']) / "latents"
+        self.latent_cache_dir = Path(self.config.dataset_config.dataset.folder_main) / "latents"
         os.makedirs(self.latent_cache_dir, exist_ok=True)
 
-        print("Mapping dataset...")
-        subfolder_names = [f.strip() for f in self.config['dataset_config']['dataset']['folders'].split(',')]
-        scale_values = [float(s.strip()) for s in self.config['dataset_config']['dataset']['scales'].split(',')]
+        print("Mapping dataset and caching latents...")
+        subfolder_names = [f.strip() for f in self.config.dataset_config.dataset.folders.split(',')]
+        scale_values = [float(s.strip()) for s in self.config.dataset_config.dataset.scales.split(',')]
         
         for i, folder_name in enumerate(subfolder_names):
-            subfolder_path = Path(self.config['dataset_config']['dataset']['folder_main']) / folder_name
+            subfolder_path = Path(self.config.dataset_config.dataset.folder_main) / folder_name
             scale = scale_values[i]
             for image_path in subfolder_path.glob("*"):
                 if image_path.suffix.lower() in ['.png', '.jpg', '.jpeg']:
                     self.image_paths.append(str(image_path))
                     self.scales.append(scale)
+                    
+                    # Always ensure latent is cached on disk
+                    latent = map_data_to_latents.get_latent_for_image(
+                        str(image_path), self.vae, self.device, self.weight_dtype, self.latent_cache_dir, self.vae.state_dict()
+                    )
                     if self.use_latents:
-                        latent = map_data_to_latents.get_latent_for_image(
-                            str(image_path), self.vae, self.device, self.weight_dtype, self.latent_cache_dir, self.vae.state_dict()
-                        )
                         self.latents.append(latent)
 
 
@@ -52,15 +62,20 @@ class ImageScaleDataset(Dataset):
         if self.use_latents:
             return self.latents[idx], self.scales[idx]
         else:
-            return self.image_paths[idx], self.scales[idx]
+            latent_path = self.latent_cache_dir / (Path(self.image_paths[idx]).stem + ".pt")
+            return str(latent_path.resolve()), self.scales[idx]
 
-def collate_fn(batch, tokenizers, text_encoders, config, device, weight_dtype):
-    latents, scales = zip(*batch)
+def collate_fn(batch, tokenizers, text_encoders, config, device, weight_dtype, use_latents=True):
+    items, scales = zip(*batch)
     
-    latents = torch.cat(latents, dim=0).to(device, dtype=weight_dtype)
+    if use_latents:
+        latents = torch.cat(items, dim=0).to(device, dtype=weight_dtype)
+    else:
+        latents = torch.cat([torch.load(p) for p in items], dim=0).to(device, dtype=weight_dtype)
+
     scales = torch.tensor(scales, dtype=weight_dtype, device=device)
     
-    with open(config['dataset_config']['prompts_file'], 'r') as f:
+    with open(config.dataset_config.prompts_file, 'r') as f:
         prompts = yaml.safe_load(f)
 
     text_embeddings, pooled_embeds = batch_train_util.create_batched_prompt_embeddings(
@@ -85,9 +100,9 @@ def collate_fn(batch, tokenizers, text_encoders, config, device, weight_dtype):
 def dataset_constructor(config, environment, use_latents=True):
     dataset = ImageScaleDataset(config, environment['vae'], environment['device'], environment['weight_dtype'], use_latents=use_latents)
     
-    collate_wrapper = lambda b: collate_fn(b, environment['tokenizers'], environment['text_encoders'], config, environment['device'], environment['weight_dtype'])
+    collate_wrapper = lambda b: collate_fn(b, environment['tokenizers'], environment['text_encoders'], config, environment['device'], environment['weight_dtype'], use_latents=use_latents)
     
-    dataloader = DataLoader(dataset, batch_size=config['train']['batch_size'], shuffle=True, collate_fn=collate_wrapper)
+    dataloader = DataLoader(dataset, batch_size=config.train.batch_size, shuffle=True, collate_fn=collate_wrapper)
     return dataloader
 
 def setup_logging():
@@ -148,20 +163,8 @@ if __name__ == '__main__':
         return environment
 
     def main():
-        class AttrDict(dict):
-            def __init__(self, *args, **kwargs):
-                super(AttrDict, self).__init__(*args, **kwargs)
-                self.__dict__ = self
-
         args = config_io()
-        config_dict = {}
-        for key, value in args.items():
-            if isinstance(value, dict):
-                config_dict[key] = AttrDict(value)
-            else:
-                config_dict[key] = value
-        
-        config = AttrDict(config_dict)
+        config = AttrDict(args)
         
         environment = envsetup(config)
         
@@ -173,9 +176,7 @@ if __name__ == '__main__':
             if i >= 240:
                 break
             print(f"Batch {i+1}/240 (paths):")
-            # In a real scenario, you would load the latents here before passing to the model
-            # For this test, we just check that the batching works
-            print(f"  Latent paths: {batch['latents']}")
+            print(f"  Latents shape: {batch['latents'].shape}")
             print(f"  Scales: {batch['scales']}")
 
         # Test with use_latents=True (in-memory latents)
