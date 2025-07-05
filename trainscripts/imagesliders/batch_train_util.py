@@ -147,6 +147,40 @@ def diffusion(
     # return latents_steps
     return latents
 
+def text_tokenize(
+    tokenizer: CLIPTokenizer,  # 普通ならひとつ、XLならふたつ！
+    prompts: list[str],
+):
+    token_ids = [
+        tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids
+        for prompt in prompts
+    ]
+    return torch.cat(token_ids)
+
+
+def text_encode_xl(
+    text_encoder: SDXL_TEXT_ENCODER_TYPE,
+    tokens: torch.FloatTensor,
+    num_images_per_prompt: int = 1,
+):
+    prompt_embeds = text_encoder(
+        tokens.to(text_encoder.device), output_hidden_states=True
+    )
+    pooled_prompt_embeds = prompt_embeds[0]
+    prompt_embeds = prompt_embeds.hidden_states[-2]  # always penultimate layer
+
+    bs_embed, seq_len, _ = prompt_embeds.shape
+    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+
+    return prompt_embeds, pooled_prompt_embeds
+
 def encode_prompts_xl(
     tokenizers: list[CLIPTokenizer],
     text_encoders: list[SDXL_TEXT_ENCODER_TYPE],

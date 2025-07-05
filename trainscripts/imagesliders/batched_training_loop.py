@@ -282,29 +282,62 @@ def training_step(
     environment,
     batch,
 ):
+    unet = environment["unet"]
+    vae = environment["vae"]
+    noise_scheduler = environment["noise_scheduler"]
+    tokenizers = environment["tokenizers"]
+    text_encoders = environment["text_encoders"]
+    network = environment["network"]
+    optimizer = environment["optimizer"]
+    lr_scheduler = environment["lr_scheduler"]
+    criteria = environment["criteria"]
+    device = environment["device"]
+    weight_dtype = environment["weight_dtype"]
+    config = environment["config"]
 
+    img_tensor, scale, prompts = batch
+    img_tensor = img_tensor.to(device, dtype=weight_dtype)
+    
+    # Create prompt embeddings
+    positive_prompt = prompts[0]['positive']
+    neutral_prompt = prompts[0]['neutral']
+    unconditional_prompt = prompts[0]['unconditional']
+
+    prompt_pair = prompt_util.PromptEmbedsPair(
+        batch_train_util.encode_prompts_xl(
+            tokenizers,
+            text_encoders,
+            [positive_prompt, unconditional_prompt],
+            num_images_per_prompt=1,
+        ),
+        batch_train_util.encode_prompts_xl(
+            tokenizers,
+            text_encoders,
+            [neutral_prompt, unconditional_prompt],
+            num_images_per_prompt=1,
+        ),
+    )
+    
     # Call superfunctional_train_step
     loss_per_batch_element = superfunctional_train_step(
         unet=unet,
         vae=vae,
         noise_scheduler=noise_scheduler,
-        img_batches=img_batches,
-        scales=scales,
+        img_batches=(img_tensor, img_tensor), # Using same image for high and low for now
+        scales=(scale.item(), scale.item()),
         prompt_embeds=(prompt_pair.positive, prompt_pair.neutral), # This argument is redundant given prompt_pair
         prompt_pair=prompt_pair,
-        config=environment["config"], # Need to pass config from environment
+        config=config,
         network=network,
         criteria=criteria,
         device=device,
         weight_dtype=weight_dtype,
-        add_time_ids=add_time_ids,
-        seed=seed,
+        add_time_ids=prompt_pair.positive.add_time_ids,
+        seed=random.randint(0, 2**32 - 1),
     )
 
     # Calculate total loss (e.g., sum or mean of high and low losses)
-    loss_high = loss_high_per_element.mean()
-    loss_low = loss_low_per_element.mean()
-    total_loss = loss_high + loss_low # Simple sum for now
+    total_loss = loss_per_batch_element.mean()
 
     return total_loss
 
