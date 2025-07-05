@@ -172,8 +172,11 @@ class BatchedLoRANetwork(nn.Module):
         """
         Determines if LoRA should be applied to a given module based on training method and target replace modules.
         """
+        if "time_embed" in name:
+            return False
+            
         if self.train_method == "noxattn":
-            return "attn2" not in name and "time_embed" not in name
+            return "attn2" not in name
         elif self.train_method == "innoxattn":
             return "attn2" not in name
         elif self.train_method == "selfattn":
@@ -185,9 +188,9 @@ class BatchedLoRANetwork(nn.Module):
         elif self.train_method == "xattn-strict":
             return "attn2" in name
         elif self.train_method == "noxattn-hspace":
-            return "attn2" not in name and "time_embed" not in name and "mid_block" in name
+            return "attn2" not in name and "mid_block" in name
         elif self.train_method == "noxattn-hspace-last":
-            return "attn2" not in name and "time_embed" not in name and "mid_block" in name
+            return "attn2" not in name and "mid_block" in name
         else:
             raise NotImplementedError(f"train_method: {self.train_method} is not implemented.")
 
