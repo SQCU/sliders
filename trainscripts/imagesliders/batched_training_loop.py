@@ -53,6 +53,9 @@ def envsetup(config):
 
     vae, unet, tokenizers, text_encoders, noise_scheduler = batch_model_util.load_models(config, device, weight_dtype)
     
+    # Patch the UNet's time_embedding layer to the correct dtype
+    unet.time_embedding.to(dtype=weight_dtype)
+    
     network = lora.BatchedLoRANetwork(
         unet=unet,
         rank=config.network.rank,
