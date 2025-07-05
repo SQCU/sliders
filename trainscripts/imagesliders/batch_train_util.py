@@ -205,3 +205,44 @@ def encode_prompts_xl(
     )
 
     return torch.concat(text_embeds_list, dim=-1), pooled_text_embeds
+
+
+def create_batched_prompt_embeddings(
+    tokenizers: list[CLIPTokenizer],
+    text_encoders: list[SDXL_TEXT_ENCODER_TYPE],
+    prompts: dict,
+    num_images_per_prompt: int = 1,
+):
+    """
+    Creates a batched prompt embedding tensor for use in the training loop.
+    """
+    positive_prompts = [prompts['positive']]
+    unconditional_prompts = [prompts['unconditional']]
+    neutral_prompts = [prompts['neutral']]
+
+    # Encode all prompts
+    positive_text_embeds, positive_pooled_embeds = encode_prompts_xl(
+        tokenizers, text_encoders, positive_prompts, num_images_per_prompt
+    )
+    unconditional_text_embeds, unconditional_pooled_embeds = encode_prompts_xl(
+        tokenizers, text_encoders, unconditional_prompts, num_images_per_prompt
+    )
+    neutral_text_embeds, neutral_pooled_embeds = encode_prompts_xl(
+        tokenizers, text_encoders, neutral_prompts, num_images_per_prompt
+    )
+
+    # Concatenate for the UNet
+    text_embeddings_for_noise_pred = torch.cat([
+        positive_text_embeds,
+        unconditional_text_embeds,
+        neutral_text_embeds,
+    ], dim=0)
+
+    # Pooled embeds are also needed for XL
+    pooled_embeds_for_noise_pred = torch.cat([
+        positive_pooled_embeds,
+        unconditional_pooled_embeds,
+        neutral_pooled_embeds,
+    ], dim=0)
+
+    return text_embeddings_for_noise_pred, pooled_embeds_for_noise_pred

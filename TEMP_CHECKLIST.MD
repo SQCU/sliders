@@ -4,7 +4,7 @@ This checklist outlines the next steps for enhancing the training core loop to s
 
 ## 1. Batched Training of Multiple Training Pairs
 
-**Goal:** Enable `train_lora-scale-xl.py` to process multiple image pairs within a single forward pass, leveraging GPU parallelism.
+**Goal:** Enable `batched_training_loop.py` to process multiple image pairs within a single forward pass, leveraging GPU parallelism.
 
 *   [x] **Batched LoRA Application:** (Completed - now considered part of core batching fixes)
     *   [x] **`BatchedLoRAModule` Creation:** Created `trainscripts/imagesliders/batch_lora.py` with `BatchedLoRAModule` to handle batched multipliers using tensor operations.

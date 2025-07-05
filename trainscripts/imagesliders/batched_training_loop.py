@@ -298,24 +298,12 @@ def training_step(
     img_tensor, scale, prompts = batch
     img_tensor = img_tensor.to(device, dtype=weight_dtype)
     
-    # Create prompt embeddings
-    positive_prompt = prompts[0]['positive']
-    neutral_prompt = prompts[0]['neutral']
-    unconditional_prompt = prompts[0]['unconditional']
-
-    prompt_pair = prompt_util.PromptEmbedsPair(
-        batch_train_util.encode_prompts_xl(
-            tokenizers,
-            text_encoders,
-            [positive_prompt, unconditional_prompt],
-            num_images_per_prompt=1,
-        ),
-        batch_train_util.encode_prompts_xl(
-            tokenizers,
-            text_encoders,
-            [neutral_prompt, unconditional_prompt],
-            num_images_per_prompt=1,
-        ),
+    # Create prompt embeddings using the new utility function
+    text_embeddings, pooled_embeds = batch_train_util.create_batched_prompt_embeddings(
+        tokenizers,
+        text_encoders,
+        prompts[0],
+        num_images_per_prompt=1,
     )
     
     # Call superfunctional_train_step
@@ -325,19 +313,19 @@ def training_step(
         noise_scheduler=noise_scheduler,
         img_batches=(img_tensor, img_tensor), # Using same image for high and low for now
         scales=(scale.item(), scale.item()),
-        prompt_embeds=(prompt_pair.positive, prompt_pair.neutral), # This argument is redundant given prompt_pair
-        prompt_pair=prompt_pair,
+        text_embeddings=text_embeddings,
+        pooled_embeds=pooled_embeds,
         config=config,
         network=network,
         criteria=criteria,
         device=device,
         weight_dtype=weight_dtype,
-        add_time_ids=prompt_pair.positive.add_time_ids,
+        add_time_ids=add_time_ids, # This needs to be fixed
         seed=random.randint(0, 2**32 - 1),
     )
 
     # Calculate total loss (e.g., sum or mean of high and low losses)
-    total_loss = loss_per_batch_element.mean()
+    total_loss = loss_per_batch_element.sum()
 
     return total_loss
 
