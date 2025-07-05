@@ -229,9 +229,9 @@ def create_batched_prompt_embeddings(
     """
     Creates a batched prompt embedding tensor for use in the training loop.
     """
-    positive_prompts = [prompts['positive']]
-    unconditional_prompts = [prompts['unconditional']]
-    neutral_prompts = [prompts['neutral']]
+    positive_prompts = [prompts[0]['positive']]
+    unconditional_prompts = [prompts[0]['unconditional']]
+    neutral_prompts = [prompts[0]['neutral']]
 
     # Encode all prompts
     positive_text_embeds, positive_pooled_embeds = encode_prompts_xl(
