@@ -1,3 +1,4 @@
+from typing import Literal, Optional
 import yaml
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ from trainscripts.imagesliders import map_data_to_latents
 from trainscripts.imagesliders import batch_train_util
 import datetime
 import sys
+from pydantic import BaseModel
 
 def load_config_from_yaml(filepath):
     with open(filepath, 'r') as f:
@@ -98,6 +100,32 @@ def collate_fn(batch, tokenizers, text_encoders, config, device, weight_dtype, u
     }
 
 def dataset_constructor(config, environment, use_latents=True):
+    """
+    Initializes and returns a DataLoader for the ImageScaleDataset.
+
+    This function sets up the dataset which pairs images with scaling factors,
+    and then wraps it in a DataLoader for batching. It also handles latent
+    caching and can operate in two modes: either by loading latents directly
+    into memory (`use_latents=True`) or by providing paths to cached latent
+    files (`use_latents=False`).
+
+    Args:
+        config (AttrDict): 
+            A configuration object containing dataset and training parameters.
+            Expected to have `dataset_config` and `train.batch_size`.
+        environment (dict): 
+            A dictionary containing the necessary components for data processing,
+            including the VAE (`vae`), `device`, `weight_dtype`, `tokenizers`,
+            and `text_encoders`.
+        use_latents (bool, optional): 
+            If True, the DataLoader provides batches of pre-loaded latents.
+            If False, it provides batches of paths to latent files.
+            Defaults to True.
+
+    Returns:
+        DataLoader: 
+            A PyTorch DataLoader instance configured for the training loop.
+    """
     dataset = ImageScaleDataset(config, environment['vae'], environment['device'], environment['weight_dtype'], use_latents=use_latents)
     
     collate_wrapper = lambda b: collate_fn(b, environment['tokenizers'], environment['text_encoders'], config, environment['device'], environment['weight_dtype'], use_latents=use_latents)
@@ -115,8 +143,110 @@ def setup_logging():
     print(f"Logging output to {log_filename}")
     return log_filename
 
+PRECISION_TYPES = Literal["fp32", "fp16", "bf16", "float32", "float16", "bfloat16"]
+NETWORK_TYPES = Literal["lierla", "c3lier"]
+
+
+class PretrainedModelConfig(BaseModel):
+    name_or_path: str
+    v2: bool = False
+    v_pred: bool = False
+
+    clip_skip: Optional[int] = None
+
+
+class NetworkConfig(BaseModel):
+    type: NETWORK_TYPES = "lierla"
+    rank: int = 4
+    alpha: float = 1.0
+
+    training_method: str = "full"
+
+
+class TrainConfig(BaseModel):
+    batch_size: int = 4
+    precision: PRECISION_TYPES = "bfloat16"
+    noise_scheduler: Literal["ddim", "ddpm", "lms", "euler_a"] = "ddim"
+
+    iterations: int = 500
+    lr: float = 1e-4
+    optimizer: str = "adamw"
+    optimizer_args: str = ""
+    lr_scheduler: str = "constant"
+
+    max_denoising_steps: int = 50
+
+
+class SaveConfig(BaseModel):
+    name: str = "untitled"
+    path: str = "./output"
+    per_steps: int = 200
+    precision: PRECISION_TYPES = "float32"
+
+
+class LoggingConfig(BaseModel):
+    use_wandb: bool = False
+
+    verbose: bool = False
+
+
+class OtherConfig(BaseModel):
+    use_xformers: bool = False
+    use_pytorch_SDPA: bool = True
+    torch_compile: bool = False
+    lycorisize:bool = False
+    gradient_checkpointing: bool = False
+    torch_amp: bool = False
+
+
+class RootConfig(BaseModel):
+    prompts_file: str
+    pretrained_model: PretrainedModelConfig
+    latent_cache_dir: Optional[str] = None
+
+    network: NetworkConfig
+
+    train: Optional[TrainConfig]
+
+    save: Optional[SaveConfig]
+
+    logging: Optional[LoggingConfig]
+
+    other: Optional[OtherConfig]
+
+
+def parse_precision(precision: str) -> torch.dtype:
+    if precision == "fp32" or precision == "float32":
+        return torch.float32
+    elif precision == "fp16" or precision == "float16":
+        return torch.float16
+    elif precision == "bf16" or precision == "bfloat16":
+        return torch.bfloat16
+
+    raise ValueError(f"Invalid precision type: {precision}")
+
+
+def load_config_from_yaml_and_merge(config_path: str) -> RootConfig:
+    with open(config_path, "r") as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+
+    root = RootConfig(**config)
+
+    if root.train is None:
+        root.train = TrainConfig()
+
+    if root.save is None:
+        root.save = SaveConfig()
+
+    if root.logging is None:
+        root.logging = LoggingConfig()
+
+    if root.other is None:
+        root.other = OtherConfig()
+
+    return root
+
 if __name__ == '__main__':
-    from trainscripts.imagesliders import config_util
     from trainscripts.imagesliders import batch_model_util
     import torch.optim as optim
 
@@ -135,7 +265,7 @@ if __name__ == '__main__':
         
         inner_config_path = config['obsolete_config']['refpath']
         print(f"Loading and merging inner config from: {inner_config_path}")
-        inner_config = config_util.load_config_from_yaml(inner_config_path)
+        inner_config = load_config_from_yaml_and_merge(inner_config_path)
         config.update(inner_config)
 
         dset_config_path = config['dset_config']['refpath']
@@ -146,7 +276,7 @@ if __name__ == '__main__':
 
     def envsetup(config):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        weight_dtype = config_util.parse_precision(config.train.precision)
+        weight_dtype = parse_precision(config.train.precision)
 
         vae, unet, tokenizers, text_encoders, noise_scheduler = batch_model_util.load_models(config, device, weight_dtype)
 
