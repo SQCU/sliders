@@ -207,50 +207,12 @@ def config_io():
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def dataset_constructor(config):
-    print("WARNING: dataset_constructor is a stub and returns dummy data for 3 image pairs.")
-    # Simulate 3 image pairs as requested in the checklist
-    num_pairs = 3
-    for i in range(num_pairs):
-        # Dummy image batches (batch_size, C, H, W)
-        # Assuming latents are 4, 64, 64 for SDXL
-        dummy_high_img_batch = torch.randn(1, 3, 512, 512) # Example image size
-        dummy_low_img_batch = torch.randn(1, 3, 512, 512)
-        img_batches = (dummy_high_img_batch, dummy_low_img_batch)
-
-        # Dummy scales
-        scales = (random.uniform(0.1, 1.0), random.uniform(0.1, 1.0))
-
-        # Dummy prompt embeddings (batch_size, sequence_length, hidden_size)
-        # For SDXL, text_embeds are typically (1, 77, 768) and pooled_embeds are (1, 1280)
-        dummy_positive_text_embeds = torch.randn(1, 77, 768)
-        dummy_positive_pooled_embeds = torch.randn(1, 1280)
-        dummy_neutral_text_embeds = torch.randn(1, 77, 768)
-        dummy_neutral_pooled_embeds = torch.randn(1, 1280)
-
-        # Create dummy PromptEmbedsXL and PromptEmbedsPair
-        dummy_positive_prompt_embeds = prompt_util.PromptEmbedsXL(
-            dummy_positive_text_embeds,
-            dummy_positive_pooled_embeds
-        )
-        dummy_neutral_prompt_embeds = prompt_util.PromptEmbedsXL(
-            dummy_neutral_text_embeds,
-            dummy_neutral_pooled_embeds
-        )
-        prompt_pair = prompt_util.PromptEmbedsPair(
-            positive=dummy_positive_prompt_embeds,
-            neutral=dummy_neutral_prompt_embeds
-        )
-
-        # Dummy add_time_ids (batch_size, 6) for SDXL
-        dummy_add_time_ids = torch.randn(1, 6)
-
-        yield {
-            "img_batches": img_batches,
-            "scales": scales,
-            "prompt_pair": prompt_pair,
-            "add_time_ids": dummy_add_time_ids,
-            "seed": random.randint(0, 100000),
-        }
+    #stubbed out:
+    #load a normal debug dataset through normal mechanisms.
+    #construct visual 'prompt pairs' 
+    #(make sure that each dataset sampled from has at least two different magnitudes in batchsize * gradient accumulation)
+    #cast batches to an iterator (hint: a huggingface dataset) for sampling during training 
+    pass
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def envsetup(config):
@@ -265,15 +227,7 @@ def envsetup(config):
 
     # Load models using the new utility function
     vae, unet, tokenizers, text_encoders, noise_scheduler =         batch_model_util.load_models(config, device, weight_dtype)
-
-    tokenizer = tokenizers[0]
-    text_encoder = text_encoders[0]
-    tokenizer_2 = None
-    text_encoder_2 = None
-    if len(tokenizers) > 1:
-        tokenizer_2 = tokenizers[1]
-        text_encoder_2 = text_encoders[1]
-
+    
     # Initialize LoRA Network
     network = lora.BatchedLoRANetwork(
         unet=unet,
@@ -306,8 +260,8 @@ def envsetup(config):
         "unet": unet,
         "vae": vae,
         "noise_scheduler": noise_scheduler,
-        "tokenizer": tokenizer,
-        "text_encoder": text_encoder,
+        "tokenizers": tokenizers,
+        "text_encoders": text_encoders,
         
         "network": network,
         "optimizer": optimizer,
