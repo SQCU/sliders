@@ -5,6 +5,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from trainscripts.imagesliders import map_data_to_latents
 from trainscripts.imagesliders import batch_train_util
+import datetime
+import sys
 
 def load_config_from_yaml(filepath):
     with open(filepath, 'r') as f:
@@ -88,6 +90,16 @@ def dataset_constructor(config, environment, use_latents=True):
     dataloader = DataLoader(dataset, batch_size=config['train']['batch_size'], shuffle=True, collate_fn=collate_wrapper)
     return dataloader
 
+def setup_logging():
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_filename = os.path.join(log_dir, f"batch_config_util_test_{timestamp}.log")
+    sys.stdout = open(log_filename, "w")
+    sys.stderr = sys.stdout # Redirect stderr to the same log file
+    print(f"Logging output to {log_filename}")
+    return log_filename
+
 if __name__ == '__main__':
     from trainscripts.imagesliders import config_util
     from trainscripts.imagesliders import batch_model_util
@@ -129,55 +141,65 @@ if __name__ == '__main__':
             "noise_scheduler": noise_scheduler,
             "tokenizers": tokenizers,
             "text_encoders": text_encoders,
-            "network": network,
-            "optimizer": optimizer,
-            "lr_scheduler": lr_scheduler,
-            "criteria": criteria,
             "device": device,
             "weight_dtype": weight_dtype,
             "config": config,
         }
         return environment
 
-    class AttrDict(dict):
-        def __init__(self, *args, **kwargs):
-            super(AttrDict, self).__init__(*args, **kwargs)
-            self.__dict__ = self
+    def main():
+        class AttrDict(dict):
+            def __init__(self, *args, **kwargs):
+                super(AttrDict, self).__init__(*args, **kwargs)
+                self.__dict__ = self
 
-    args = config_io()
-    config_dict = {}
-    for key, value in args.items():
-        if isinstance(value, dict):
-            config_dict[key] = AttrDict(value)
-        else:
-            config_dict[key] = value
-    
-    config = AttrDict(config_dict)
-    
-    environment = envsetup(config)
-    
-    # Test with use_latents=False (references to latent paths)
-    print("Testing with latent paths (use_latents=False)...")
-    dataloader_paths = dataset_constructor(config, environment, use_latents=False)
-    
-    for i, batch in enumerate(dataloader_paths):
-        if i >= 240:
-            break
-        print(f"Batch {i+1}/240 (paths):")
-        # In a real scenario, you would load the latents here before passing to the model
-        # For this test, we just check that the batching works
-        print(f"  Latent paths: {batch['latents']}")
-        print(f"  Scales: {batch['scales']}")
+        args = config_io()
+        config_dict = {}
+        for key, value in args.items():
+            if isinstance(value, dict):
+                config_dict[key] = AttrDict(value)
+            else:
+                config_dict[key] = value
+        
+        config = AttrDict(config_dict)
+        
+        environment = envsetup(config)
+        
+        # Test with use_latents=False (references to latent paths)
+        print("Testing with latent paths (use_latents=False)...")
+        dataloader_paths = dataset_constructor(config, environment, use_latents=False)
+        
+        for i, batch in enumerate(dataloader_paths):
+            if i >= 240:
+                break
+            print(f"Batch {i+1}/240 (paths):")
+            # In a real scenario, you would load the latents here before passing to the model
+            # For this test, we just check that the batching works
+            print(f"  Latent paths: {batch['latents']}")
+            print(f"  Scales: {batch['scales']}")
 
-    # Test with use_latents=True (in-memory latents)
-    print("\nTesting with in-memory latents (use_latents=True)...")
-    dataloader_latents = dataset_constructor(config, environment, use_latents=True)
+        # Test with use_latents=True (in-memory latents)
+        print("\nTesting with in-memory latents (use_latents=True)...")
+        dataloader_latents = dataset_constructor(config, environment, use_latents=True)
 
-    for i, batch in enumerate(dataloader_latents):
-        if i >= 240:
-            break
-        print(f"Batch {i+1}/240 (in-memory):")
-        print(f"  Latents shape: {batch['latents'].shape}")
-        print(f"  Scales: {batch['scales']}")
+        for i, batch in enumerate(dataloader_latents):
+            if i >= 240:
+                break
+            print(f"Batch {i+1}/240 (in-memory):")
+            print(f"  Latents shape: {batch['latents'].shape}")
+            print(f"  Scales: {batch['scales']}")
 
-    print("\nDataset and Dataloader test finished.")
+        print("\nDataset and Dataloader test finished.")
+
+    log_file_path = setup_logging()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        raise
+    finally:
+        sys.stdout.close()
+        sys.stdout = sys.__stdout__ # Restore original stdout
+        sys.stderr = sys.__stderr__ # Restore original stderr
+        print(f"Script finished. Log saved to {log_file_path}")
