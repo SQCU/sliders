@@ -168,7 +168,7 @@ class BatchedLoRANetwork(nn.Module):
         """
         for name, module in root_module.named_modules():
             if self._should_apply_lora(name, module):
-                for child_name, child_module in module.named_modules():
+                for child_name, child_module in module.named_children():
                     if child_module.__class__.__name__ in ["Linear", "Conv2d", "LoRACompatibleLinear", "LoRACompatibleConv"]:
                         if self._should_apply_lora_to_child(name, child_name):
                             lora_name = f"{LORA_PREFIX_UNET}.{name}.{child_name}".replace(".", "_")

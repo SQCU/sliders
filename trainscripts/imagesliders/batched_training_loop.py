@@ -9,13 +9,13 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 
 # Assuming the following files are in the same directory
-from . import train_util, model_util, config_util, prompt_util
-from . import batch_lora as lora # Use the new batched lora
-from . import train_util, batch_train_util # Keep train_util for other functions not yet moved
-from .prompt_util import PromptEmbedsXL, PromptEmbedsPair
+from trainscripts.imagesliders import train_util, model_util, config_util, prompt_util
+from trainscripts.imagesliders import batch_lora as lora # Use the new batched lora
+from trainscripts.imagesliders import train_util, batch_train_util # Keep train_util for other functions not yet moved
+from trainscripts.imagesliders.prompt_util import PromptEmbedsXL, PromptEmbedsPair
 #our new functions live here instead of being rewritten inside of train_util, etc.
 #add new batch_... imports as we need to deviate from imagesliders imports.
-from . import batch_train_util
+from trainscripts.imagesliders import batch_train_util
 
 def log_vram_usage(step_name):
     if torch.cuda.is_available():
@@ -116,12 +116,10 @@ def superfunctional_train_step(
     denoised_latents_low = denoised_latents_low.to(device, dtype=weight_dtype)
     low_noise = low_noise.to(device, dtype=weight_dtype)
 
-    # Prepare for batched predict_noise_xl calls
-    # Concatenate text_embeds, pooled_embeds, and add_time_ids for high and low cases
-    # Each needs to be duplicated for classifier-free guidance within predict_noise_xl
+    # Prepare for batched predict_noise calls for SD1.5
+    # Concatenate text_embeds for high and low cases
+    # Each needs to be duplicated for classifier-free guidance within predict_noise
     # So, for a batch of 2 (high and low), we need 4 entries (high_uncond, high_cond, low_uncond, low_cond)
-    # This means we need to prepare the inputs to predict_noise_xl such that when it duplicates them,
-    # it results in the correct pairings.
 
     # For high scale: prompt_pair.positive
     # For low scale: prompt_pair.neutral
@@ -134,22 +132,10 @@ def superfunctional_train_step(
         prompt_pair.neutral.text_embeds   # neutral cond
     ], dim=0)
 
-    # Create the pooled_embeds batch: [positive_pooled_uncond, positive_pooled_cond, neutral_pooled_uncond, neutral_pooled_cond]
-    pooled_embeds_for_noise_pred = torch.cat([
-        prompt_pair.positive.pooled_embeds, # positive uncond
-        prompt_pair.positive.pooled_embeds, # positive cond
-        prompt_pair.neutral.pooled_embeds,  # neutral uncond
-        prompt_pair.neutral.pooled_embeds   # neutral cond
-    ], dim=0)
-
-    # Create the add_time_ids batch: [add_time_ids_high_uncond, add_time_ids_high_cond, add_time_ids_low_uncond, add_time_ids_low_cond]
-    # Assuming add_time_ids is the same for both high and low, and already duplicated for CFG
-    add_time_ids_for_noise_pred = torch.cat([
-        add_time_ids, # high uncond
-        add_time_ids, # high cond
-        add_time_ids, # low uncond
-        add_time_ids  # low cond
-    ], dim=0)
+    # For SD1.5, pooled_embeds and add_time_ids are not used in the same way as SDXL.
+    # We will pass None for these or adjust the predict_noise function call.
+    # For now, let's ensure they are not used in the concatenation.
+    # The `batched_predict_noise_xl_modular` will need to be adjusted or replaced with an SD1.5 equivalent.
 
     # Set LoRA slider for the combined batch.
     # Convert scales to a tensor and set for the batched LoRA network
@@ -213,7 +199,7 @@ def config_io():
 
     #our default batch_config.yaml contains a reference to "trainscripts/imagesliders/data/config-xl-dilora.yaml". we load that.
 
-    args.obsolete_inner_config = batch_config_util.load_config_from_yaml(args.outerconfig['obsolete_config']['refpath'])
+    args.obsolete_inner_config = config_util.load_config_from_yaml(args.outerconfig['obsolete_config']['refpath'])
     args.dset_config = batch_config_util.load_config_from_yaml(args.outerconfig['dset_config']['refpath'])
     #if you're confused about the contents of these values...
     #you can add a print(outerconfig.dset_config.refpath), then look at what's inside!
@@ -221,45 +207,181 @@ def config_io():
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def dataset_constructor(config):
-    from . import map_data_to_latents
-    # For now, return a dummy iterable to unblock the training loop
-    print("WARNING: dataset_constructor is a stub and returns dummy data.")
-    return [{"dummy_batch": True}]
+    print("WARNING: dataset_constructor is a stub and returns dummy data for 3 image pairs.")
+    # Simulate 3 image pairs as requested in the checklist
+    num_pairs = 3
+    for i in range(num_pairs):
+        # Dummy image batches (batch_size, C, H, W)
+        # Assuming latents are 4, 64, 64 for SDXL
+        dummy_high_img_batch = torch.randn(1, 3, 512, 512) # Example image size
+        dummy_low_img_batch = torch.randn(1, 3, 512, 512)
+        img_batches = (dummy_high_img_batch, dummy_low_img_batch)
+
+        # Dummy scales
+        scales = (random.uniform(0.1, 1.0), random.uniform(0.1, 1.0))
+
+        # Dummy prompt embeddings (batch_size, sequence_length, hidden_size)
+        # For SDXL, text_embeds are typically (1, 77, 768) and pooled_embeds are (1, 1280)
+        dummy_positive_text_embeds = torch.randn(1, 77, 768)
+        dummy_positive_pooled_embeds = torch.randn(1, 1280)
+        dummy_neutral_text_embeds = torch.randn(1, 77, 768)
+        dummy_neutral_pooled_embeds = torch.randn(1, 1280)
+
+        # Create dummy PromptEmbedsXL and PromptEmbedsPair
+        dummy_positive_prompt_embeds = prompt_util.PromptEmbedsXL(
+            dummy_positive_text_embeds,
+            dummy_positive_pooled_embeds
+        )
+        dummy_neutral_prompt_embeds = prompt_util.PromptEmbedsXL(
+            dummy_neutral_text_embeds,
+            dummy_neutral_pooled_embeds
+        )
+        prompt_pair = prompt_util.PromptEmbedsPair(
+            positive=dummy_positive_prompt_embeds,
+            neutral=dummy_neutral_prompt_embeds
+        )
+
+        # Dummy add_time_ids (batch_size, 6) for SDXL
+        dummy_add_time_ids = torch.randn(1, 6)
+
+        yield {
+            "img_batches": img_batches,
+            "scales": scales,
+            "prompt_pair": prompt_pair,
+            "add_time_ids": dummy_add_time_ids,
+            "seed": random.randint(0, 100000),
+        }
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def envsetup(config):
-    #load models, check memory use, load optimizers, 
-    #make sure the right things are nograd and on the right devices.
-    #also make sure to bind the right parameters to the right optimizers.
+    from trainscripts.imagesliders import batch_lora as lora
+    from trainscripts.imagesliders import config_util
+    from trainscripts.imagesliders import batch_model_util # New import
+    import torch.optim as optim
 
-    #do stuff here to construct environment
-    
-    #okay now bundle up the state we use in training into an environment object
+    # Determine device and dtype
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weight_dtype = config_util.parse_precision(config.train.precision)
 
-    #okay now return that object
-    #return environment
-    
-    #stub pass
-    pass
+    # Load models using the new utility function
+    vae, unet, tokenizers, text_encoders, noise_scheduler =         batch_model_util.load_models(config, device, weight_dtype)
+
+    tokenizer = tokenizers[0]
+    text_encoder = text_encoders[0]
+    tokenizer_2 = None
+    text_encoder_2 = None
+    if len(tokenizers) > 1:
+        tokenizer_2 = tokenizers[1]
+        text_encoder_2 = text_encoders[1]
+
+    # Initialize LoRA Network
+    network = lora.BatchedLoRANetwork(
+        unet=unet,
+        rank=config.network.rank,
+        
+        alpha=config.network.alpha,
+        train_method=config.network.training_method,
+    ).to(device, dtype=weight_dtype)
+    network.prepare_optimizer_params() # Prepare parameters for optimizer
+
+    # Optimizer
+    optimizer_name = config.train.optimizer.lower()
+    if optimizer_name == "adamw":
+        optimizer = optim.AdamW(network.parameters(), lr=config.train.lr)
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+    # Learning Rate Scheduler
+    lr_scheduler = get_scheduler(
+        name=config.train.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=config.train.iterations,
+    )
+
+    # Loss function
+    criteria = torch.nn.MSELoss(reduction="none") # Use reduction="none" for element-wise loss
+
+    environment = {
+        "unet": unet,
+        "vae": vae,
+        "noise_scheduler": noise_scheduler,
+        "tokenizer": tokenizer,
+        "text_encoder": text_encoder,
+        
+        "network": network,
+        "optimizer": optimizer,
+        "lr_scheduler": lr_scheduler,
+        "criteria": criteria,
+        "device": device,
+        "weight_dtype": weight_dtype,
+        "config": config, # Pass the config to the environment
+    }
+    return environment
+
+
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
-def training_step(environment,
-data,
-):  
-    #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
-    #a lot of environment setup and other stuff are wrongly included
-    #in superfunctional_train_step. factor them out to make it stateless!
+def training_step(
+    environment,
+    batch,
+):
+    # Extract components from environment
+    unet = environment["unet"]
+    vae = environment["vae"]
+    noise_scheduler = environment["noise_scheduler"]
+    network = environment["network"]
+    criteria = environment["criteria"]
+    device = environment["device"]
+    weight_dtype = environment["weight_dtype"]
+    text_encoder = environment["text_encoder"]
+    text_encoder_2 = environment["text_encoder_2"]
+    tokenizer = environment["tokenizer"]
+    tokenizer_2 = environment["tokenizer_2"]
 
-    #select target cases from dataset
-    
-    #compute model prediction
+    # Extract data from batch
+    img_batches = batch["img_batches"]
+    scales = batch["scales"]
+    prompt_pair = batch["prompt_pair"]
+    add_time_ids = batch["add_time_ids"]
+    seed = batch["seed"]
 
-    #use environment["criterion"] on target,prediction
-    #e.g. comparison = environment["criterion"](target, prediction)
-    #return comparison
+    # Move data to device and set dtype
+    img_batches_high = img_batches[0].to(device, dtype=weight_dtype)
+    img_batches_low = img_batches[1].to(device, dtype=weight_dtype)
+    img_batches = (img_batches_high, img_batches_low)
 
-    #stub pass
-    pass
+    # Ensure prompt embeddings are on the correct device and dtype
+    prompt_pair.positive.text_embeds = prompt_pair.positive.text_embeds.to(device, dtype=weight_dtype)
+    prompt_pair.positive.pooled_embeds = prompt_pair.positive.pooled_embeds.to(device, dtype=weight_dtype)
+    prompt_pair.neutral.text_embeds = prompt_pair.neutral.text_embeds.to(device, dtype=weight_dtype)
+    prompt_pair.neutral.pooled_embeds = prompt_pair.neutral.pooled_embeds.to(device, dtype=weight_dtype)
+    add_time_ids = add_time_ids.to(device, dtype=weight_dtype)
+
+    # Call superfunctional_train_step
+    loss_high_per_element, loss_low_per_element, _, _, _, _, _, _ = superfunctional_train_step(
+        unet=unet,
+        vae=vae,
+        noise_scheduler=noise_scheduler,
+        img_batches=img_batches,
+        scales=scales,
+        prompt_embeds=(prompt_pair.positive, prompt_pair.neutral), # This argument is redundant given prompt_pair
+        prompt_pair=prompt_pair,
+        config=environment["config"], # Need to pass config from environment
+        network=network,
+        criteria=criteria,
+        device=device,
+        weight_dtype=weight_dtype,
+        add_time_ids=add_time_ids,
+        seed=seed,
+    )
+
+    # Calculate total loss (e.g., sum or mean of high and low losses)
+    loss_high = loss_high_per_element.mean()
+    loss_low = loss_low_per_element.mean()
+    total_loss = loss_high + loss_low # Simple sum for now
+
+    return total_loss
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
 def training_loop(
@@ -298,6 +420,9 @@ def training_loop(
         pass
 
     #non-stub real functions you better be using for real.
+    optimizer = environment["optimizer"]
+    lr_scheduler = environment["lr_scheduler"]
+
     for batch in dataset:
         optimizer.zero_grad()
         loss_tensor = training_step(environment,batch)
