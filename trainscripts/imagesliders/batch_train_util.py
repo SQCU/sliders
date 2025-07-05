@@ -21,6 +21,7 @@ SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
 
 def get_batched_noisy_images(
     img_batch: torch.Tensor,
+    vae: torch.nn.Module,
     generator: torch.Generator,
     noise_scheduler: SchedulerMixin,
     config,
@@ -32,9 +33,12 @@ def get_batched_noisy_images(
     """
     Combines the process of getting noisy images for high and low scales into a single batched operation.
     """
+    with torch.no_grad():
+        latents = vae.encode(img_batch.to(dtype=weight_dtype)).latent_dist.sample()
+        latents = latents * vae.config.scaling_factor
    
     # Generate noise for the combined batch
-    noise_shape = img_batch.shape
+    noise_shape = latents.shape
     noise = randn_tensor(noise_shape, generator=generator, device=device)
 
     #timestep interval logic from upstream
@@ -42,7 +46,7 @@ def get_batched_noisy_images(
     timestep = noise_scheduler.timesteps[time_:time_+1]
 
     # Add noise to the combined latents
-    noisy_latents = noise_scheduler.add_noise(img_batch, noise, timestep)
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timestep)
 
     #return without splitting and unsplitting several times for no reason!
     return noisy_latents, noise
@@ -74,6 +78,10 @@ def run_unet_inference(
     """
     Performs the UNet forward pass to predict the noise residual.
     """
+    print(f"latent_model_input shape: {latent_model_input.shape}")
+    print(f"text_embeddings shape: {text_embeddings.shape}")
+    print(f"add_text_embeddings shape: {add_text_embeddings.shape}")
+    print(f"add_time_ids shape: {add_time_ids.shape}")
     added_cond_kwargs = {
         "text_embeds": add_text_embeddings,
         "time_ids": add_time_ids,
@@ -114,15 +122,16 @@ def batched_predict_noise_xl_modular(
     A modular version of predict_noise_xl, orchestrating the sub-components.
     This function can be easily modified to swap out different guidance strategies.
     """
+    device = unet.device
     latent_model_input = prepare_unet_input_for_cfg(latents, scheduler, timestep)
     
     noise_pred = run_unet_inference(
         unet,
-        latent_model_input,
+        latent_model_input.to(device),
         timestep,
-        text_embeddings,
-        add_text_embeddings,
-        add_time_ids,
+        text_embeddings.to(device),
+        add_text_embeddings.to(device),
+        add_time_ids.to(device),
     )
     
     guided_target = apply_cfg_guidance(noise_pred, guidance_scale)
@@ -249,7 +258,7 @@ def create_batched_prompt_embeddings(
         neutral_pooled_embeds,
     ], dim=0)
 
-    return text_embeddings_for_noise_pred, pooled_embeds_for_noise_pred
+    return text_embeddings_for_noise_pred, positive_pooled_embeds
 
 # for XL
 def get_add_time_ids(

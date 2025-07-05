@@ -86,6 +86,7 @@ def superfunctional_train_step(
         img_batch = torch.cat(img_batches, dim=0)
         combined_noisy_latents, noise = batch_train_util.get_batched_noisy_images(
             img_batch, # This is a tuple of (high_batch, low_batch)
+            vae,
             generator,
             noise_scheduler,
             config,
@@ -102,6 +103,9 @@ def superfunctional_train_step(
     # The unsqueeze operations are to make the tensor broadcastable to the expected shape
         batched_scales = torch.tensor(scales, device=device, dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) # Shape (2, 1, 1, 1) for broadcasting
 
+    # Concatenate the latents for classifier-free guidance
+    latent_model_input = torch.cat([combined_noisy_latents] * 2)
+
     network.set_lora_scales(batched_scales)
 
     with network: # This context manager ensures LoRA weights are applied during the UNet forward pass
@@ -117,10 +121,10 @@ def superfunctional_train_step(
             unet,
             noise_scheduler,
             batch_timesteps,    # tensor of timesteps used in training batch (indexes of noise levels)
-            combined_noisy_latents, # Combined high and low latents
-            text_embeddings,
-            pooled_embeds,
-            add_time_ids,
+            latent_model_input.to(dtype=weight_dtype), # Combined high and low latents
+            text_embeddings.to(dtype=weight_dtype),
+            pooled_embeds.to(dtype=weight_dtype),
+            add_time_ids.to(dtype=weight_dtype),
             guidance_scale=1, # Classifier-free guidance is handled internally by predict_noise_xl_modular
         )
 

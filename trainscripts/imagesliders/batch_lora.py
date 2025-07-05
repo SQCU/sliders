@@ -84,30 +84,11 @@ class BatchedLoRAModule(nn.Module):
         # The original module reference is kept for its parameters and state_dict,
         # but its forward method is now overridden.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Performs the augmented forward pass.
-
-        Args:
-            x (torch.Tensor): The input tensor to the original module.
-
-        Returns:
-            torch.Tensor: The output tensor after applying the LoRA update.
-        """
-        # The current_multiplier is expected to be a tensor of shape (batch_size, 1, 1, ...)
-        # or (batch_size,) that can broadcast correctly with the LoRA output.
-        # The multiplication `* self.current_multiplier * self.scale` will apply
-        # different scales to different batch items.
-        lora_output = self.lora_up(self.lora_down(x))
-        
-        # Ensure current_multiplier is broadcastable.
-        # If x is (B, C, H, W) and lora_output is (B, C, H, W),
-        # current_multiplier should be (B, 1, 1, 1) for element-wise scaling per batch item.
-        # If x is (B, D) and lora_output is (B, D),
-        # current_multiplier should be (B, 1) for element-wise scaling per batch item.
-        # We assume current_multiplier is already correctly shaped by BatchedLoRANetwork.
-        
-        return self.org_forward(x) + lora_output * self.current_multiplier * self.scale
+    def forward(self, x):
+        return (
+            self.org_forward(x)
+            + self.lora_up(self.lora_down(x)) * self.current_multiplier * self.scale
+        )
 
 
 class BatchedLoRANetwork(nn.Module):
@@ -268,5 +249,7 @@ class BatchedLoRANetwork(nn.Module):
 
         # This part needs to be adapted based on how you want to save.
         # For now, a simple torch.save
-        torch.save(state_dict, file)
-        print(f"LoRA weights saved to {file}")
+        if os.path.splitext(file)[1] == ".safetensors":
+            save_file(state_dict, file, metadata)
+        else:
+            torch.save(state_dict, file)
