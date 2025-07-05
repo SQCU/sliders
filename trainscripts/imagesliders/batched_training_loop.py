@@ -46,8 +46,7 @@ def superfunctional_train_step(
     seed: int,
 ):
     """
-    Performs a single training step for a high/low image pair, leveraging batched operations
-    for internal efficiency.
+    Performs a single training step for a batch of images with multiple network scales.
 
     This function encapsulates the core logic for:
     1. Generating noisy latents for both high and low images.
@@ -56,70 +55,47 @@ def superfunctional_train_step(
     4. Performing a batched UNet forward pass to predict noise.
     5. Calculating the loss for both high and low predictions.
 
-    Args:
-        unet (torch.nn.Module): The UNet model for noise prediction.
-        vae (torch.nn.Module): The VAE model for image encoding/decoding.
-        noise_scheduler: The noise scheduler (e.g., DDPMScheduler).
-        img_batches (tuple[torch.Tensor, torch.Tensor]): A tuple containing two tensors,
-            where the first tensor is the batch of 'high' images and the second is
-            the batch of 'low' images. Each tensor is expected to have shape (batch_size, C, H, W).
-            For this function, batch_size is typically 1, representing a single high/low pair.
-        scales (tuple[float, float]): A tuple containing the LoRA scale for the 'high' image
-            and the 'low' image, respectively.
-        prompt_embeds (tuple[prompt_util.PromptEmbedsXL, prompt_util.PromptEmbedsXL]):
-            A tuple where the first element contains prompt embeddings for the 'high' image
-            (positive prompt) and the second for the 'low' image (neutral prompt).
-        prompt_pair (prompt_util.PromptEmbedsPair): A container object holding the
-            positive and neutral prompt embeddings. Used for clarity in some parts.
-        config (config_util.RootConfig): The overall training configuration.
-        network (lora.BatchedLoRANetwork): The batched LoRA network responsible for
-            applying LoRA weights based on the provided scales.
-        criteria (torch.nn.Module): The loss function (e.g., MSELoss).
-        device (torch.device): The device (e.g., 'cuda:0' or 'cpu') to perform computations on.
-        weight_dtype (torch.dtype): The data type for model weights (e.g., torch.float16, torch.bfloat16).
-        add_time_ids (torch.Tensor): Additional time IDs for SDXL models, typically
-            representing original image dimensions.
-        seed (int): The random seed for noise generation.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            A tuple containing:
-            - loss_high_per_element (torch.Tensor): Element-wise loss for the 'high' image.
-            - loss_low_per_element (torch.Tensor): Element-wise loss for the 'low' image.
-            - denoised_latents_high (torch.Tensor): Denoised latents for the 'high' image.
-            - high_noise (torch.Tensor): The noise added to the 'high' image latents.
-            - target_latents_high (torch.Tensor): Predicted noise for the 'high' image.
-            - denoised_latents_low (torch.Tensor): Denoised latents for the 'low' image.
-            - low_noise (torch.Tensor): The noise added to the 'low' image latents.
-            - target_latents_low (torch.Tensor): Predicted noise for the 'low' image.
+        tuple[torch.Tensor, torch.Tensor]:
+            A tuple containing the loss at each batch element. 
     """
-    noise_scheduler.set_timesteps(1000)
-    current_timestep = noise_scheduler.timesteps[
-        int((config.train.max_denoising_steps - 1) * 1000 / config.train.max_denoising_steps)
-    ]
+    #funky undocumented stuff:
+    #counterintuitively, this does distillation training,
+    # the argument is choosing how many sampling steps are used to generate a 'full image'.
+    # lower value = fewer sampling steps = bigger prediction distance in the signal-to-noise-ratio domain
+    with torch.no_grad():
+        noise_scheduler.set_timesteps(
+            config.train.max_denoising_steps, device=device
+        )
 
-    generator = torch.manual_seed(seed)
-    
+    # 1 ~ 49 からランダム
+    #fix this for batching so that each high/low tuple,
+    # stemming from a matching image,
+    # shares a timestep sampled from this distribution
+    # stub code picks an item() from this instead of sampling from it.
+        timesteps_to = torch.randint(
+            1, config.train.max_denoising_steps, (1,)
+        ).item()
+
+        seed = random.randint(0,2*15)
+        generator = torch.manual_seed(seed)
     # Call graph hop 1: get_batched_noisy_images from batch_train_util
-    denoised_latents_high, high_noise, denoised_latents_low, low_noise = batch_train_util.get_batched_noisy_images(
-        img_batches, # This is a tuple of (high_batch, low_batch)
-        vae,
-        generator,
-        unet,
-        noise_scheduler,
-        config,
-        device,
-        weight_dtype,
-    )
-    denoised_latents_high = denoised_latents_high.to(device, dtype=weight_dtype)
-    high_noise = high_noise.to(device, dtype=weight_dtype)
-    denoised_latents_low = denoised_latents_low.to(device, dtype=weight_dtype)
-    low_noise = low_noise.to(device, dtype=weight_dtype)
-
-    # Prepare for batched predict_noise calls for SD1.5
+    # this is misnamed 'denoised_latents' in upstream. 
+    # it retrieves noisy latents in the upstream's functions so we use a less deranged name here.
+        start_timesteps = 0
+        combined_noisy_latents, noise = batch_train_util.get_batched_noisy_images(
+            img_batches, # This is a tuple of (high_batch, low_batch)
+            vae,
+            generator,
+            unet,
+            noise_scheduler,
+            config,
+            start_timesteps,
+            timesteps_to,
+            device,
+            weight_dtype,
+        )
+    
     # Concatenate text_embeds for high and low cases
-    # Each needs to be duplicated for classifier-free guidance within predict_noise
-    # So, for a batch of 2 (high and low), we need 4 entries (high_uncond, high_cond, low_uncond, low_cond)
 
     # For high scale: prompt_pair.positive
     # For low scale: prompt_pair.neutral
@@ -132,11 +108,6 @@ def superfunctional_train_step(
         prompt_pair.neutral.text_embeds   # neutral cond
     ], dim=0)
 
-    # For SD1.5, pooled_embeds and add_time_ids are not used in the same way as SDXL.
-    # We will pass None for these or adjust the predict_noise function call.
-    # For now, let's ensure they are not used in the concatenation.
-    # The `batched_predict_noise_xl_modular` will need to be adjusted or replaced with an SD1.5 equivalent.
-
     # Set LoRA slider for the combined batch.
     # Convert scales to a tensor and set for the batched LoRA network
     # The unsqueeze operations are to make the tensor broadcastable to the expected shape
@@ -148,30 +119,35 @@ def superfunctional_train_step(
     network.set_lora_scales(batched_scales)
 
     with network: # This context manager ensures LoRA weights are applied during the UNet forward pass
-        with torch.no_grad(): # No gradient calculation needed for noise prediction
-            # Perform batched predict_noise_xl call for both high and low scales
-            # The BatchedLoRANetwork will now apply the correct scale to each item in the batch
-            
-            # Concatenate denoised latents for high and low cases for the UNet input
-            combined_denoised_latents_for_noise_pred = torch.cat([denoised_latents_high, denoised_latents_low], dim=0)
+        # Perform batched predict_noise_xl call for both high and low scales
+        # The BatchedLoRANetwork will now apply the correct scale to each item in the batch
 
-            # Call graph hop 3: batched_predict_noise_xl_modular from batch_train_util
-            target_latents_high, target_latents_low = batch_train_util.batched_predict_noise_xl_modular(
-                unet,
-                noise_scheduler,
-                current_timestep,
-                combined_denoised_latents_for_noise_pred, # Combined high and low latents
-                text_embeddings_for_noise_pred,
-                pooled_embeds_for_noise_pred,
-                add_time_ids_for_noise_pred,
-                guidance_scale=1, # Classifier-free guidance is handled internally by predict_noise_xl_modular
-            )
+        #necessary to predict right noise level for each potentially different timestep in a batch.
+        #should form a scalar integer tensor of batch dim size.
+        #don't try to understand the calculation here, but it's mandatory.
+        batch_timesteps = noise_scheduler.timesteps[
+            int(timesteps_to * 1000 / config.train.max_denoising_steps)
+        ]
+
+        # Call graph hop 3: batched_predict_noise_xl_modular from batch_train_util
+        target_latents_high, target_latents_low = batch_train_util.batched_predict_noise_xl_modular(
+            unet,
+            noise_scheduler,
+            batch_timesteps,    # tensor of timesteps used in training batch (indexes of noise levels)
+            combined_noisy_latents, # Combined high and low latents
+            text_embeddings_for_noise_pred,
+            pooled_embeds_for_noise_pred,
+            add_time_ids_for_noise_pred,
+            guidance_scale=1, # Classifier-free guidance is handled internally by predict_noise_xl_modular
+        )
 
     # Call graph hop 4: Loss calculation (criteria is typically MSELoss)
     loss_high_per_element = (target_latents_high - high_noise).pow(2).to(torch.float32)
     loss_low_per_element = (target_latents_low - low_noise).pow(2).to(torch.float32)
 
-    return loss_high_per_element, loss_low_per_element, denoised_latents_high, high_noise, target_latents_high, denoised_latents_low, low_noise, target_latents_low
+    del denoised_latents_high, high_noise, target_latents_high, denoised_latents_low, low_noise, target_latents_low
+
+    return loss_high_per_element, loss_low_per_element,
 
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
@@ -212,6 +188,13 @@ def dataset_constructor(config):
     #construct visual 'prompt pairs' 
     #(make sure that each dataset sampled from has at least two different magnitudes in batchsize * gradient accumulation)
     #cast batches to an iterator (hint: a huggingface dataset) for sampling during training 
+    #   also do stuff about vae input scaling:
+    # from diffusers.image_processor import VaeImageProcessor
+    # vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    # image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor,do_convert_rgb=True)
+    # image = image_processor.preprocess(image)
+    # init_latents = vae.encode(image).latent_dist.sample(None)
+    # init_latents = vae.config.scaling_factor * init_latents
     pass
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:

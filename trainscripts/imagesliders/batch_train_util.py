@@ -5,6 +5,8 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 from typing import Tuple
 
+SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
+
 # --- Analysis of train_util.get_noisy_image ---
 # Function Operand: imgs (single Image.Image or list of Image.Image), vae, generator, unet, scheduler, total_timesteps, start_timesteps.
 # Can be batched? Yes. The function already handles a list of Image.Image and concatenates them into image_batch.
@@ -12,39 +14,32 @@ from typing import Tuple
 # Needs to be batched? Yes. In superfunctional_train_step, get_noisy_image is called twice. To truly batch the training step, these two calls should ideally be combined into a single call that processes both high and low images in a single batch.
 
 def get_batched_noisy_images(
-    img_batches: Tuple[torch.Tensor, torch.Tensor],
-    vae: torch.nn.Module,
+    img_batch: torch.Tensor,
     generator: torch.Generator,
-    unet: torch.nn.Module,
     noise_scheduler,
     config,
+    total_timesteps:int, # = 1000,
+    start_timesteps:int, #=0,
     device: torch.device,
     weight_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Combines the process of getting noisy images for high and low scales into a single batched operation.
     """
-    # Combine high and low latents for batched noise generation
-    combined_latents_for_noise_addition = torch.cat([img_batches[0], img_batches[1]], dim=0)
-    
+   
     # Generate noise for the combined batch
-    noise_shape = combined_latents_for_noise_addition.shape
+    noise_shape = img_batch.shape
     combined_noise = randn_tensor(noise_shape, generator=generator, device=device)
 
-    # Determine the timestep for adding noise (same for both high and low)
-    noise_timestep = noise_scheduler.timesteps[config.train.max_denoising_steps - 1]
+    #timestep interval logic from upstream
+    time_ = total_timesteps
+    timestep = scheduler.timesteps[time_:time_+1]
 
     # Add noise to the combined latents
-    combined_denoised_latents = noise_scheduler.add_noise(combined_latents_for_noise_addition, combined_noise, noise_timestep)
+    noisy_latents = noise_scheduler.add_noise(img_batch, combined_noise, timestep)
 
-    # Split back into high and low components
-    denoised_latents_high = combined_denoised_latents[0].unsqueeze(0)
-    high_noise = combined_noise[0].unsqueeze(0)
-
-    denoised_latents_low = combined_denoised_latents[1].unsqueeze(0)
-    low_noise = combined_noise[1].unsqueeze(0)
-
-    return denoised_latents_high, high_noise, denoised_latents_low, low_noise
+    #return without splitting and unsplitting several times for no reason!
+    return noisy_latents, noise
 
 # --- Modular functions for predict_noise_xl and guidance ---
 
@@ -98,27 +93,6 @@ def apply_cfg_guidance(
     )
     return guided_target
 
-def apply_rescale_noise_cfg(
-    noise_cfg: torch.FloatTensor,
-    noise_pred_text: torch.FloatTensor,
-    guidance_rescale: float,
-) -> torch.FloatTensor:
-    """
-    Rescales `noise_cfg` according to `guidance_rescale`.
-    Based on findings of [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://arxiv.org/pdf/2305.08891.pdf).
-    """
-    std_text = noise_pred_text.std(
-        dim=list(range(1, noise_pred_text.ndim)), keepdim=True
-    )
-    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
-    # rescale the results from guidance (fixes overexposure)
-    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
-    # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
-    noise_cfg = (
-        guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
-    )
-    return noise_cfg
-
 def batched_predict_noise_xl_modular(
     unet: torch.nn.Module,
     scheduler,
@@ -147,8 +121,51 @@ def batched_predict_noise_xl_modular(
     
     guided_target = apply_cfg_guidance(noise_pred, guidance_scale)
     
-    # noise_pred_text is needed for rescale_noise_cfg, so we need to re-chunk noise_pred
-    _, noise_pred_text = noise_pred.chunk(2) 
-    guided_target = apply_rescale_noise_cfg(guided_target, noise_pred_text, guidance_rescale)
-    
     return guided_target
+
+def diffusion(
+    unet: UNet2DConditionModel,
+    scheduler: SchedulerMixin,
+    latents: torch.FloatTensor,  # ただのノイズだけのlatents
+    text_embeddings: torch.FloatTensor,
+    total_timesteps: int = 1000,
+    start_timesteps=0,
+    **kwargs,
+):
+    # latents_steps = []
+
+    for timestep in tqdm(scheduler.timesteps[start_timesteps:total_timesteps]):
+        noise_pred = run_unet_inference(
+            unet, scheduler, timestep, latents, text_embeddings, **kwargs
+        )
+
+        # compute the previous noisy sample x_t -> x_t-1
+        latents = scheduler.step(noise_pred, timestep, latents).prev_sample
+
+    # return latents_steps
+    return latents
+
+def encode_prompts_xl(
+    tokenizers: list[CLIPTokenizer],
+    text_encoders: list[SDXL_TEXT_ENCODER_TYPE],
+    prompts: list[str],
+    num_images_per_prompt: int = 1,
+) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    # text_encoder and text_encoder_2's penuultimate layer's output
+    text_embeds_list = []
+    pooled_text_embeds = None  # always text_encoder_2's pool
+
+    for tokenizer, text_encoder in zip(tokenizers, text_encoders):
+        text_tokens_input_ids = text_tokenize(tokenizer, prompts)
+        text_embeds, pooled_text_embeds = text_encode_xl(
+            text_encoder, text_tokens_input_ids, num_images_per_prompt
+        )
+
+        text_embeds_list.append(text_embeds)
+
+    bs_embed = pooled_text_embeds.shape[0]
+    pooled_text_embeds = pooled_text_embeds.repeat(1, num_images_per_prompt).view(
+        bs_embed * num_images_per_prompt, -1
+    )
+
+    return torch.concat(text_embeds_list, dim=-1), pooled_text_embeds

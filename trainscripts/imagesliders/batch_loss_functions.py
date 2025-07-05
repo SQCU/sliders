@@ -1,5 +1,6 @@
 # trainscripts/imagesliders/batch_loss_functions.py
 # Defines stateless loss functions.
+# semantically meaningful only for 'textsliders'
 
 import torch
 
