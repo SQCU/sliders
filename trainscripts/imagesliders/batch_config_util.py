@@ -9,6 +9,9 @@ from trainscripts.imagesliders import batch_train_util
 import datetime
 import sys
 from pydantic import BaseModel
+from trainscripts.imagesliders import batch_model_util
+import torch.optim as optim
+import argparse
 
 def load_config_from_yaml(filepath):
     with open(filepath, 'r') as f:
@@ -246,52 +249,47 @@ def load_config_from_yaml_and_merge(config_path: str) -> RootConfig:
 
     return root
 
+def config_io():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batchtrainconfig", "--bconfig", "-c", 
+                        type=str, 
+                        help="Path to the batch training config file.",
+                        default="trainscripts/imagesliders/data/batch_config.yaml")
+    args = parser.parse_args()
+
+    print(f"Loading batch config from: {args.batchtrainconfig}")
+    config = load_config_from_yaml(args.batchtrainconfig)
+    
+    inner_config_path = config['obsolete_config']['refpath']
+    print(f"Loading and merging inner config from: {inner_config_path}")
+    inner_config = load_config_from_yaml_and_merge(inner_config_path)
+    config.update(inner_config)
+
+    dset_config_path = config['dset_config']['refpath']
+    print(f"Loading dataset config from: {dset_config_path}")
+    config['dataset_config'] = load_config_from_yaml(dset_config_path)
+
+    return config
+
+def envsetup(config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weight_dtype = parse_precision(config.train.precision)
+
+    vae, unet, tokenizers, text_encoders, noise_scheduler = batch_model_util.load_models(config, device, weight_dtype)
+
+    environment = {
+        "unet": unet,
+        "vae": vae,
+        "noise_scheduler": noise_scheduler,
+        "tokenizers": tokenizers,
+        "text_encoders": text_encoders,
+        "device": device,
+        "weight_dtype": weight_dtype,
+        "config": config,
+    }
+    return environment
+
 if __name__ == '__main__':
-    from trainscripts.imagesliders import batch_model_util
-    import torch.optim as optim
-
-    def config_io():
-        import argparse
-
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--batchtrainconfig", "--bconfig", "-c", 
-                            type=str, 
-                            help="Path to the batch training config file.",
-                            default="trainscripts/imagesliders/data/batch_config.yaml")
-        args = parser.parse_args()
-
-        print(f"Loading batch config from: {args.batchtrainconfig}")
-        config = load_config_from_yaml(args.batchtrainconfig)
-        
-        inner_config_path = config['obsolete_config']['refpath']
-        print(f"Loading and merging inner config from: {inner_config_path}")
-        inner_config = load_config_from_yaml_and_merge(inner_config_path)
-        config.update(inner_config)
-
-        dset_config_path = config['dset_config']['refpath']
-        print(f"Loading dataset config from: {dset_config_path}")
-        config['dataset_config'] = load_config_from_yaml(dset_config_path)
-
-        return config
-
-    def envsetup(config):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        weight_dtype = parse_precision(config.train.precision)
-
-        vae, unet, tokenizers, text_encoders, noise_scheduler = batch_model_util.load_models(config, device, weight_dtype)
-
-        environment = {
-            "unet": unet,
-            "vae": vae,
-            "noise_scheduler": noise_scheduler,
-            "tokenizers": tokenizers,
-            "text_encoders": text_encoders,
-            "device": device,
-            "weight_dtype": weight_dtype,
-            "config": config,
-        }
-        return environment
-
     def main():
         args = config_io()
         config = AttrDict(args)

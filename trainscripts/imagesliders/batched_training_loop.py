@@ -4,22 +4,96 @@ import gc
 from tqdm import tqdm
 import datetime
 import sys
+import argparse
+import yaml
+from diffusers.optimization import get_scheduler
+import torch.optim as optim
 
 from trainscripts.imagesliders.batch_config_util import (
-    config_io,
-    envsetup,
     dataset_constructor,
     setup_logging,
     AttrDict,
+    load_config_from_yaml,
+    load_config_from_yaml_and_merge,
+    parse_precision,
 )
 from trainscripts.imagesliders import batch_lora as lora
 from trainscripts.imagesliders import batch_train_util
+from trainscripts.imagesliders import batch_model_util
 
 
-def train_step(environment: dict, batch: dict):
+def config_io():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batchtrainconfig", "--bconfig", "-c", 
+                        type=str, 
+                        help="Path to the batch training config file.",
+                        default="trainscripts/imagesliders/data/batch_config.yaml")
+    args = parser.parse_args()
+
+    print(f"Loading batch config from: {args.batchtrainconfig}")
+    config = load_config_from_yaml(args.batchtrainconfig)
+    
+    inner_config_path = config['obsolete_config']['refpath']
+    print(f"Loading and merging inner config from: {inner_config_path}")
+    # This function is not ideal, but it's what the original code used.
+    # It returns a Pydantic model, which we convert to a dict.
+    inner_config_model = load_config_from_yaml_and_merge(inner_config_path)
+    inner_config = inner_config_model.dict()
+    config.update(inner_config)
+
+    dset_config_path = config['dset_config']['refpath']
+    print(f"Loading dataset config from: {dset_config_path}")
+    config['dataset_config'] = load_config_from_yaml(dset_config_path)
+
+    return config
+
+def envsetup(config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weight_dtype = parse_precision(config.train.precision)
+
+    vae, unet, tokenizers, text_encoders, noise_scheduler = batch_model_util.load_models(config, device, weight_dtype)
+    
+    network = lora.BatchedLoRANetwork(
+        unet=unet,
+        rank=config.network.rank,
+        alpha=config.network.alpha,
+        train_method=config.network.training_method,
+    ).to(device, dtype=weight_dtype)
+    network.prepare_optimizer_params()
+
+    optimizer_name = config.train.optimizer.lower()
+    if optimizer_name == "adamw":
+        optimizer = optim.AdamW(network.parameters(), lr=config.train.lr)
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
+    lr_scheduler = get_scheduler(
+        name=config.train.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=config.train.iterations,
+    )
+
+    environment = {
+        "unet": unet,
+        "vae": vae,
+        "noise_scheduler": noise_scheduler,
+        "tokenizers": tokenizers,
+        "text_encoders": text_encoders,
+        "network": network,
+        "optimizer": optimizer,
+        "lr_scheduler": lr_scheduler,
+        "device": device,
+        "weight_dtype": weight_dtype,
+        "config": config,
+    }
+    return environment
+
+
+def train_step(environment: dict, batch: dict, seed: int):
     """
     Performs a single training step. The function is simplified to accept
-    the environment dictionary and a single batch of data.
+    the environment dictionary, a single batch of data, and a seed for reproducibility.
     """
     # Unpack necessary components from the environment
     unet = environment["unet"]
@@ -40,25 +114,22 @@ def train_step(environment: dict, batch: dict):
 
     # Prepare for training step
     optimizer.zero_grad()
-    noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
-    
-    # Select a random timestep for noise addition
-    timesteps_to = torch.randint(
-        1, config.train.max_denoising_steps, (1,)
-    ).item()
 
-    # Add noise to latents
-    noisy_latents, noise = batch_train_util.get_batched_noisy_images(
-        latents,
-        None,  # VAE is not needed here as we operate on latents
-        None,  # Generator is not needed for noise addition
-        noise_scheduler,
-        config,
-        0,
-        timesteps_to,
-        device,
-        weight_dtype,
-    )
+    # --- TIMESTEP LOGIC ---
+    with torch.no_grad():
+        noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
+        generator = torch.Generator(device=device).manual_seed(seed)
+        
+        # Generate a random timestep for each item in the batch
+        timesteps_to = torch.randint(
+            1, config.train.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
+        ).long()
+
+    # Add noise to latents using the generated timesteps
+    noise = torch.randn(latents.shape, device=latents.device, generator=generator)
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps_to)
+    
+    # --- END TIMESTEP LOGIC ---
 
     # Set LoRA scales for the current batch
     batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
@@ -66,13 +137,17 @@ def train_step(environment: dict, batch: dict):
 
     # Predict noise
     with network:
-        batch_timesteps = noise_scheduler.timesteps[
-            int(timesteps_to * 1000 / config.train.max_denoising_steps)
-        ]
+        # The timesteps for the UNet need to be the actual timesteps from the scheduler
+        # corresponding to the `timesteps_to` indices.
+        unet_timesteps = noise_scheduler.timesteps[timesteps_to].to(weight_dtype)
+        
+        # Expand the timesteps to match the batch size of the noisy_latents
+        unet_timesteps = unet_timesteps.repeat(2)
+        
         predicted_noise = batch_train_util.batched_predict_noise_xl_modular(
             unet,
             noise_scheduler,
-            batch_timesteps,
+            unet_timesteps,
             noisy_latents,
             text_embeddings,
             pooled_embeds,
@@ -80,10 +155,53 @@ def train_step(environment: dict, batch: dict):
             guidance_scale=1,
         )
 
-    # Calculate loss
-    # The predicted noise is scaled by the LoRA scales during the forward pass
+    # Calculate loss per element
     loss_per_element = (predicted_noise - noise).pow(2).to(torch.float32)
-    loss = loss_per_element.mean()
+    
+    # Reduce the loss to a per-item scalar value by taking the mean over non-batch dimensions
+    loss_per_item = loss_per_element.mean(dim=list(range(1, loss_per_element.ndim)))
+
+    # Dynamically pair up high and low scale losses
+    unique_scales = torch.unique(scales)
+    if len(unique_scales) < 2:
+        # Cannot form pairs, fall back to mean loss for the entire batch
+        loss = loss_per_item.mean()
+    else:
+        # For simplicity, assume the lowest scale is "low" and highest is "high"
+        low_scale = unique_scales.min()
+        high_scale = unique_scales.max()
+
+        low_indices = torch.where(scales == low_scale)[0]
+        high_indices = torch.where(scales == high_scale)[0]
+
+        num_pairs = min(len(low_indices), len(high_indices))
+
+        if num_pairs > 0:
+            # Identify indices for paired items
+            low_paired_indices = low_indices[:num_pairs]
+            high_paired_indices = high_indices[:num_pairs]
+
+            # Calculate summed losses for pairs
+            paired_losses = loss_per_item[low_paired_indices] + loss_per_item[high_paired_indices]
+
+            # Identify indices of all items used in pairs
+            used_indices = torch.cat([low_paired_indices, high_paired_indices])
+            
+            # Create a mask to find leftover items
+            mask = torch.ones(len(loss_per_item), dtype=torch.bool, device=loss_per_item.device)
+            mask[used_indices] = False
+            
+            # Get losses for leftover items
+            leftover_losses = loss_per_item[mask]
+
+            # Combine paired losses and leftover losses
+            all_losses_to_average = torch.cat([paired_losses, leftover_losses])
+            
+            # Final loss is the mean of the combined list
+            loss = all_losses_to_average.mean()
+        else:
+            # No pairs could be formed, so just average all item losses
+            loss = loss_per_item.mean()
 
     # Backpropagation
     loss.backward()
@@ -97,10 +215,15 @@ def training_loop(environment: dict, static_batches: list):
     """
     Main training loop that iterates over a static list of pre-generated batches.
     """
+    # Create a seed for the training run for reproducibility
+    seed = torch.initial_seed()
+    print(f"Using seed {seed} for training.")
+    
     for i in range(environment["config"].train.iterations):
         # Cycle through the static batches
         batch = static_batches[i % len(static_batches)]
-        loss = train_step(environment, batch)
+        # Pass the iteration number as the seed for this step
+        loss = train_step(environment, batch, seed + i)
 
         if i % 10 == 0:
             print(f"Iteration {i+1}/{environment['config'].train.iterations}, Loss: {loss}")
@@ -124,10 +247,10 @@ def main():
     Main function to set up the environment, create the dataset,
     run the training loop, and handle shutdown.
     """
-    # Load configuration using the unified config_io
+    # Load configuration using the local config_io
     config = AttrDict(config_io())
 
-    # Set up the training environment
+    # Set up the training environment using the local envsetup
     environment = envsetup(config)
 
     # Create the dataset and dataloader
@@ -140,6 +263,7 @@ def main():
     print(f"Cached {len(static_batches)} batches.")
 
     # Clean up VRAM before starting training
+    # The VAE and text_encoders are no longer needed after caching the batches
     del environment["vae"]
     del environment["text_encoders"]
     gc.collect()
@@ -152,20 +276,48 @@ def main():
     graceful_shutdown(environment)
 
 
+def setup_logging():
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_filename = os.path.join(log_dir, f"batched_training_loop_{timestamp}.log")
+    
+    # Save original stdout and stderr
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    # Redirect stdout and stderr to the log file
+    log_file = open(log_filename, "w")
+    sys.stdout = log_file
+    sys.stderr = log_file
+    
+    print(f"Logging output to {log_filename}")
+    
+    return log_filename, original_stdout, original_stderr
+
 if __name__ == "__main__":
-    log_file_path = setup_logging()
+    log_file_path, orig_stdout, orig_stderr = setup_logging()
     try:
+        # Print to the original console that logging has started
+        print(f"--- Starting Batched Training Loop ---", file=orig_stdout)
+        print(f"All output will be redirected to: {log_file_path}", file=orig_stdout)
+        
         main()
+        
     except Exception as e:
         import traceback
+        # Log the exception to the file
+        print("--- EXCEPTION OCCURRED ---", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+        # Also print exception to the original console
+        print(f"\n--- EXCEPTION OCCURRED ---", file=orig_stderr)
+        print(f"An error occurred. Check the log file for details: {log_file_path}", file=orig_stderr)
+        traceback.print_exc(file=orig_stderr)
         raise
+        
     finally:
         # Restore stdout and stderr
-        if isinstance(sys.stdout, open):
-            sys.stdout.close()
-            sys.stdout = sys.__stdout__
-        if isinstance(sys.stderr, open):
-            sys.stderr.close()
-            sys.stderr = sys.__stderr__
-        print(f"Script finished. Log saved to {log_file_path}")
+        sys.stdout.close()
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
+        print(f"--- Script finished. Log saved to {log_file_path} ---")

@@ -70,7 +70,7 @@ def prepare_unet_input_for_cfg(
 def run_unet_inference(
     unet: torch.nn.Module,
     latent_model_input: torch.FloatTensor,
-    timestep: int,
+    timestep: torch.Tensor,  # Changed to torch.Tensor
     text_embeddings: torch.FloatTensor,
     add_text_embeddings: torch.FloatTensor,
     add_time_ids: torch.FloatTensor,
@@ -78,6 +78,13 @@ def run_unet_inference(
     """
     Performs the UNet forward pass to predict the noise residual.
     """
+    # Ensure timestep is a tensor and expand it if necessary
+    if not isinstance(timestep, torch.Tensor):
+        timestep = torch.tensor([timestep], device=latent_model_input.device)
+    
+    # Expand the timestep to match the batch size of the latent_model_input
+    timestep = timestep.expand(latent_model_input.shape[0])
+
     print(f"latent_model_input shape: {latent_model_input.shape}")
     print(f"text_embeddings shape: {text_embeddings.shape}")
     print(f"add_text_embeddings shape: {add_text_embeddings.shape}")
@@ -110,7 +117,7 @@ def apply_cfg_guidance(
 def batched_predict_noise_xl_modular(
     unet: torch.nn.Module,
     scheduler,
-    timestep: int,
+    timestep: torch.Tensor, # Changed to torch.Tensor
     latents: torch.FloatTensor,
     text_embeddings: torch.FloatTensor,
     add_text_embeddings: torch.FloatTensor,
@@ -125,6 +132,13 @@ def batched_predict_noise_xl_modular(
     device = unet.device
     latent_model_input = prepare_unet_input_for_cfg(latents, scheduler, timestep)
     
+    # Ensure timestep is a tensor and expand it if necessary
+    if not isinstance(timestep, torch.Tensor):
+        timestep = torch.tensor([timestep], device=latent_model_input.device)
+    
+    # Expand the timestep to match the batch size of the latent_model_input
+    timestep = timestep.expand(latent_model_input.shape[0])
+
     noise_pred = run_unet_inference(
         unet,
         latent_model_input.to(device),
