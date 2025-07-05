@@ -24,11 +24,8 @@ def log_vram_usage(step_name):
     else:
         print(f"VRAM usage after {step_name}: CUDA not available.")
 
-
-#this function is suspicious, it's a reference case but you should make it better, simpler.
-#prefer structs or kv dicts for non-ml data and metadata
-#use tensors for absolutely everything interacting with an accelerator.
-#even if older code passes dumb tuples around for no reason.
+#a ton of this is canonical and absolutely must be written exactly this way
+#e.g. timestep stuff
 def superfunctional_train_step(
     unet: torch.nn.Module,
     vae: torch.nn.Module,
@@ -55,11 +52,11 @@ def superfunctional_train_step(
     4. Performing a batched UNet forward pass to predict noise.
     5. Calculating the loss for both high and low predictions.
 
-        tuple[torch.Tensor, torch.Tensor]:
-            A tuple containing the loss at each batch element. 
+        returns torch.Tensor
+            A tensor containing the loss at each batch element. 
     """
     #funky undocumented stuff:
-    #counterintuitively, this does distillation training,
+    #counterintuitively, set_timesteps does distillation training,
     # the argument is choosing how many sampling steps are used to generate a 'full image'.
     # lower value = fewer sampling steps = bigger prediction distance in the signal-to-noise-ratio domain
     with torch.no_grad():
@@ -78,7 +75,7 @@ def superfunctional_train_step(
 
         seed = random.randint(0,2*15)
         generator = torch.manual_seed(seed)
-    # Call graph hop 1: get_batched_noisy_images from batch_train_util
+
     # this is misnamed 'denoised_latents' in upstream. 
     # it retrieves noisy latents in the upstream's functions so we use a less deranged name here.
         start_timesteps = 0
@@ -96,31 +93,23 @@ def superfunctional_train_step(
         )
     
     # Concatenate text_embeds for high and low cases
-
-    # For high scale: prompt_pair.positive
-    # For low scale: prompt_pair.neutral
-
     # Create the text_embeddings batch: [positive_uncond, positive_cond, neutral_uncond, neutral_cond]
-    text_embeddings_for_noise_pred = torch.cat([
-        prompt_pair.positive.text_embeds, # positive uncond
-        prompt_pair.positive.text_embeds, # positive cond
-        prompt_pair.neutral.text_embeds,  # neutral uncond
-        prompt_pair.neutral.text_embeds   # neutral cond
-    ], dim=0)
+    # OBSOLETE, REFACTOR
+        text_embeddings_for_noise_pred = torch.cat([
+            prompt_pair.positive.text_embeds, # positive uncond
+            prompt_pair.positive.text_embeds, # positive cond
+            prompt_pair.neutral.text_embeds,  # neutral uncond
+            prompt_pair.neutral.text_embeds   # neutral cond
+        ], dim=0)
 
     # Set LoRA slider for the combined batch.
-    # Convert scales to a tensor and set for the batched LoRA network
     # The unsqueeze operations are to make the tensor broadcastable to the expected shape
-    # by BatchedLoRANetwork, which expects a (batch_size, 1, 1, 1) tensor.
-    # Here, batch_size is 2 (for high and low).
-    batched_scales = torch.tensor(scales, device=device, dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) # Shape (2, 1, 1, 1) for broadcasting
-    
-    # Call graph hop 2: set_lora_scales from BatchedLoRANetwork
+    # probably doesn't work, fix if necessary?
+        batched_scales = torch.tensor(scales, device=device, dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) # Shape (2, 1, 1, 1) for broadcasting
+
     network.set_lora_scales(batched_scales)
 
     with network: # This context manager ensures LoRA weights are applied during the UNet forward pass
-        # Perform batched predict_noise_xl call for both high and low scales
-        # The BatchedLoRANetwork will now apply the correct scale to each item in the batch
 
         #necessary to predict right noise level for each potentially different timestep in a batch.
         #should form a scalar integer tensor of batch dim size.
@@ -129,8 +118,7 @@ def superfunctional_train_step(
             int(timesteps_to * 1000 / config.train.max_denoising_steps)
         ]
 
-        # Call graph hop 3: batched_predict_noise_xl_modular from batch_train_util
-        target_latents_high, target_latents_low = batch_train_util.batched_predict_noise_xl_modular(
+        predict_latents = batch_train_util.batched_predict_noise_xl_modular(
             unet,
             noise_scheduler,
             batch_timesteps,    # tensor of timesteps used in training batch (indexes of noise levels)
@@ -141,13 +129,10 @@ def superfunctional_train_step(
             guidance_scale=1, # Classifier-free guidance is handled internally by predict_noise_xl_modular
         )
 
-    # Call graph hop 4: Loss calculation (criteria is typically MSELoss)
-    loss_high_per_element = (target_latents_high - high_noise).pow(2).to(torch.float32)
-    loss_low_per_element = (target_latents_low - low_noise).pow(2).to(torch.float32)
+    # OBSOLETE USE CRITERION DEFINED ELSEWHERE IN TRAINING LOOP
+    loss_per_element = (predict_latents - high_noise).pow(2).to(torch.float32)
 
-    del denoised_latents_high, high_noise, target_latents_high, denoised_latents_low, low_noise, target_latents_low
-
-    return loss_high_per_element, loss_low_per_element,
+    return loss_per_batch_element
 
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
@@ -263,40 +248,9 @@ def training_step(
     environment,
     batch,
 ):
-    # Extract components from environment
-    unet = environment["unet"]
-    vae = environment["vae"]
-    noise_scheduler = environment["noise_scheduler"]
-    network = environment["network"]
-    criteria = environment["criteria"]
-    device = environment["device"]
-    weight_dtype = environment["weight_dtype"]
-    text_encoder = environment["text_encoder"]
-    text_encoder_2 = environment["text_encoder_2"]
-    tokenizer = environment["tokenizer"]
-    tokenizer_2 = environment["tokenizer_2"]
-
-    # Extract data from batch
-    img_batches = batch["img_batches"]
-    scales = batch["scales"]
-    prompt_pair = batch["prompt_pair"]
-    add_time_ids = batch["add_time_ids"]
-    seed = batch["seed"]
-
-    # Move data to device and set dtype
-    img_batches_high = img_batches[0].to(device, dtype=weight_dtype)
-    img_batches_low = img_batches[1].to(device, dtype=weight_dtype)
-    img_batches = (img_batches_high, img_batches_low)
-
-    # Ensure prompt embeddings are on the correct device and dtype
-    prompt_pair.positive.text_embeds = prompt_pair.positive.text_embeds.to(device, dtype=weight_dtype)
-    prompt_pair.positive.pooled_embeds = prompt_pair.positive.pooled_embeds.to(device, dtype=weight_dtype)
-    prompt_pair.neutral.text_embeds = prompt_pair.neutral.text_embeds.to(device, dtype=weight_dtype)
-    prompt_pair.neutral.pooled_embeds = prompt_pair.neutral.pooled_embeds.to(device, dtype=weight_dtype)
-    add_time_ids = add_time_ids.to(device, dtype=weight_dtype)
 
     # Call superfunctional_train_step
-    loss_high_per_element, loss_low_per_element, _, _, _, _, _, _ = superfunctional_train_step(
+    loss_per_batch_element = superfunctional_train_step(
         unet=unet,
         vae=vae,
         noise_scheduler=noise_scheduler,
