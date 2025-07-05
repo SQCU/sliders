@@ -53,19 +53,6 @@ def get_batched_noisy_images(
 
 # --- Modular functions for predict_noise_xl and guidance ---
 
-def prepare_unet_input_for_cfg(
-    latents: torch.FloatTensor,
-    scheduler,
-    timestep: int,
-) -> torch.FloatTensor:
-    """
-    Prepares the latent input for the UNet by expanding for classifier-free guidance
-    and scaling according to the scheduler.
-    """
-    # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-    latent_model_input = torch.cat([latents] * 2)
-    latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
-    return latent_model_input
 
 def run_unet_inference(
     unet: torch.nn.Module,
@@ -78,14 +65,9 @@ def run_unet_inference(
     """
     Performs the UNet forward pass to predict the noise residual.
     """
-    # Ensure timestep is a tensor and expand it if necessary
-    if not isinstance(timestep, torch.Tensor):
-        timestep = torch.tensor([timestep], device=latent_model_input.device)
-    
-    # Expand the timestep to match the batch size of the latent_model_input
-    timestep = timestep.expand(latent_model_input.shape[0])
 
     print(f"latent_model_input shape: {latent_model_input.shape}")
+    print(f"timestep shape: {timestep.shape}")
     print(f"text_embeddings shape: {text_embeddings.shape}")
     print(f"add_text_embeddings shape: {add_text_embeddings.shape}")
     print(f"add_time_ids shape: {add_time_ids.shape}")
@@ -94,11 +76,13 @@ def run_unet_inference(
         "time_ids": add_time_ids,
     }
     noise_pred = unet(
-        latent_model_input,
-        timestep,
+        latent_model_input.to(unet.dtype),
+        timestep.to(unet.dtype), # Explicitly cast timestep to unet's dtype
         encoder_hidden_states=text_embeddings,
         added_cond_kwargs=added_cond_kwargs,
     ).sample
+
+
     return noise_pred
 
 def apply_cfg_guidance(
@@ -130,14 +114,8 @@ def batched_predict_noise_xl_modular(
     This function can be easily modified to swap out different guidance strategies.
     """
     device = unet.device
-    latent_model_input = prepare_unet_input_for_cfg(latents, scheduler, timestep)
-    
-    # Ensure timestep is a tensor and expand it if necessary
-    if not isinstance(timestep, torch.Tensor):
-        timestep = torch.tensor([timestep], device=latent_model_input.device)
-    
-    # Expand the timestep to match the batch size of the latent_model_input
-    timestep = timestep.expand(latent_model_input.shape[0])
+    latent_model_input = latents
+    latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
 
     noise_pred = run_unet_inference(
         unet,
@@ -150,6 +128,46 @@ def batched_predict_noise_xl_modular(
     
     guided_target = apply_cfg_guidance(noise_pred, guidance_scale)
     
+    return guided_target
+
+def simple_predict_noise_xl(
+    unet: UNet2DConditionModel,
+    scheduler: SchedulerMixin,
+    timestep: int,
+    latents: torch.FloatTensor,
+    text_embeddings: torch.FloatTensor,
+    add_text_embeddings: torch.FloatTensor,
+    add_time_ids: torch.FloatTensor,
+    guidance_scale: float = 7.5,
+) -> torch.FloatTensor:
+    """
+    Reproduces the core noise prediction logic of train_util.predict_noise_xl
+    without the guidance_rescale part.
+    """
+    # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+    latent_model_input = latents
+
+    latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
+
+    added_cond_kwargs = {
+        "text_embeds": add_text_embeddings,
+        "time_ids": add_time_ids,
+    }
+
+    # predict the noise residual
+    noise_pred = unet(
+        latent_model_input.to(unet.dtype),
+        torch.tensor([timestep], device=unet.device, dtype=unet.dtype).expand(latent_model_input.shape[0]),
+        encoder_hidden_states=text_embeddings.to(unet.dtype),
+        added_cond_kwargs=added_cond_kwargs,
+    ).sample
+
+    # perform guidance
+    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+    guided_target = noise_pred_uncond + guidance_scale * (
+        noise_pred_text - noise_pred_uncond
+    )
+
     return guided_target
 
 def diffusion(

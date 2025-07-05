@@ -136,7 +136,7 @@ def check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, v
     # If we reach here, latents need to be encoded
     image = Image.open(image_path).convert("RGB")
     latents = encode_images_to_latents([image], vae, device, weight_dtype) # encode_images_to_latents expects a list
-    save_latents_to_disk(latents.squeeze(0), output_dir, image_path, vae_state_dict)
+    save_latents_to_disk(latents, output_dir, image_path, vae_state_dict)
     return False
 
 def get_latent_for_image(image_path, vae, device, weight_dtype, output_dir, vae_state_dict):

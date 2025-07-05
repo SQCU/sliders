@@ -9,7 +9,7 @@ import yaml
 from diffusers.optimization import get_scheduler
 import torch.optim as optim
 
-from trainscripts.imagesliders.batch_config_util import (
+from .batch_config_util import (
     dataset_constructor,
     setup_logging,
     AttrDict,
@@ -17,9 +17,9 @@ from trainscripts.imagesliders.batch_config_util import (
     load_config_from_yaml_and_merge,
     parse_precision,
 )
-from trainscripts.imagesliders import batch_lora as lora
-from trainscripts.imagesliders import batch_train_util
-from trainscripts.imagesliders import batch_model_util
+from . import batch_lora as lora
+from . import batch_train_util
+from . import batch_model_util
 
 
 def config_io():
@@ -53,8 +53,8 @@ def envsetup(config):
 
     vae, unet, tokenizers, text_encoders, noise_scheduler = batch_model_util.load_models(config, device, weight_dtype)
     
-    # Patch the UNet's time_embedding layer to the correct dtype
-    unet.time_embedding.to(dtype=weight_dtype)
+    # Cast the entire unet to the correct dtype
+    unet.to(device, dtype=weight_dtype)
     
     network = lora.BatchedLoRANetwork(
         unet=unet,
@@ -115,6 +115,8 @@ def train_step(environment: dict, batch: dict, seed: int):
     pooled_embeds = batch["pooled_embeds"].to(device, dtype=weight_dtype)
     add_time_ids = batch["add_time_ids"].to(device, dtype=weight_dtype)
 
+    print(f"Shape of initial latents (batch['latents']): {latents.shape}")
+
     # Prepare for training step
     optimizer.zero_grad()
 
@@ -144,17 +146,28 @@ def train_step(environment: dict, batch: dict, seed: int):
         # corresponding to the `timesteps_to` indices.
         unet_timesteps = noise_scheduler.timesteps[timesteps_to].to(weight_dtype)
         
-        # Expand the timesteps to match the batch size of the noisy_latents
-        unet_timesteps = unet_timesteps.repeat(2)
+        # Duplicate inputs for classifier-free guidance
+        # The batch_train_util.batched_predict_noise_xl_modular expects inputs to be duplicated for CFG
+        unet_timesteps_cfg = torch.cat([unet_timesteps, unet_timesteps], dim=0)
+        noisy_latents_cfg = torch.cat([noisy_latents, noisy_latents], dim=0)
+        text_embeddings_cfg = torch.cat([text_embeddings, text_embeddings], dim=0)
+        pooled_embeds_cfg = torch.cat([pooled_embeds, pooled_embeds], dim=0)
+        add_time_ids_cfg = torch.cat([add_time_ids, add_time_ids], dim=0)
+
+        print(f"Shape of unet_timesteps_cfg: {unet_timesteps_cfg.shape}")
+        print(f"Shape of noisy_latents_cfg: {noisy_latents_cfg.shape}")
+        print(f"Shape of text_embeddings_cfg: {text_embeddings_cfg.shape}")
+        print(f"Shape of pooled_embeds_cfg: {pooled_embeds_cfg.shape}")
+        print(f"Shape of add_time_ids_cfg: {add_time_ids_cfg.shape}")
         
         predicted_noise = batch_train_util.batched_predict_noise_xl_modular(
             unet,
             noise_scheduler,
-            unet_timesteps,
-            noisy_latents,
-            text_embeddings,
-            pooled_embeds,
-            add_time_ids,
+            unet_timesteps_cfg, # This should now have the correct batch size (2N)
+            noisy_latents_cfg,
+            text_embeddings_cfg,
+            pooled_embeds_cfg,
+            add_time_ids_cfg,
             guidance_scale=1,
         )
 

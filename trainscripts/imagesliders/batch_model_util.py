@@ -19,8 +19,8 @@ def load_models(config, device, weight_dtype):
         torch_dtype=weight_dtype,
         cache_dir=DIFFUSERS_CACHE_DIR,
     )
-    unet = pipe.unet.to(device)
-    vae = pipe.vae.to(device)
+    unet = pipe.unet.to(device, dtype=weight_dtype)
+    vae = pipe.vae.to(device, dtype=weight_dtype)
     tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
     text_encoders = [pipe.text_encoder, pipe.text_encoder_2]
 
