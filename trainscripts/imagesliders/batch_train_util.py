@@ -7,6 +7,10 @@ from typing import Tuple, Union
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from diffusers import UNet2DConditionModel, SchedulerMixin
 
+UNET_ATTENTION_TIME_EMBED_DIM = 256  # XL
+TEXT_ENCODER_2_PROJECTION_DIM = 1280
+UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM = 2816
+
 SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
 
 # --- Analysis of train_util.get_noisy_image ---
@@ -18,7 +22,7 @@ SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
 def get_batched_noisy_images(
     img_batch: torch.Tensor,
     generator: torch.Generator,
-    noise_scheduler,
+    noise_scheduler: SchedulerMixin,
     config,
     total_timesteps:int, # = 1000,
     start_timesteps:int, #=0,
@@ -31,14 +35,14 @@ def get_batched_noisy_images(
    
     # Generate noise for the combined batch
     noise_shape = img_batch.shape
-    combined_noise = randn_tensor(noise_shape, generator=generator, device=device)
+    noise = randn_tensor(noise_shape, generator=generator, device=device)
 
     #timestep interval logic from upstream
     time_ = total_timesteps
-    timestep = scheduler.timesteps[time_:time_+1]
+    timestep = noise_scheduler.timesteps[time_:time_+1]
 
     # Add noise to the combined latents
-    noisy_latents = noise_scheduler.add_noise(img_batch, combined_noise, timestep)
+    noisy_latents = noise_scheduler.add_noise(img_batch, noise, timestep)
 
     #return without splitting and unsplitting several times for no reason!
     return noisy_latents, noise
@@ -246,3 +250,41 @@ def create_batched_prompt_embeddings(
     ], dim=0)
 
     return text_embeddings_for_noise_pred, pooled_embeds_for_noise_pred
+
+# for XL
+def get_add_time_ids(
+    height: int,
+    width: int,
+    dynamic_crops: bool = False,
+    dtype: torch.dtype = torch.float32,
+):
+    if dynamic_crops:
+        # random float scale between 1 and 3
+        random_scale = torch.rand(1).item() * 2 + 1
+        original_size = (int(height * random_scale), int(width * random_scale))
+        # random position
+        crops_coords_top_left = (
+            torch.randint(0, original_size[0] - height, (1,)).item(),
+            torch.randint(0, original_size[1] - width, (1,)).item(),
+        )
+        target_size = (height, width)
+    else:
+        original_size = (height, width)
+        crops_coords_top_left = (0, 0)
+        target_size = (height, width)
+
+    # this is expected as 6
+    add_time_ids = list(original_size + crops_coords_top_left + target_size)
+
+    # this is expected as 2816
+    passed_add_embed_dim = (
+        UNET_ATTENTION_TIME_EMBED_DIM * len(add_time_ids)  # 256 * 6
+        + TEXT_ENCODER_2_PROJECTION_DIM  # + 1280
+    )
+    if passed_add_embed_dim != UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM:
+        raise ValueError(
+            f"Model expects an added time embedding vector of length {UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
+        )
+
+    add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+    return add_time_ids

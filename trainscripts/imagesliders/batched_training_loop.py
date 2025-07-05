@@ -36,8 +36,8 @@ def superfunctional_train_step(
     noise_scheduler,
     img_batches: tuple[torch.Tensor, torch.Tensor],
     scales: tuple[float, float],
-    prompt_embeds: tuple[prompt_util.PromptEmbedsXL, prompt_util.PromptEmbedsXL],
-    prompt_pair: prompt_util.PromptEmbedsPair,
+    text_embeddings: torch.Tensor,
+    pooled_embeds: torch.Tensor,
     config: config_util.RootConfig,
     network: lora.BatchedLoRANetwork,
     criteria: torch.nn.Module,
@@ -83,11 +83,10 @@ def superfunctional_train_step(
     # this is misnamed 'denoised_latents' in upstream. 
     # it retrieves noisy latents in the upstream's functions so we use a less deranged name here.
         start_timesteps = 0
+        img_batch = torch.cat(img_batches, dim=0)
         combined_noisy_latents, noise = batch_train_util.get_batched_noisy_images(
-            img_batches, # This is a tuple of (high_batch, low_batch)
-            vae,
+            img_batch, # This is a tuple of (high_batch, low_batch)
             generator,
-            unet,
             noise_scheduler,
             config,
             start_timesteps,
@@ -98,24 +97,16 @@ def superfunctional_train_step(
     
     # Concatenate text_embeds for high and low cases
     # Create the text_embeddings batch: [positive_uncond, positive_cond, neutral_uncond, neutral_cond]
-    # OBSOLETE, REFACTOR
-        text_embeddings_for_noise_pred = torch.cat([
-            prompt_pair.positive.text_embeds, # positive uncond
-            prompt_pair.positive.text_embeds, # positive cond
-            prompt_pair.neutral.text_embeds,  # neutral uncond
-            prompt_pair.neutral.text_embeds   # neutral cond
-        ], dim=0)
 
     # Set LoRA slider for the combined batch.
     # The unsqueeze operations are to make the tensor broadcastable to the expected shape
-    # probably doesn't work, fix if necessary?
         batched_scales = torch.tensor(scales, device=device, dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) # Shape (2, 1, 1, 1) for broadcasting
 
     network.set_lora_scales(batched_scales)
 
     with network: # This context manager ensures LoRA weights are applied during the UNet forward pass
 
-        #necessary to predict right noise level for each potentially different timestep in a batch.
+        # .timesteps is necessary to predict right noise level for each potentially different timestep in a batch.
         #should form a scalar integer tensor of batch dim size.
         #don't try to understand the calculation here, but it's mandatory.
         batch_timesteps = noise_scheduler.timesteps[
@@ -127,16 +118,16 @@ def superfunctional_train_step(
             noise_scheduler,
             batch_timesteps,    # tensor of timesteps used in training batch (indexes of noise levels)
             combined_noisy_latents, # Combined high and low latents
-            text_embeddings_for_noise_pred,
-            pooled_embeds_for_noise_pred,
-            add_time_ids_for_noise_pred,
+            text_embeddings,
+            pooled_embeds,
+            add_time_ids,
             guidance_scale=1, # Classifier-free guidance is handled internally by predict_noise_xl_modular
         )
 
     # OBSOLETE USE CRITERION DEFINED ELSEWHERE IN TRAINING LOOP
-    loss_per_element = (predict_latents - high_noise).pow(2).to(torch.float32)
+    loss_per_element = (predict_latents - noise).pow(2).to(torch.float32)
 
-    return loss_per_batch_element
+    return loss_per_element
 
 
 #HANDWRITTEN AT USER'S EXTREME DISPLEASURE:
@@ -305,6 +296,10 @@ def training_step(
         prompts[0],
         num_images_per_prompt=1,
     )
+
+    add_time_ids = batch_train_util.get_add_time_ids(
+        1024, 1024, False, dtype=weight_dtype
+    ).to(device)
     
     # Call superfunctional_train_step
     loss_per_batch_element = superfunctional_train_step(
@@ -320,7 +315,7 @@ def training_step(
         criteria=criteria,
         device=device,
         weight_dtype=weight_dtype,
-        add_time_ids=add_time_ids, # This needs to be fixed
+        add_time_ids=add_time_ids,
         seed=random.randint(0, 2**32 - 1),
     )
 
