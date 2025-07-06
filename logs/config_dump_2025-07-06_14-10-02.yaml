@@ -1,0 +1,67 @@
+&id011 !!python/object/new:__main__.AttrDict
+dictitems:
+    dataset_config: &id002 !!python/object/new:__main__.AttrDict
+        dictitems:
+            dataset: &id001 !!python/object/new:__main__.AttrDict
+                dictitems:
+                    folder_main: datasets/bracket
+                    folders: 0, 1, 2
+                    scales: 0.15, 1, 2
+                state: *id001
+            prompts_file: trainscripts/imagesliders/data/prompts-xl-dilora-bracket.yaml
+        state: *id002
+    dset_config: &id003 !!python/object/new:__main__.AttrDict
+        dictitems:
+            refpath: trainscripts/imagesliders/data/bracket_dataset.yaml
+        state: *id003
+    logging: &id004 !!python/object/new:__main__.AttrDict
+        dictitems:
+            use_wandb: false
+            verbose: false
+        state: *id004
+    network: &id005 !!python/object/new:__main__.AttrDict
+        dictitems:
+            alpha: 16.0
+            rank: 64
+            training_method: noxattn
+            type: c3lier
+        state: *id005
+    obsolete_config: &id006 !!python/object/new:__main__.AttrDict
+        dictitems:
+            refpath: trainscripts/imagesliders/data/config-xl-batchtest.yaml
+        state: *id006
+    other: &id007 !!python/object/new:__main__.AttrDict
+        dictitems:
+            lycorisize: false
+            torch_compile: false
+            use_pytorch_SDPA: false
+            use_xformers: false
+        state: *id007
+    pretrained_model: &id008 !!python/object/new:__main__.AttrDict
+        dictitems:
+            name_or_path: F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors
+            v2: false
+            v_pred: false
+        state: *id008
+    prompts_file: trainscripts/imagesliders/data/prompts-xl-dilora-bracket.yaml
+    save: &id009 !!python/object/new:__main__.AttrDict
+        dictitems:
+            name: molKM_IL_imageslider
+            path: ./models
+            per_steps: 20
+            precision: bfloat16
+        state: *id009
+    train: &id010 !!python/object/new:__main__.AttrDict
+        dictitems:
+            batch_size: 8
+            bounds_test_vae_batch_size: true
+            iterations: 20
+            lr: 0.00024
+            lr_scheduler: cosine
+            max_denoising_steps: 50
+            noise_scheduler: ddim
+            optimizer: AdamW
+            precision: bfloat16
+            vae_encoding_batch_size: 20
+        state: *id010
+state: *id011

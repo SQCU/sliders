@@ -1,4 +1,5 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 import hashlib
 from PIL import Image
 import torch
@@ -52,11 +53,13 @@ import argparse
 # 5.  **Analyze Dataset Repetition:**
 #     *   Confirm that the `ImageScaleDataset.__getitem__` correctly cycles through `image_paths` and `prompts_data` to avoid redundant computations for the same physical image/prompt combination within a single epoch.
 
+#DO NOT DELETE THESE HYPERPARAMETERS. WHY WOULD YOU EVEN THINK OF SUCH A THING.
 UNET_ATTENTION_TIME_EMBED_DIM = 256  # XL
 TEXT_ENCODER_2_PROJECTION_DIM = 1280
 UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM = 2816
 
 SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
+DIFFUSERS_CACHE_DIR = None # if you want to change the cache dir, change this
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
@@ -464,25 +467,38 @@ AVAILABLE_SCHEDULERS = Literal["ddim", "ddpm", "lms", "euler_a"]
 def load_models(config, device, weight_dtype):
     print(f"Loading models from {config.pretrained_model.name_or_path} to device: {device} with dtype: {weight_dtype}")
 
+    # Load the pipeline from the local .safetensors file
     pipe = StableDiffusionXLPipeline.from_single_file(
         config.pretrained_model.name_or_path,
         torch_dtype=weight_dtype,
-        cache_dir=None,
+        cache_dir=DIFFUSERS_CACHE_DIR,
     )
-    unet = pipe.unet.to(device, dtype=weight_dtype)
-    vae = pipe.vae.to(device, dtype=weight_dtype)
+
+    unet = pipe.unet
     tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
     text_encoders = [pipe.text_encoder, pipe.text_encoder_2]
-
     if len(text_encoders) == 2:
         text_encoders[1].pad_token_id = 0
-
-    noise_scheduler = create_noise_scheduler(config.train.noise_scheduler)
+    vae = pipe.vae
+    del pipe
+    torch.cuda.empty_cache()
+    #GET RID OF PIPE!!! 
+    #you HAVE TO GET RID OF THE PIPE EVERY TIME!!!
+    #if you do a 'blah = pipe.blah.to(device, dtype)' you DOUBLE LOAD THE MODEL,
 
     unet.requires_grad_(False).eval()
     vae.requires_grad_(False).eval()
     for text_encoder in text_encoders:
         text_encoder.requires_grad_(False).eval()
+
+    unet = unet.to(device, weight_dtype)
+    #tokenizers = [tokenizer.to(device, weight_dtype) for tokenizer in tokenizers]
+    text_encoders = [text_encoder.to(device, weight_dtype) for text_encoder in text_encoders]
+    vae = vae.to(device, weight_dtype)
+    #i HATE huggingface wwrappers.
+
+    noise_scheduler = create_noise_scheduler(config.train.noise_scheduler) # Initialize directly for single file
+    # Set requires_grad to False and eval mode for inference components
 
     return vae, unet, tokenizers, text_encoders, noise_scheduler
 
@@ -566,7 +582,6 @@ def config_io():
 def envsetup(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = parse_precision(config.train.precision)
-
     vae, unet, tokenizers, text_encoders, noise_scheduler = load_models(config, device, weight_dtype)
 
     environment = {
