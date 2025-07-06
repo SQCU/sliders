@@ -1,4 +1,7 @@
-# Written by Gemini 2.5, under review
+# ref:
+# - https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L566
+# - https://huggingface.co/spaces/baulab/Erasing-Concepts-In-Diffusion/blob/main/train.py
+# OBSOLETE FILE FOR REFERENCE DO NOT REFACTOR DO NOT EDIT PLEASE I BEG YOU PLEAEAAASEEEEE! PLEASE!
 
 from typing import List, Optional
 import argparse
@@ -6,15 +9,13 @@ import ast
 from pathlib import Path
 import gc, os
 import numpy as np
-import hashlib
 
 import torch
 from tqdm import tqdm
 from PIL import Image
-from torchvision import transforms
 
-from .config import TrainingConfig
-from .data_preprocessing import create_dataloader
+
+
 import train_util
 import random
 import model_util
@@ -28,28 +29,11 @@ from prompt_util import (
 import debug_util
 import config_util
 from config_util import RootConfig
-import map_data_to_latents
 
 import wandb
 
 NUM_IMAGES_PER_PROMPT = 1
 from lora import LoRANetwork, DEFAULT_TARGET_REPLACE, UNET_TARGET_REPLACE_MODULE_CONV
-
-class EMA:
-    def __init__(self, decay):
-        self.decay = decay
-        self.shadow = {}
-
-    def update(self, name, x):
-        if name not in self.shadow:
-            self.shadow[name] = x.clone().detach()
-        else:
-            self.shadow[name].mul_(self.decay).add_(x, alpha=1 - self.decay)
-        return self.shadow[name]
-
-    def get(self, name):
-        return self.shadow.get(name, None)
-
 
 def flush():
     torch.cuda.empty_cache()
@@ -58,45 +42,16 @@ def flush():
 
 def train(
     config: RootConfig,
-    training_config: TrainingConfig,
     prompts: list[PromptSettings],
     device,
     folder_main: str,
     folders,
     scales,
-    use_latents: bool = False,
+    
 ):
-    # Create the dataloader
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-    if config.train.use_latents and config.latent_cache_dir is not None:
-        # Ensure VAE is on the correct device and dtype for encoding
-        vae.to(device, dtype=weight_dtype)
-        vae.requires_grad_(False)
-        vae.eval()
-        vae_checksum = hashlib.sha256(str(vae.state_dict()).encode('utf-8')).hexdigest()
-
-        # Pre-encode and cache latents if not already present and valid
-        all_image_paths = []
-        for folder in folders:
-            current_folder_path = os.path.join(folder_main, folder)
-            for filename in os.listdir(current_folder_path):
-                if filename.endswith((".png", ".jpg", ".jpeg")):
-                    all_image_paths.append(os.path.join(current_folder_path, filename))
-
-        print(f"Checking/encoding latents for {len(all_image_paths)} images...")
-        for image_path in all_image_paths:
-            map_data_to_latents.check_and_encode_latent(image_path, vae, device, weight_dtype, config.latent_cache_dir, vae.state_dict())
-        
-        # Move VAE off GPU after encoding to save VRAM
-        vae.to("cpu")
-        del vae
-        flush()
-    else:
-        vae_checksum = None # No VAE checksum needed if not using latents
-
-    dataloader = create_dataloader(folder_main, folders, scales, training_config, use_latents, vae_checksum, transform)
+    scales = np.array(scales)   #why was nparray?
+    folders = np.array(folders)
+    scales_unique = list(scales)
 
     metadata = {
         "prompts": ",".join([prompt.json() for prompt in prompts]),
@@ -144,13 +99,9 @@ def train(
     unet.requires_grad_(False)
     unet.eval()
     
-    vae.to(device, dtype=weight_dtype)
+    vae.to(device)
     vae.requires_grad_(False)
     vae.eval()
-
-    vae_checksum = None
-    if config.train.use_latents:
-        vae_checksum = hashlib.sha256(str(vae.state_dict()).encode('utf-8')).hexdigest()
 
     if config.other.torch_compile:
         unet = torch.compile(unet)
@@ -158,7 +109,18 @@ def train(
     lycorisized = False
     if config.other.lycorisize:
         from lycoris import create_lycoris, LycorisNetwork
+        #def LycorisWithify():
+        #    class WithLycorisNetwork(LycorisNetwork): 
+        #        def __init__(self, *args, **kwargs):
+        #            super().__init__(*args, **kwargs)
+        #        def __enter__(self):
+        #            set_multiplier(self.multiplier) #this feels really superfluous
+        #        def __exit__(self, exc_type, exc_val, exc_tb):
+        #            set_multiplier(0)   #this feels superfluous but shikata the nai.
+        #    #LycorisNetwork = WithLycorisNetwork #does this even work lol?
         print("Total params:", sum(p.numel() for p in unet.parameters()))
+        #LycorisWithify()
+        #print("withifying lycorisnetwork. this probably isn't how inheritance works?")
         network = create_lycoris(unet, 
         1.0, #initial multiplier i think?
         config.network.rank, #dim -> linear dim -> (linear dim, conv dim)
@@ -167,6 +129,9 @@ def train(
         network.to(device, dtype=weight_dtype)
         network.apply_to() # mandatory lycoris boilerplate
         
+        #note: sliderify with set_multiplier(self, multiplier)
+
+
         print("lyc Params:", sum(p.numel() for p in network.parameters()))
 
         lycorisized = True
@@ -178,10 +143,10 @@ def train(
             multiplier=1.0,
             alpha=config.network.alpha,
             train_method=config.network.training_method,
-            target_replace=modules, #unstub code from upstream
         ).to(device, dtype=weight_dtype)
     
     optimizer_module = train_util.get_optimizer(config.train.optimizer)
+    #optimizer_args
     optimizer_kwargs = {}
     if config.train.optimizer_args is not None and len(config.train.optimizer_args) > 0:
         for arg in config.train.optimizer_args.split(" "):
@@ -189,6 +154,12 @@ def train(
             value = ast.literal_eval(value)
             optimizer_kwargs[key] = value
     
+    #if lycorisized: #dunno why cloneofsimo impl. uses that wrapper function.
+    #    optimizer = optimizer_module(
+    #        network.parameters(), 
+    #        lr=config.train.lr, 
+    #        **optimizer_kwargs)
+    #else: 
     optimizer = optimizer_module(
         network.prepare_optimizer_params(lr=config.train.lr),  #... lycoris... weird compatibility...
         lr=config.train.lr, 
@@ -206,14 +177,19 @@ def train(
     for settings in prompts:
         print(settings)
 
+    # debug
     debug_util.check_requires_grad(network)
     debug_util.check_training_mode(network)
 
     cache = PromptEmbedsCache()
     prompt_pairs: list[PromptEmbedsPair] = []
 
-    loss_ema = EMA(decay=0.999) # EMA for loss tracking
-
+    #"for settings in prompts" seems to suggest u can run more than one prompt pair in a prompt config?
+    #i think unconditional might be about specifying the negative prompt at inference time.
+    #which leaves 'target' to be the positive prompt invariant and 'positive' to be the positive prompt variant. 
+    #...
+    #literally:loss = 
+    #target_latents - (neutral_latents + self.guidance_scale * (positive_latents - unconditional_latents))
     with torch.no_grad():
         for settings in prompts:
             print(settings)
@@ -256,46 +232,271 @@ def train(
     loss = None
 
     for i in pbar:
-        optimizer.zero_grad()
+        with torch.no_grad():
+            noise_scheduler.set_timesteps(
+                config.train.max_denoising_steps, device=device
+            )
 
-        for (img1_batch, scale1_batch), (img2_batch, scale2_batch) in dataloader:
-            img1_batch = img1_batch.to(device, dtype=weight_dtype)
-            img2_batch = img2_batch.to(device, dtype=weight_dtype)
+            optimizer.zero_grad()
 
             prompt_pair: PromptEmbedsPair = prompt_pairs[
                 torch.randint(0, len(prompt_pairs), (1,)).item()
             ]
 
-            loss_high, loss_low = superfunctional_train_step(
-                unet,
-                vae,
-                noise_scheduler,
-                (img1_batch, img2_batch),
-                (scale1_batch, scale2_batch),
-                (prompt_pair.positive, prompt_pair.neutral),
-                prompt_pair,
-                config,
-                network,
-                criteria,
-                device,
-                weight_dtype,
-            )
-            
-            loss = loss_high + loss_low
-            
-            pbar.set_description(f"Loss*1k: {loss.item()*1000:.4f}")
-            
-            # Update and log EMA of loss
-            ema_loss = loss_ema.update("loss", loss)
-            if config.logging.use_wandb:
-                wandb.log(
-                    {"loss": loss, "ema_loss": ema_loss, "iteration": i, "lr": lr_scheduler.get_last_lr()[0]}
+            # 1 ~ 49 からランダム
+            timesteps_to = torch.randint(
+                1, config.train.max_denoising_steps, (1,)
+            ).item()
+
+            height, width = prompt_pair.resolution, prompt_pair.resolution
+            if prompt_pair.dynamic_resolution:
+                height, width = train_util.get_random_resolution_in_bucket(
+                    prompt_pair.resolution
                 )
 
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
+            if config.logging.verbose:
+                print("guidance_scale:", prompt_pair.guidance_scale)
+                print("resolution:", prompt_pair.resolution)
+                print("dynamic_resolution:", prompt_pair.dynamic_resolution)
+                if prompt_pair.dynamic_resolution:
+                    print("bucketed resolution:", (height, width))
+                print("batch_size:", prompt_pair.batch_size)
+                print("dynamic_crops:", prompt_pair.dynamic_crops)
 
+            
+            
+            #scale_to_look = abs(random.choice(list(scales_unique)))
+            scales_to_look = random.sample(list(scales_unique),2)   #2 choices
+            scales_to_look.sort()   #smaller first idx
+
+            #folder1 = folders[scales==-scale_to_look][0]
+            #folder2 = folders[scales==scale_to_look][0]
+            #use lowest then highest
+            folder1 = folders[scales==scales_to_look[-1]][0]
+            folder2 = folders[scales==scales_to_look[0]][0]
+            
+            ims = os.listdir(f'{folder_main}/{folder1}/')
+            ims = [im_ for im_ in ims if '.png' in im_ or '.jpg' in im_ or '.jpeg' in im_ or '.webp' in im_]
+            random_sampler = random.randint(0, len(ims)-1)
+
+            #...
+            img1 = Image.open(f'{folder_main}/{folder1}/{ims[random_sampler]}').resize((512,512))#
+            img2 = Image.open(f'{folder_main}/{folder2}/{ims[random_sampler]}').resize((512,512))#
+            
+            seed = random.randint(0,2*15)
+            
+            generator = torch.manual_seed(seed)
+            denoised_latents_low, low_noise = train_util.get_noisy_image(
+                img1,
+                vae,
+                generator,
+                unet,
+                noise_scheduler,
+                start_timesteps=0,
+                total_timesteps=timesteps_to)
+            denoised_latents_low = denoised_latents_low.to(device, dtype=weight_dtype)
+            low_noise = low_noise.to(device, dtype=weight_dtype)
+            
+            generator = torch.manual_seed(seed)
+            denoised_latents_high, high_noise = train_util.get_noisy_image(
+                img2,
+                vae,
+                generator,
+                unet,
+                noise_scheduler,
+                start_timesteps=0,
+                total_timesteps=timesteps_to)
+            denoised_latents_high = denoised_latents_high.to(device, dtype=weight_dtype)
+            high_noise = high_noise.to(device, dtype=weight_dtype)
+            noise_scheduler.set_timesteps(1000)
+
+            add_time_ids = train_util.get_add_time_ids(
+                height,
+                width,
+                dynamic_crops=prompt_pair.dynamic_crops,
+                dtype=weight_dtype,
+            ).to(device, dtype=weight_dtype)
+
+
+            current_timestep = noise_scheduler.timesteps[
+                int(timesteps_to * 1000 / config.train.max_denoising_steps)
+            ]
+            try:
+                # with network: の外では空のLoRAのみが有効になる
+                high_latents = train_util.predict_noise_xl(
+                    unet,
+                    noise_scheduler,
+                    current_timestep,
+                    denoised_latents_high,
+                    text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.text_embeds,
+                        prompt_pair.positive.text_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.pooled_embeds,
+                        prompt_pair.positive.pooled_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_time_ids=train_util.concat_embeddings(
+                        add_time_ids, add_time_ids, prompt_pair.batch_size
+                    ),
+                    guidance_scale=1,
+                ).to(device, dtype=weight_dtype)
+            except:
+                flush()
+                print(f'Error Occured!: {np.array(img1).shape} {np.array(img2).shape}')
+                raise
+                #continue
+            # with network: の外では空のLoRAのみが有効になる
+            
+            low_latents = train_util.predict_noise_xl(
+                unet,
+                noise_scheduler,
+                current_timestep,
+                denoised_latents_low,
+                text_embeddings=train_util.concat_embeddings(
+                    prompt_pair.unconditional.text_embeds,
+                    prompt_pair.neutral.text_embeds,
+                    prompt_pair.batch_size,
+                ),
+                add_text_embeddings=train_util.concat_embeddings(
+                    prompt_pair.unconditional.pooled_embeds,
+                    prompt_pair.neutral.pooled_embeds,
+                    prompt_pair.batch_size,
+                ),
+                add_time_ids=train_util.concat_embeddings(
+                    add_time_ids, add_time_ids, prompt_pair.batch_size
+                ),
+                guidance_scale=1,
+            ).to(device, dtype=weight_dtype)
+            
+            
+                
+        #network.set_lora_slider(scale=scale_to_look)
+        if lycorisized:
+            network.set_multiplier(torch.tensor(scales_to_look[-1]))
+            target_latents_high = train_util.predict_noise_xl(
+                    unet,
+                    noise_scheduler,
+                    current_timestep,
+                    denoised_latents_high,
+                    text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.text_embeds,
+                        prompt_pair.positive.text_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.pooled_embeds,
+                        prompt_pair.positive.pooled_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_time_ids=train_util.concat_embeddings(
+                        add_time_ids, add_time_ids, prompt_pair.batch_size
+                    ),
+                    guidance_scale=1,
+                ).to(device, dtype=weight_dtype)
+            #network.set_multiplier(0)   #similar to the exit part of `with`
+        else:
+            network.set_lora_slider(scale=scales_to_look[-1])
+            with network:
+                target_latents_high = train_util.predict_noise_xl(
+                    unet,
+                    noise_scheduler,
+                    current_timestep,
+                    denoised_latents_high,
+                    text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.text_embeds,
+                        prompt_pair.positive.text_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.pooled_embeds,
+                        prompt_pair.positive.pooled_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_time_ids=train_util.concat_embeddings(
+                        add_time_ids, add_time_ids, prompt_pair.batch_size
+                    ),
+                    guidance_scale=1,
+                ).to(device, dtype=weight_dtype)
+
+        high_latents.requires_grad = False
+        low_latents.requires_grad = False
+        
+        loss_high = criteria(target_latents_high, high_noise.to(weight_dtype))
+        pbar.set_description(f"Loss*1k: {loss_high.item()*1000:.4f}")
+        loss_high.backward()
+        
+        # opposite
+        #network.set_lora_slider(scale=-scale_to_look)
+        if lycorisized:
+            network.set_multiplier(torch.tensor(scales_to_look[0]))
+            target_latents_low = train_util.predict_noise_xl(
+                    unet,
+                    noise_scheduler,
+                    current_timestep,
+                    denoised_latents_low,
+                    text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.text_embeds,
+                        prompt_pair.neutral.text_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.pooled_embeds,
+                        prompt_pair.neutral.pooled_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_time_ids=train_util.concat_embeddings(
+                        add_time_ids, add_time_ids, prompt_pair.batch_size
+                    ),
+                    guidance_scale=1,
+                ).to(device, dtype=weight_dtype)
+            #network.set_multiplier(0)   #similar to the exit part of 'with'.
+        else:
+            network.set_lora_slider(scale=scales_to_look[0])
+            with network:
+                target_latents_low = train_util.predict_noise_xl(
+                    unet,
+                    noise_scheduler,
+                    current_timestep,
+                    denoised_latents_low,
+                    text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.text_embeds,
+                        prompt_pair.neutral.text_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_text_embeddings=train_util.concat_embeddings(
+                        prompt_pair.unconditional.pooled_embeds,
+                        prompt_pair.neutral.pooled_embeds,
+                        prompt_pair.batch_size,
+                    ),
+                    add_time_ids=train_util.concat_embeddings(
+                        add_time_ids, add_time_ids, prompt_pair.batch_size
+                    ),
+                    guidance_scale=1,
+                ).to(device, dtype=weight_dtype)
+
+
+        high_latents.requires_grad = False
+        low_latents.requires_grad = False
+        
+        loss_low = criteria(target_latents_low, low_noise.to(weight_dtype))
+        pbar.set_description(f"Loss*1k: {loss_low.item()*1000:.4f}")
+        loss_low.backward()
+        
+        
+        optimizer.step()
+        lr_scheduler.step()
+
+        del (
+            high_latents,
+            low_latents,
+            target_latents_low,
+            target_latents_high,
+        )
+        flush()
+        
         if (
             i % config.save.per_steps == 0
             and i != 0
@@ -334,8 +535,6 @@ def main(args):
     config_file = args.config_file
 
     config = config_util.load_config_from_yaml(config_file)
-    training_config = TrainingConfig()
-
     if args.name is not None:
         config.save.name = args.name
     attributes = []
@@ -356,6 +555,11 @@ def main(args):
     
     folders = args.folders.split(',')
     folders = [f.strip() for f in folders]
+    #why were these being passed as strings :(((
+    #scales = args.scales.split(',')
+    #scales = [f.strip() for f in scales]
+    #scales = [int(s) for s in scales]
+    #scales = [s for s in scales]
     scales = args.scales
     
     print(folders, scales)
@@ -371,9 +575,9 @@ def main(args):
             config.save.name += f'_alpha{args.alpha}'
             config.save.name += f'_rank{config.network.rank }'
             config.save.path = f'models/{config.save.name}'
-            train(config=config, training_config=training_config, prompts=prompts, device=device, folder_main = folder_main, folders = folders, scales = scales, use_latents=args.use_latents)
+            train(config=config, prompts=prompts, device=device, folder_main = folder_main, folders = folders, scales = scales)
     else:
-        train(config=config, training_config=training_config, prompts=prompts, device=device, folder_main = args.folder_main, folders = folders, scales = scales, use_latents=args.use_latents)
+        train(config=config, prompts=prompts, device=device, folder_main = args.folder_main, folders = folders, scales = scales)
 
 
 if __name__ == "__main__":
@@ -383,12 +587,14 @@ if __name__ == "__main__":
         required=True,
         help="Config file for training.",
     )
+    # config_file 'data/config.yaml'
     parser.add_argument(
         "--alpha",
         type=float,
         required=True,
         help="LoRA weight.",
     )
+    # --alpha 1.0
     parser.add_argument(
         "--rank",
         type=int,
@@ -396,6 +602,7 @@ if __name__ == "__main__":
         help="Rank of LoRA.",
         default=4,
     )
+    # --rank 4
     parser.add_argument(
         "--device",
         type=int,
@@ -403,6 +610,7 @@ if __name__ == "__main__":
         default=0,
         help="Device to train on.",
     )
+    # --device 0
     parser.add_argument(
         "--name",
         type=str,
@@ -410,6 +618,7 @@ if __name__ == "__main__":
         default=None,
         help="Device to train on.",
     )
+    # --name 'eyesize_slider'
     parser.add_argument(
         "--attributes",
         type=str,
@@ -441,21 +650,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--scales",
-        type=float, 
+        type=float, #this was string. why was string????
         required=False,
         nargs='*',
-        default = [-2, -1, 1, 2],
+        default = '-2, -1, 1, 2',
         help="scales for different attribute-scaled images",
     )
     
     
-    parser.add_argument(
-        "--use_latents",
-        action="store_true",
-        help="Use cached latents instead of images.",
-    )
-    
     args = parser.parse_args()
 
     main(args)
-
+# OBSOLETE FILE FOR REFERENCE DO NOT REFACTOR DO NOT EDIT PLEASE I BEG YOU PLEAEAAASEEEEE! PLEASE!
