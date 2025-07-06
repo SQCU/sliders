@@ -77,9 +77,15 @@ def save_latents_to_disk(latents, output_dir, image_path, vae_state_dict):
     latent_path = os.path.join(output_dir, latent_filename)
     torch.save(latents, latent_path)
 
+    vae_checksum_hasher = hashlib.sha256()
+    for k, v in vae_state_dict.items():
+        vae_checksum_hasher.update(k.encode('utf-8'))
+        vae_checksum_hasher.update(v.cpu().to(torch.float32).numpy().tobytes())
+    vae_checksum = vae_checksum_hasher.hexdigest()
+
     metadata = {
         "image_checksum": get_sha256_checksum(image_path),
-        "vae_checksum": hashlib.sha256(str(vae_state_dict).encode('utf-8')).hexdigest(),
+        "vae_checksum": vae_checksum,
         "latent_checksum": get_sha256_checksum(latent_path),
     }
 
@@ -113,7 +119,11 @@ def check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, v
     metadata_path = os.path.join(output_dir, metadata_filename)
 
     current_image_checksum = get_sha256_checksum(image_path)
-    current_vae_checksum = hashlib.sha256(str(vae_state_dict).encode('utf-8')).hexdigest()
+    current_vae_checksum_hasher = hashlib.sha256()
+    for k, v in vae_state_dict.items():
+        current_vae_checksum_hasher.update(k.encode('utf-8'))
+        current_vae_checksum_hasher.update(v.cpu().to(torch.float32).numpy().tobytes())
+    current_vae_checksum = current_vae_checksum_hasher.hexdigest()
 
     if os.path.exists(latent_path) and os.path.exists(metadata_path):
         try:
