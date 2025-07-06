@@ -31,14 +31,14 @@ class TrainingSchedule:
         print("Collecting all possible training data combinations...")
         
         image_data_by_filename: Dict[str, Dict[float, str]] = {}
-        subfolder_names = [f.strip() for f in self.config.dataset_config.dataset.folders.split(',')]
-        scale_values = [float(s.strip()) for s in self.config.dataset_config.dataset.scales.split(',')]
+        subfolder_names = [f.strip() for f in self.config.dataset.folders.split(',')]
+        scale_values = [float(s.strip()) for s in self.config.dataset.scales.split(',')]
         
         if len(subfolder_names) != len(scale_values):
             raise ValueError("Number of folders must match number of scales in dataset configuration.")
 
         for i, folder_name in enumerate(subfolder_names):
-            subfolder_path = Path(self.config.dataset_config.dataset.folder_main) / folder_name
+            subfolder_path = Path(self.config.dataset.folder_main) / folder_name
             current_scale = scale_values[i]
             
             for image_path in subfolder_path.glob("*"):
@@ -65,7 +65,7 @@ class TrainingSchedule:
         all_image_filenames = list(data_pool_by_filename.keys())
         all_scales = sorted(list(set(scale for filename_data in data_pool_by_filename.values() for scale in filename_data.keys())))
 
-        with open(self.config.dataset_config.prompts_file, 'r') as f:
+        with open(self.config.dataset.prompts_file, 'r') as f:
             prompts_data = yaml.safe_load(f)
         if not prompts_data:
             raise ValueError("Prompts data is empty. Check your prompts file.")

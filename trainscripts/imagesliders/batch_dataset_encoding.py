@@ -37,23 +37,6 @@ import argparse
 # The current issue is that the latent caching process is slow, often re-computing latents for unchanged images.
 # This suggests issues with the cache validation or the VAE encoding process itself.
 
-#            #scale_to_look = abs(random.choice(list(scales_unique)))
-#cales_to_look = random.sample(list(scales_unique),2)   #2 choices
-scales_to_look.sort()   #smaller first idx
-
-#folder1 = folders[scales==-scale_to_look][0]
-#folder2 = folders[scales==scale_to_look][0]
-#use lowest then highest
-folder1 = folders[scales==scales_to_look[-1]][0]
-folder2 = folders[scales==scales_to_look[0]][0]
-
-ims = os.listdir(f'{folder_main}/{folder1}/')
-ims = [im_ for im_ in ims if '.png' in im_ or '.jpg' in im_ or '.jpeg' in im_ or '.webp' in im_]
-random_sampler = random.randint(0, len(ims)-1)
-
-#...
-img1 = Image.open(f'{folder_main}/{folder1}/{ims[random_sampler]}').resize((512,512))#
-img2 = Image.open(f'{folder_main}/{folder2}/{ims[random_sampler]}').resize((512,512))#
 
 #DO NOT DELETE THESE HYPERPARAMETERS. WHY WOULD YOU EVEN THINK OF SUCH A THING.
 UNET_ATTENTION_TIME_EMBED_DIM = 256  # XL
@@ -386,6 +369,8 @@ def prepare_cached_batches(config, environment):
         all_text_embeddings = []
         all_pooled_embeds = []
 
+        pair_indices = []
+        is_low_cases = []
         for item in batch_items:
             latent, encoding_time, load_time = get_latent_for_image(
                 item.image_path, vae, device, weight_dtype, 
@@ -395,6 +380,8 @@ def prepare_cached_batches(config, environment):
             )
             latents.append(latent)
             scales.append(item.scale)
+            pair_indices.append(item.pair_index)
+            is_low_cases.append(item.is_low_case)
             total_latent_encoding_time += encoding_time
             total_latent_load_time += load_time
 
@@ -427,6 +414,8 @@ def prepare_cached_batches(config, environment):
             "text_embeddings": text_embeddings_batch,
             "pooled_embeds": pooled_embeds_batch,
             "add_time_ids": add_time_ids,
+            "pair_indices": torch.tensor(pair_indices, dtype=torch.long, device=device),
+            "is_low_cases": torch.tensor(is_low_cases, dtype=torch.bool, device=device),
         }
         static_batches.append(batch)
 
@@ -566,15 +555,14 @@ def config_io():
 
     print(f"Loading batch config from: {args.batchtrainconfig}")
     config = AttrDict(load_config_from_yaml(args.batchtrainconfig))
-    
-    inner_config_path = config.obsolete_config.refpath
-    print(f"Loading and merging inner config from: {inner_config_path}")
-    inner_config = AttrDict(load_config_from_yaml(inner_config_path))
-    config.update(inner_config)
 
-    dset_config_path = config.dset_config.refpath
-    print(f"Loading dataset config from: {dset_config_path}")
-    config.dataset_config = AttrDict(load_config_from_yaml(dset_config_path))
+    # Load and merge model config if specified
+    if 'model_config' in config and 'refpath' in config.model_config:
+        model_config_path = config.model_config.refpath
+        print(f"Loading and merging model config from: {model_config_path}")
+        model_config = AttrDict(load_config_from_yaml(model_config_path))
+        # Merge model_config into the main config, overwriting existing keys
+        config.update(model_config)
 
     return config
 
@@ -758,7 +746,8 @@ def find_optimal_vae_batch_size(config, environment, vram_max_threshold=0.85, ma
     print(f"\nLargest successful batch size: {largest_successful_batch['batch_size']}")
     print(f"Batch size with best throughput: {best_throughput_result['batch_size']} ({best_throughput_result['images_per_second']:.2f} images/sec)")
     print(f"\nRecommendation:")
-    print(f"Set 'vae_encoding_batch_size' in your config to {largest_successful_batch['batch_size']} for a balance of speed and stability.")
+    print(f"Setting 'vae_encoding_batch_size' in config to {largest_successful_batch['batch_size']} for a balance of speed and stability.")
+    config.train.vae_encoding_batch_size = largest_successful_batch['batch_size']
 
 def main():
     log_file_path, orig_stdout, orig_stderr = setup_logging()

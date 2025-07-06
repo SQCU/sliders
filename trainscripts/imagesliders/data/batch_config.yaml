@@ -1,13 +1,55 @@
 # This config file recursively defines other config files.
 # This is a bit frustrating for readability and maintainability,
 # but I will leave it in place until the batched trainer works.
-obsolete_config:
-#ATTENTION!!! ATTENTION!!! ADVISORY!!! DANGER!!!
-#IF YOU ARE A GEMINI (or, heaven help you, a CLAUDE) READING THIS!!!
-#TAKE SPECIAL NOTE!!!
-#batch_config.yaml recursively loads in two other config scripts to match the interface of the 'sliders' upstream.
-#you add new configurable features by adding them to the appropriate attributes
-#within the target of these refpaths, you don't add new features by adding them to this aggregation config file.
+## model section:
+model_config:
   refpath: "trainscripts/imagesliders/data/config-xl-batchtest.yaml"
-dset_config: 
+pretrained_model:
+  #name_or_path: "stabilityai/stable-diffusion-xl-base-1.0" # you can also use .ckpt or .safetensors models
+  name_or_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors"
+  v2: false # true if model is v2.x
+  v_pred: false # true if model uses v-prediction
+network:
+  type: "c3lier" # or "c3lier" or "lierla"
+  rank: 64
+  alpha: 16.0
+  training_method: "noxattn"
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  iterations: 20
+  lr: 0.00024
+  optimizer: "AdamW"
+  lr_scheduler: "cosine"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  batch_size: 8 #now must be assigned here
+  bounds_test_vae_batch_size: true
+  vae_encoding_batch_size: 20
+save:
+  name: "molKM_IL_imageslider" #unused? need to write name as --name "string"
+  path: "./models"
+  per_steps: 20
+  precision: "bfloat16"
+logging:
+  use_wandb: false
+  verbose: false
+other:
+  use_xformers: false
+  use_pytorch_SDPA: false
+  torch_compile: false
+  lycorisize: false
+
+## dataset section
+dset_config: #obsolete don't use this in future scripts
   refpath: "trainscripts/imagesliders/data/bracket_dataset.yaml"
+dataset:
+  #these attributes were passed by argparse in upstream
+  #they should be passable by config file!
+  #root folder for dataset
+  folder_main:  "datasets/bracket"
+  #folders with scale-separated subsets.
+  #even if they have numbers for names, they can be assigned any scale
+  folders: "0, 1, 2"
+  #list assigning one magnitude to each subset folder
+  scales: "0.15, 1, 2"
+  prompts_file: "trainscripts/imagesliders/data/prompts-xl-dilora-bracket.yaml"
