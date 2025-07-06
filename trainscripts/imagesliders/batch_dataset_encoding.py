@@ -3,7 +3,7 @@ import hashlib
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
-from diffusers import AutoencoderKL
+from diffusers import AutoencoderKL, DDPMScheduler, SchedulerMixin, DDIMScheduler, LMSDiscreteScheduler, EulerAncestralDiscreteScheduler, StableDiffusionXLPipeline
 from diffusers.image_processor import VaeImageProcessor
 import json
 import yaml
@@ -12,7 +12,9 @@ import time
 from tqdm import tqdm
 from typing import Tuple, Union, Literal, List, Dict, Any
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
-from diffusers import UNet2DConditionModel, SchedulerMixin
+import datetime
+import sys
+import argparse
 
 # --- Training Data Flow in Diffusion Models ---
 # In diffusion model training, the objective is to learn a transition kernel that transforms a noisy example (x_t)
@@ -163,11 +165,6 @@ def get_latent_for_image(image_path, vae, device, weight_dtype, output_dir, vae_
     return torch.load(latent_path), encoding_time, checksum_time
 
 # --- Copied from batch_train_util.py for self-containment ---
-UNET_ATTENTION_TIME_EMBED_DIM = 256  # XL
-TEXT_ENCODER_2_PROJECTION_DIM = 1280
-UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM = 2816
-
-SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
 
 def text_tokenize(
     tokenizer: CLIPTokenizer,
@@ -397,3 +394,180 @@ def prepare_cached_batches(config, environment):
     print(f"Total time spent in checksums: {total_checksum_time:.4f} seconds")
 
     return static_batches
+
+# --- Copied from batch_model_util.py for self-containment ---
+AVAILABLE_SCHEDULERS = Literal["ddim", "ddpm", "lms", "euler_a"]
+
+def load_models(config, device, weight_dtype):
+    print(f"Loading models from {config.pretrained_model.name_or_path} to device: {device} with dtype: {weight_dtype}")
+
+    pipe = StableDiffusionXLPipeline.from_single_file(
+        config.pretrained_model.name_or_path,
+        torch_dtype=weight_dtype,
+        cache_dir=None,
+    )
+    unet = pipe.unet.to(device, dtype=weight_dtype)
+    vae = pipe.vae.to(device, dtype=weight_dtype)
+    tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
+    text_encoders = [pipe.text_encoder, pipe.text_encoder_2]
+
+    if len(text_encoders) == 2:
+        text_encoders[1].pad_token_id = 0
+
+    noise_scheduler = create_noise_scheduler(config.train.noise_scheduler)
+
+    unet.requires_grad_(False).eval()
+    vae.requires_grad_(False).eval()
+    for text_encoder in text_encoders:
+        text_encoder.requires_grad_(False).eval()
+
+    return vae, unet, tokenizers, text_encoders, noise_scheduler
+
+def create_noise_scheduler(
+    scheduler_name: AVAILABLE_SCHEDULERS = "ddpm",
+    prediction_type: Literal["epsilon", "v_prediction"] = "epsilon",
+) -> SchedulerMixin:
+    name = scheduler_name.lower().replace(" ", "_")
+    if name == "ddim":
+        scheduler = DDIMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            num_train_timesteps=1000,
+            clip_sample=False,
+            prediction_type=prediction_type,
+        )
+    elif name == "ddpm":
+        scheduler = DDPMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            num_train_timesteps=1000,
+            clip_sample=False,
+            prediction_type=prediction_type,
+        )
+    elif name == "lms":
+        scheduler = LMSDiscreteScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            num_train_timesteps=1000,
+            prediction_type=prediction_type,
+        )
+    elif name == "euler_a":
+        scheduler = EulerAncestralDiscreteScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            num_train_timesteps=1000,
+            prediction_type=prediction_type,
+        )
+    else:
+        raise ValueError(f"Unknown scheduler name: {name}")
+
+    return scheduler
+
+# --- Copied from batch_config_util.py for self-containment ---
+def parse_precision(precision: str) -> torch.dtype:
+    if precision == "fp32" or precision == "float32":
+        return torch.float32
+    elif precision == "fp16" or precision == "float16":
+        return torch.float16
+    elif precision == "bf16" or precision == "bfloat16":
+        return torch.bfloat16
+
+    raise ValueError(f"Invalid precision type: {precision}")
+
+def config_io():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batchtrainconfig", "--bconfig", "-c", 
+                        type=str, 
+                        help="Path to the batch training config file.",
+                        default="trainscripts/imagesliders/data/batch_config.yaml")
+    args = parser.parse_args()
+
+    print(f"Loading batch config from: {args.batchtrainconfig}")
+    config = AttrDict(load_config_from_yaml(args.batchtrainconfig))
+    
+    inner_config_path = config.obsolete_config.refpath
+    print(f"Loading and merging inner config from: {inner_config_path}")
+    inner_config = AttrDict(load_config_from_yaml(inner_config_path))
+    config.update(inner_config)
+
+    dset_config_path = config.dset_config.refpath
+    print(f"Loading dataset config from: {dset_config_path}")
+    config.dataset_config = AttrDict(load_config_from_yaml(dset_config_path))
+
+    return config
+
+def envsetup(config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    weight_dtype = parse_precision(config.train.precision)
+
+    vae, unet, tokenizers, text_encoders, noise_scheduler = load_models(config, device, weight_dtype)
+
+    environment = {
+        "unet": unet,
+        "vae": vae,
+        "noise_scheduler": noise_scheduler,
+        "tokenizers": tokenizers,
+        "text_encoders": text_encoders,
+        "device": device,
+        "weight_dtype": weight_dtype,
+        "config": config,
+    }
+    return environment
+
+def setup_logging():
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_filename = os.path.join(log_dir, f"batch_dataset_encoding_test_{timestamp}.log")
+    
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    log_file = open(log_filename, "w")
+    sys.stdout = log_file
+    sys.stderr = log_file
+    
+    print(f"Logging output to {log_filename}")
+    
+    return log_filename, original_stdout, original_stderr
+
+
+def main():
+    log_file_path, orig_stdout, orig_stderr = setup_logging()
+    try:
+        print(f"--- Starting Batch Dataset Encoding Test ---", file=orig_stdout)
+        print(f"All output will be redirected to: {log_file_path}", file=orig_stdout)
+        
+        config = config_io()
+        environment = envsetup(config)
+        
+        # We only need VAE, tokenizers, text_encoders for batch caching
+        # Unet and noise_scheduler are not used in prepare_cached_batches
+        # but are part of the environment returned by envsetup.
+        # We can clean them up if memory is an issue, but for now, keep for simplicity.
+
+        static_batches = prepare_cached_batches(config, environment)
+        
+        print(f"Successfully prepared {len(static_batches)} batches.", file=orig_stdout)
+        
+    except Exception as e:
+        import traceback
+        print("--- EXCEPTION OCCURRED ---", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print(f"\n--- EXCEPTION OCCURRED ---", file=orig_stderr)
+        print(f"An error occurred. Check the log file for details: {log_file_path}", file=orig_stderr)
+        traceback.print_exc(file=orig_stderr)
+        raise
+        
+    finally:
+        sys.stdout.close()
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
+        print(f"--- Script finished. Log saved to {log_file_path} ---", file=orig_stdout)
+
+if __name__ == "__main__":
+    main()
