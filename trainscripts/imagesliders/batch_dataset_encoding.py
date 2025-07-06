@@ -465,28 +465,16 @@ def load_models(config, device, weight_dtype):
         cache_dir=DIFFUSERS_CACHE_DIR,
     )
 
-    unet = pipe.unet
+    unet = pipe.unet.to(device, weight_dtype)
     tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
-    text_encoders = [pipe.text_encoder, pipe.text_encoder_2]
+    text_encoders = [pipe.text_encoder.to(device, weight_dtype), pipe.text_encoder_2.to(device, weight_dtype)]
     if len(text_encoders) == 2:
         text_encoders[1].pad_token_id = 0
-    vae = pipe.vae
+    vae = pipe.vae.to(device, weight_dtype)
     del pipe
-    torch.cuda.empty_cache()
     #GET RID OF PIPE!!! 
     #you HAVE TO GET RID OF THE PIPE EVERY TIME!!!
     #if you do a 'blah = pipe.blah.to(device, dtype)' you DOUBLE LOAD THE MODEL,
-
-    unet.requires_grad_(False).eval()
-    vae.requires_grad_(False).eval()
-    for text_encoder in text_encoders:
-        text_encoder.requires_grad_(False).eval()
-
-    unet = unet.to(device, weight_dtype)
-    #tokenizers = [tokenizer.to(device, weight_dtype) for tokenizer in tokenizers]
-    text_encoders = [text_encoder.to(device, weight_dtype) for text_encoder in text_encoders]
-    vae = vae.to(device, weight_dtype)
-    #i HATE huggingface wwrappers
 
     return vae, unet, tokenizers, text_encoders
 
@@ -570,6 +558,10 @@ def envsetup(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = parse_precision(config.train.precision)
     vae, unet, tokenizers, text_encoders = load_models(config, device, weight_dtype)
+    unet.requires_grad_(False).eval()
+    vae.requires_grad_(False).eval()
+    for text_encoder in text_encoders:
+        text_encoder.requires_grad_(False).eval()
 
     noise_scheduler = create_noise_scheduler(config.train.noise_scheduler) # Initialize directly for single file
     environment = {
