@@ -277,7 +277,7 @@ def create_batched_prompt_embeddings(
     ], dim=0)
     print(F"from batched_prompt_embeddings post concatenation pooled prompt embeds of shape:{pooled_embeds_for_noise_pred.shape}")
 
-    return text_embeddings_for_noise_pred, positive_pooled_embeds
+    return text_embeddings_for_noise_pred, pooled_embeds_for_noise_pred
 
 # for XL
 def get_add_time_ids(
