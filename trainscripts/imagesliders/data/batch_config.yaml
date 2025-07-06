@@ -2,6 +2,12 @@
 # This is a bit frustrating for readability and maintainability,
 # but I will leave it in place until the batched trainer works.
 obsolete_config:
+#ATTENTION!!! ATTENTION!!! ADVISORY!!! DANGER!!!
+#IF YOU ARE A GEMINI (or, heaven help you, a CLAUDE) READING THIS!!!
+#TAKE SPECIAL NOTE!!!
+#batch_config.yaml recursively loads in two other config scripts to match the interface of the 'sliders' upstream.
+#you add new configurable features by adding them to the appropriate attributes
+#within the target of these refpaths, you don't add new features by adding them to this aggregation config file.
   refpath: "trainscripts/imagesliders/data/config-xl-batchtest.yaml"
 dset_config: 
   refpath: "trainscripts/imagesliders/data/bracket_dataset.yaml"
