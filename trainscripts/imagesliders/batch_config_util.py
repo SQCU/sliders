@@ -1,4 +1,3 @@
-from typing import Literal, Optional
 import yaml
 import os
 from pathlib import Path
@@ -8,9 +7,6 @@ from trainscripts.imagesliders import map_data_to_latents
 from trainscripts.imagesliders import batch_train_util
 import datetime
 import sys
-from pydantic import BaseModel
-from trainscripts.imagesliders import batch_model_util
-import torch.optim as optim
 import argparse
 
 def load_config_from_yaml(filepath):
@@ -25,28 +21,17 @@ class AttrDict(dict):
             if isinstance(value, dict):
                 self[key] = AttrDict(value)
 
-#this is RADIOACTIVE FUCKING POISON WHY IS THERE LOGIC IN HERE!!!
-#SOMEHOW THIS IS CAUSING THE COLLATE_FN TO REMOVE RANDOM PARTS OF TEXT EMBEDDDING TENSORS WHICH EXIST INSIDE OF OTHER LOGIC!!!!!!
-
 class ImageScaleDataset(Dataset):
-    def __init__(self, config, vae, device, weight_dtype, use_latents=True):
+    def __init__(self, config):
         self.config = config
-        self.vae = vae
-        self.device = device
-        self.weight_dtype = weight_dtype
-        self.use_latents = use_latents
         
         self.image_paths = []
         self.scales = []
-        self.latents = []
-
-        print(config.keys())
-        #print(config.keys().keys())
 
         self.latent_cache_dir = Path(self.config.dataset_config.dataset.folder_main) / "latents"
         os.makedirs(self.latent_cache_dir, exist_ok=True)
 
-        print("Mapping dataset and caching latents...")
+        print("Collecting image paths and scales...")
         subfolder_names = [f.strip() for f in self.config.dataset_config.dataset.folders.split(',')]
         scale_values = [float(s.strip()) for s in self.config.dataset_config.dataset.scales.split(',')]
         
@@ -57,46 +42,51 @@ class ImageScaleDataset(Dataset):
                 if image_path.suffix.lower() in ['.png', '.jpg', '.jpeg']:
                     self.image_paths.append(str(image_path))
                     self.scales.append(scale)
-                    
-                    # Always ensure latent is cached on disk
-                    latent = map_data_to_latents.get_latent_for_image(
-                        str(image_path), self.vae, self.device, self.weight_dtype, self.latent_cache_dir, self.vae.state_dict()
-                    )
-                    if self.use_latents:
-                        self.latents.append(latent)
+        
+        # Load prompts
+        with open(self.config.dataset_config.prompts_file, 'r') as f:
+            self.prompts_data = yaml.safe_load(f)
 
+        self.total_dataset_size = self.config.train.iterations * self.config.train.batch_size
 
     def __len__(self):
-        return len(self.latents)
+        return self.total_dataset_size
 
     def __getitem__(self, idx):
-        if self.use_latents:
-            return self.latents[idx], self.scales[idx]
-        else:
-            latent_path = self.latent_cache_dir / (Path(self.image_paths[idx]).stem + ".pt")
-            return str(latent_path.resolve()), self.scales[idx]
+        image_idx = idx % len(self.image_paths)
+        prompt_idx = idx % len(self.prompts_data)
+        return self.image_paths[image_idx], self.scales[image_idx], self.prompts_data[prompt_idx]
 
-def collate_fn(batch, tokenizers, text_encoders, config, device, weight_dtype, use_latents=True):
-    items, scales = zip(*batch)
+def collate_fn(batch, tokenizers, text_encoders, config, vae, device, weight_dtype):
+    image_paths, scales, prompts_data = zip(*batch)
     
-    if use_latents:
-        latents = torch.cat(items, dim=0).to(device, dtype=weight_dtype)
-    else:
-        latents = torch.cat([torch.load(p) for p in items], dim=0).to(device, dtype=weight_dtype)
+    latents = []
+    for img_path in image_paths:
+        latent = map_data_to_latents.get_latent_for_image(
+            img_path, vae, device, weight_dtype, Path(config.dataset_config.dataset.folder_main) / "latents", vae.state_dict()
+        )
+        latents.append(latent)
+    latents = torch.cat(latents, dim=0).to(device, dtype=weight_dtype)
 
     scales = torch.tensor(scales, dtype=weight_dtype, device=device)
     
-    with open(config.dataset_config.prompts_file, 'r') as f:
-        prompts = yaml.safe_load(f)
+    # prompts_data is already a list of dictionaries, each containing 'positive', 'unconditional', 'neutral'
+    # We need to process each item in the batch individually for prompt embeddings
+    # and then concatenate them.
+    all_text_embeddings = []
+    all_pooled_embeds = []
 
-    text_embeddings, pooled_embeds = batch_train_util.create_batched_prompt_embeddings(
-        tokenizers,
-        text_encoders,
-        prompts,
-        num_images_per_prompt=len(latents),
-    )
+    for prompt_dict in prompts_data:
+        text_embeddings, pooled_embeds = batch_train_util.create_batched_prompt_embeddings(
+            tokenizers,
+            text_encoders,
+            prompt_dict,
+        )
+        all_text_embeddings.append(text_embeddings)
+        all_pooled_embeds.append(pooled_embeds)
 
-    print(f"from collate_fn: te{text_embeddings.shape},pe{pooled_embeds.shape}")
+    text_embeddings_batch = torch.cat(all_text_embeddings, dim=0).to(device, dtype=weight_dtype)
+    pooled_embeds_batch = torch.cat(all_pooled_embeds, dim=0).to(device, dtype=weight_dtype)
 
     add_time_ids = batch_train_util.get_add_time_ids(
         1024, 1024, False, dtype=latents.dtype
@@ -105,20 +95,17 @@ def collate_fn(batch, tokenizers, text_encoders, config, device, weight_dtype, u
     return {
         "latents": latents,
         "scales": scales,
-        "text_embeddings": text_embeddings.to(device, dtype=weight_dtype),
-        "pooled_embeds": pooled_embeds.to(device, dtype=weight_dtype),
+        "text_embeddings": text_embeddings_batch,
+        "pooled_embeds": pooled_embeds_batch,
         "add_time_ids": add_time_ids,
     }
 
-def dataset_constructor(config, environment, use_latents=True):
-    """
-    THIS IS RADIOACTIVE FUCKING POISON!!!!
-    IT BROKE EVERYTHING WE'RE WOKRING WITH AND FOR SOME REASON HJIDES / ABSTRACTS THE CREATION OF THE ACTUAL DATA!
-    """
-    dataset = ImageScaleDataset(config, environment['vae'], environment['device'], environment['weight_dtype'], use_latents=use_latents)
+def dataset_constructor(config, environment):
+    dataset = ImageScaleDataset(config)
     
-    collate_wrapper = lambda b: collate_fn(b, environment['tokenizers'], environment['text_encoders'], config, environment['device'], environment['weight_dtype'], use_latents=use_latents)
+    collate_wrapper = lambda b: collate_fn(b, environment['tokenizers'], environment['text_encoders'], config, environment['vae'], environment['device'], environment['weight_dtype'])
     
+    print(f"Batch size from config in batch_config_util.py: {config.train.batch_size}")
     dataloader = DataLoader(dataset, batch_size=config.train.batch_size, shuffle=True, collate_fn=collate_wrapper)
     return dataloader
 
@@ -132,79 +119,6 @@ def setup_logging():
     print(f"Logging output to {log_filename}")
     return log_filename
 
-PRECISION_TYPES = Literal["fp32", "fp16", "bf16", "float32", "float16", "bfloat16"]
-NETWORK_TYPES = Literal["lierla", "c3lier"]
-
-
-class PretrainedModelConfig(BaseModel):
-    name_or_path: str
-    v2: bool = False
-    v_pred: bool = False
-
-    clip_skip: Optional[int] = None
-
-
-class NetworkConfig(BaseModel):
-    type: NETWORK_TYPES = "lierla"
-    rank: int = 4
-    alpha: float = 1.0
-
-    training_method: str = "full"
-
-
-class TrainConfig(BaseModel):
-    batch_size: int = 4
-    precision: PRECISION_TYPES = "bfloat16"
-    noise_scheduler: Literal["ddim", "ddpm", "lms", "euler_a"] = "ddim"
-
-    iterations: int = 500
-    lr: float = 1e-4
-    optimizer: str = "adamw"
-    optimizer_args: str = ""
-    lr_scheduler: str = "constant"
-
-    max_denoising_steps: int = 50
-    batch_size: int = 1 #now must be assigned here
-
-
-class SaveConfig(BaseModel):
-    name: str = "untitled"
-    path: str = "./output"
-    per_steps: int = 200
-    precision: PRECISION_TYPES = "float32"
-
-
-class LoggingConfig(BaseModel):
-    use_wandb: bool = False
-
-    verbose: bool = False
-
-
-class OtherConfig(BaseModel):
-    use_xformers: bool = False
-    use_pytorch_SDPA: bool = True
-    torch_compile: bool = False
-    lycorisize:bool = False
-    gradient_checkpointing: bool = False
-    torch_amp: bool = False
-
-
-class RootConfig(BaseModel):
-    prompts_file: str
-    pretrained_model: PretrainedModelConfig
-    latent_cache_dir: Optional[str] = None
-
-    network: NetworkConfig
-
-    train: Optional[TrainConfig]
-
-    save: Optional[SaveConfig]
-
-    logging: Optional[LoggingConfig]
-
-    other: Optional[OtherConfig]
-
-
 def parse_precision(precision: str) -> torch.dtype:
     if precision == "fp32" or precision == "float32":
         return torch.float32
@@ -215,28 +129,6 @@ def parse_precision(precision: str) -> torch.dtype:
 
     raise ValueError(f"Invalid precision type: {precision}")
 
-
-#WHY DOES THIS EXIST WHY ARE THERE TWO WAYS TO LOAD A CONFIG THIS HAS BROKEN SO MANY THIGNS
-def load_config_from_yaml_and_merge(config_path: str) -> RootConfig:
-    with open(config_path, "r") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
-
-    root = RootConfig(**config)
-
-    if root.train is None:
-        root.train = TrainConfig()
-
-    if root.save is None:
-        root.save = SaveConfig()
-
-    if root.logging is None:
-        root.logging = LoggingConfig()
-
-    if root.other is None:
-        root.other = OtherConfig()
-
-    return root
-
 def config_io():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batchtrainconfig", "--bconfig", "-c", 
@@ -246,16 +138,16 @@ def config_io():
     args = parser.parse_args()
 
     print(f"Loading batch config from: {args.batchtrainconfig}")
-    config = load_config_from_yaml(args.batchtrainconfig)
+    config = AttrDict(load_config_from_yaml(args.batchtrainconfig))
     
-    inner_config_path = config['obsolete_config']['refpath']
+    inner_config_path = config.obsolete_config.refpath
     print(f"Loading and merging inner config from: {inner_config_path}")
-    inner_config = load_config_from_yaml_and_merge(inner_config_path)
+    inner_config = AttrDict(load_config_from_yaml(inner_config_path))
     config.update(inner_config)
 
-    dset_config_path = config['dset_config']['refpath']
+    dset_config_path = config.dset_config.refpath
     print(f"Loading dataset config from: {dset_config_path}")
-    config['dataset_config'] = load_config_from_yaml(dset_config_path)
+    config.dataset_config = AttrDict(load_config_from_yaml(dset_config_path))
 
     return config
 
@@ -279,8 +171,7 @@ def envsetup(config):
 
 if __name__ == '__main__':
     def main():
-        args = config_io()
-        config = AttrDict(args)
+        config = config_io()
         
         environment = envsetup(config)
         
@@ -317,6 +208,6 @@ if __name__ == '__main__':
         raise
     finally:
         sys.stdout.close()
-        sys.stdout = sys.__stdout__ # Restore original stdout
-        sys.stderr = sys.__stderr__ # Restore original stderr
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
         print(f"Script finished. Log saved to {log_file_path}")

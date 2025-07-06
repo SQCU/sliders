@@ -184,23 +184,12 @@ def text_tokenize(
 def text_encode_xl(
     text_encoder: SDXL_TEXT_ENCODER_TYPE,
     tokens: torch.FloatTensor,
-    #num_images_per_prompt: int = 1,
-    #get rid of that horrible operand
 ):
     prompt_embeds = text_encoder(
         tokens.to(text_encoder.device), output_hidden_states=True
     )
     pooled_prompt_embeds = prompt_embeds[0]
-    print(F"pre concatenation pooled prompt embeds of shape:{pooled_prompt_embeds.shape}")
     prompt_embeds = prompt_embeds.hidden_states[-2]  # always penultimate layer
-    print(F"1/3pre concatenation prompt hidden states of shape:{prompt_embeds.shape}")
-    #something weird is happening here.
-    #i think it's part of the upstream batch code they *couldn't get working*.
-    #bs_embed, seq_len, _ = prompt_embeds.shape
-    #prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-    #print(F"2/3pre concatenation prompt hidden states of shape:{prompt_embeds.shape}")
-    #prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
-    #print(F"3/3pre concatenation prompt hidden states of shape:{prompt_embeds.shape}")
 
     return prompt_embeds, pooled_prompt_embeds
 
@@ -208,8 +197,6 @@ def encode_prompts_xl(
     tokenizers: list[CLIPTokenizer],
     text_encoders: list[SDXL_TEXT_ENCODER_TYPE],
     prompts: list[str],
-    #num_images_per_prompt: int = 1,
-    #get rid of horrible thing
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
     # text_encoder and text_encoder_2's penuultimate layer's output
     text_embeds_list = []
@@ -218,20 +205,10 @@ def encode_prompts_xl(
     for tokenizer, text_encoder in zip(tokenizers, text_encoders):
         text_tokens_input_ids = text_tokenize(tokenizer, prompts)
         text_embeds, pooled_text_embeds = text_encode_xl(
-            text_encoder, text_tokens_input_ids, #num_images_per_prompt
+            text_encoder, text_tokens_input_ids,
         )
 
         text_embeds_list.append(text_embeds)
-
-    print(F"pre susblock prompt hidden states of shape:{pooled_text_embeds.shape}")
-    #suspicious block
-    #something weird is happening here.
-    #i think it's part of the upstream batch code they *couldn't get working*.
-    #bs_embed = pooled_text_embeds.shape[0]
-    #pooled_text_embeds = pooled_text_embeds.repeat(1, num_images_per_prompt).view(
-    #    bs_embed * num_images_per_prompt, -1
-    #)
-    print(F"post susblock prompt hidden states of shape:{pooled_text_embeds.shape}")
 
     return torch.concat(text_embeds_list, dim=-1), pooled_text_embeds
 
@@ -240,26 +217,23 @@ def create_batched_prompt_embeddings(
     tokenizers: list[CLIPTokenizer],
     text_encoders: list[SDXL_TEXT_ENCODER_TYPE],
     prompts: dict,
-    num_images_per_prompt: int = 1,
-    #deprecated but must still accept it for now.
-    #get rid of that horrible thing
 ):
     """
     Creates a batched prompt embedding tensor for use in the training loop.
     """
-    positive_prompts = [prompts[0]['positive']]
-    unconditional_prompts = [prompts[0]['unconditional']]
-    neutral_prompts = [prompts[0]['neutral']]
+    positive_prompts = [prompts['positive']]
+    unconditional_prompts = [prompts['unconditional']]
+    neutral_prompts = [prompts['neutral']]
 
     # Encode all prompts
     positive_text_embeds, positive_pooled_embeds = encode_prompts_xl(
-        tokenizers, text_encoders, positive_prompts, #num_images_per_prompt
+        tokenizers, text_encoders, positive_prompts,
     )
     unconditional_text_embeds, unconditional_pooled_embeds = encode_prompts_xl(
-        tokenizers, text_encoders, unconditional_prompts, #num_images_per_prompt
+        tokenizers, text_encoders, unconditional_prompts,
     )
     neutral_text_embeds, neutral_pooled_embeds = encode_prompts_xl(
-        tokenizers, text_encoders, neutral_prompts, #num_images_per_prompt
+        tokenizers, text_encoders, neutral_prompts,
     )
 
     # Concatenate for the UNet
@@ -268,14 +242,12 @@ def create_batched_prompt_embeddings(
         unconditional_text_embeds,
         neutral_text_embeds,
     ], dim=0)
-    print(F"from batched_prompt_embeddings post concatenation prompt hidden states of shape:{text_embeddings_for_noise_pred.shape}")
     # Pooled embeds are also needed for XL
     pooled_embeds_for_noise_pred = torch.cat([
         positive_pooled_embeds,
         unconditional_pooled_embeds,
         neutral_pooled_embeds,
     ], dim=0)
-    print(F"from batched_prompt_embeddings post concatenation pooled prompt embeds of shape:{pooled_embeds_for_noise_pred.shape}")
 
     return text_embeddings_for_noise_pred, pooled_embeds_for_noise_pred
 
