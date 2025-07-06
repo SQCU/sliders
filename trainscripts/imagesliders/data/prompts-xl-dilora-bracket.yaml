@@ -7,5 +7,4 @@
   guidance_scale: 2
   resolution: 1024
   dynamic_resolution: false
-  batch_size: 1
 ####################################################################################################### IMAGE SLIDER

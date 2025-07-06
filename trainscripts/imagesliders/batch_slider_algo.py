@@ -32,7 +32,9 @@ def create_pairing_map(scales: torch.Tensor) -> Dict[str, List[Any]]:
     if scales.ndim != 1:
         raise ValueError(f"scales tensor must be 1D, but got shape {scales.shape}")
 
-    unique_scales = torch.unique(scales, sorted=True)
+    scales_list = scales.tolist()
+    unique_scales_list = sorted(list(set(scales_list)))
+    unique_scales = torch.tensor(unique_scales_list, dtype=scales.dtype, device=scales.device)
     if len(unique_scales) < 2:
         return {"pairs": [], "unpaired": list(range(len(scales)))}
 

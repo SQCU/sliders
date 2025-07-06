@@ -12,7 +12,7 @@ network:
 train:
   precision: "bfloat16"
   noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
-  iterations: 200
+  iterations: 20
   lr: 0.00024
   optimizer: "AdamW"
   lr_scheduler: "cosine"  #or "constant" or "cosine"
@@ -21,7 +21,7 @@ train:
 save:
   name: "molKM_IL_imageslider" #unused? need to write name as --name "string"
   path: "./models"
-  per_steps: 2000
+  per_steps: 20
   precision: "bfloat16"
 logging:
   use_wandb: false
