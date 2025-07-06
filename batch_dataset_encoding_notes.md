@@ -75,4 +75,21 @@ A complex, multiprocessing-based watchdog to monitor for this slowdown was consi
         *   Adjusted import statements to resolve module loading issues when running as a module.
 *   **Verification:** Successfully ran `batch_dataset_encoding.py` (after import fixes), which reported successful preparation of batches using the new `TrainingSchedule`.
 
+### 3. Text Embedding Caching
+
+*   **Problem:** Text embeddings were being re-computed for every training item, leading to redundant computation and wasted resources.
+*   **Solution:**
+    *   Added a `get_unique_prompts` method to the `TrainingSchedule` class in `data_schedule.py` to extract all unique prompt dictionaries from the generated schedule.
+    *   Implemented `initialize_text_embedding_cache` in `batch_dataset_encoding.py` to pre-compute and cache text embeddings for these unique prompts.
+    *   Integrated `initialize_text_embedding_cache` into `prepare_cached_batches` to ensure embeddings are computed once.
+    *   Modified the batch creation loop in `prepare_cached_batches` to retrieve text embeddings from this cache instead of re-computing them for every `TrainingItem`.
+*   **Verification:** The log output confirmed that unique prompts were cached and that the time spent concatenating text embeddings was significantly reduced, indicating successful caching.
+
+### 4. Debug Output for Training Batches
+
+*   **Problem:** Lack of clear visibility into the structure and content of the prepared training batches.
+*   **Solution:**
+    *   Added a debug print statement to `prepare_cached_batches` in `batch_dataset_encoding.py` to display the tensor shapes of the first training batch and the metadata for each item within that batch.
+*   **Verification:** The log output provided a detailed breakdown of the tensor shapes and metadata, confirming correct batch construction and data flow.
+
 These changes significantly improve the efficiency, clarity, and maintainability of the data pipeline, laying the groundwork for more advanced features like distributed training.
