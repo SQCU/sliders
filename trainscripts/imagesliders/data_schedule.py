@@ -99,3 +99,14 @@ class TrainingSchedule:
 
     def __getitem__(self, idx):
         return self.schedule[idx]
+
+    def get_unique_prompts(self) -> List[Dict[str, Any]]:
+        unique_prompts = set()
+        for batch_items in self.schedule:
+            for item in batch_items:
+                # Convert the prompt dictionary to a hashable type (e.g., a frozenset of items)
+                # This assumes prompt dictionaries are simple and don't contain mutable objects
+                unique_prompts.add(frozenset(item.prompt.items()))
+        
+        # Convert back to list of dictionaries
+        return [dict(p) for p in unique_prompts]

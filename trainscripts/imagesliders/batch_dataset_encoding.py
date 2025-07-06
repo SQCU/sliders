@@ -328,6 +328,29 @@ def initialize_latent_cache(config, environment):
 
 from .data_schedule import TrainingSchedule
 
+def initialize_text_embedding_cache(config, environment, training_schedule):
+    print("Initializing text embedding cache...")
+    tokenizers = environment['tokenizers']
+    text_encoders = environment['text_encoders']
+    device = environment['device']
+    weight_dtype = environment['weight_dtype']
+
+    unique_prompts = training_schedule.get_unique_prompts()
+    text_embedding_cache = {}
+
+    for prompt_dict in tqdm(unique_prompts, desc="Encoding unique prompts"):
+        text_embeddings, pooled_embeds = create_batched_prompt_embeddings(
+            tokenizers,
+            text_encoders,
+            prompt_dict,
+        )
+        # Store the embeddings in CPU memory to save VRAM, move to GPU when needed
+        text_embedding_cache[frozenset(prompt_dict.items())] = (
+            text_embeddings.cpu(), pooled_embeds.cpu()
+        )
+    print(f"Cached {len(unique_prompts)} unique text embeddings.")
+    return text_embedding_cache
+
 def prepare_cached_batches(config, environment):
     """
     Pre-generates and caches all batches for the training loop using the TrainingSchedule.
@@ -336,6 +359,7 @@ def prepare_cached_batches(config, environment):
         initialize_latent_cache(config, environment)
 
     training_schedule = TrainingSchedule(config)
+    text_embedding_cache = initialize_text_embedding_cache(config, environment, training_schedule)
 
     print("Pre-generating and caching all batches from schedule...")
     static_batches = []
@@ -369,13 +393,10 @@ def prepare_cached_batches(config, environment):
             total_latent_encoding_time += encoding_time
             total_latent_load_time += load_time
 
-            text_embeddings, pooled_embeds = create_batched_prompt_embeddings(
-                tokenizers,
-                text_encoders,
-                item.prompt,
-            )
-            all_text_embeddings.append(text_embeddings)
-            all_pooled_embeds.append(pooled_embeds)
+            # Retrieve text embeddings from cache
+            cached_text_embeds, cached_pooled_embeds = text_embedding_cache[frozenset(item.prompt.items())]
+            all_text_embeddings.append(cached_text_embeds.to(device, dtype=weight_dtype))
+            all_pooled_embeds.append(cached_pooled_embeds.to(device, dtype=weight_dtype))
 
         cat_latents_start_time = time.time()
         latents_batch = torch.stack(latents).to(device, dtype=weight_dtype)
@@ -403,6 +424,26 @@ def prepare_cached_batches(config, environment):
             "add_time_ids": add_time_ids,
         }
         static_batches.append(batch)
+
+        # Debug print for the first batch
+        if len(static_batches) == 1:
+            print("\n--- Example Training Batch (First Batch) ---")
+            print("Tensor Shapes:")
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    print(f"  {key}: {value.shape}")
+                else:
+                    print(f"  {key}: {type(value)}")
+            
+            print("\nMetadata for Cached Items:")
+            for i, item in enumerate(batch_items):
+                print(f"  Item {i}:")
+                print(f"    Image Path: {item.image_path}")
+                print(f"    Prompt: {item.prompt}")
+                print(f"    Scale: {item.scale}")
+                print(f"    Pair Index: {item.pair_index}")
+                print(f"    Is Low Case: {item.is_low_case}")
+            print("--------------------------------------------")
 
         total_cat_latents_time += cat_latents_time
         total_cat_text_embeds_time += cat_text_embeds_time

@@ -46,3 +46,33 @@ To address this, the rewritten bounds tester will incorporate a performance-base
 4.  **Recommendation:** The optimal batch size will be recommended based on the highest value achieved *before* the slowdown or an OOM error occurs.
 
 A complex, multiprocessing-based watchdog to monitor for this slowdown was considered but deemed overly complex and brittle for this use case.
+
+## Completed Tasks (as of 2025-07-06)
+
+### 1. Dynamic VAE Batch Size Bounds Tester Refactor
+
+*   **Problem:** The original VAE batch size bounds tester was inefficient, prone to memory overruns, and didn't accurately account for VRAM spillover to paged memory, leading to severe performance degradation.
+*   **Solution:**
+    *   Rewrote `find_optimal_vae_batch_size` in `batch_dataset_encoding.py` to perform incremental batch size testing.
+    *   Implemented a throughput-based heuristic to detect VRAM spillover: if throughput drops significantly (e.g., below 50% of peak), the test stops, indicating the practical VRAM limit.
+    *   Ensured accurate VRAM measurement by explicitly deleting the `unet` model and performing garbage collection before the test.
+    *   The test now provides a clear recommendation for `vae_encoding_batch_size` based on the largest successful batch size and the batch size with the best throughput.
+*   **Verification:** Successfully ran the bounds test, which provided a concrete recommendation for `vae_encoding_batch_size`.
+
+### 2. Decoupling Training Schedule from Data Materialization
+
+*   **Problem:** The original `batch_dataset_encoding.py` tightly coupled the training schedule generation with data loading and materialization, leading to inefficiency and complexity.
+*   **Solution:**
+    *   **Introduced `data_schedule.py`:** Created a new module to house the `TrainingItem` and `TrainingSchedule` classes.
+    *   **`TrainingSchedule`:**
+        *   Now responsible for building a deterministic, pseudo-randomized training schedule based on a configurable seed.
+        *   Generates a master pool of all possible training data combinations (image paths, scales, and prompts).
+        *   For each training step, it samples from this master pool to construct a batch of `TrainingItem` objects.
+        *   `TrainingItem` objects encapsulate all necessary metadata for a single training example within a batch (image path, scale, prompt, pairing information, and whether it's a 'low case' for data augmentation).
+    *   **Refactored `batch_dataset_encoding.py`:**
+        *   Removed the old `ImageScaleDataset` and `collate_fn`.
+        *   Modified `prepare_cached_batches` to directly consume the `TrainingSchedule`. It now iterates through the pre-defined schedule, loads the necessary latents and prompts for each `TrainingItem`, and constructs the final batch dictionary.
+        *   Adjusted import statements to resolve module loading issues when running as a module.
+*   **Verification:** Successfully ran `batch_dataset_encoding.py` (after import fixes), which reported successful preparation of batches using the new `TrainingSchedule`.
+
+These changes significantly improve the efficiency, clarity, and maintainability of the data pipeline, laying the groundwork for more advanced features like distributed training.
