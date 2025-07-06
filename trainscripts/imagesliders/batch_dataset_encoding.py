@@ -495,12 +495,9 @@ def load_models(config, device, weight_dtype):
     #tokenizers = [tokenizer.to(device, weight_dtype) for tokenizer in tokenizers]
     text_encoders = [text_encoder.to(device, weight_dtype) for text_encoder in text_encoders]
     vae = vae.to(device, weight_dtype)
-    #i HATE huggingface wwrappers.
+    #i HATE huggingface wwrappers
 
-    noise_scheduler = create_noise_scheduler(config.train.noise_scheduler) # Initialize directly for single file
-    # Set requires_grad to False and eval mode for inference components
-
-    return vae, unet, tokenizers, text_encoders, noise_scheduler
+    return vae, unet, tokenizers, text_encoders
 
 def create_noise_scheduler(
     scheduler_name: AVAILABLE_SCHEDULERS = "ddpm",
@@ -582,8 +579,9 @@ def config_io():
 def envsetup(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = parse_precision(config.train.precision)
-    vae, unet, tokenizers, text_encoders, noise_scheduler = load_models(config, device, weight_dtype)
+    vae, unet, tokenizers, text_encoders = load_models(config, device, weight_dtype)
 
+    noise_scheduler = create_noise_scheduler(config.train.noise_scheduler) # Initialize directly for single file
     environment = {
         "unet": unet,
         "vae": vae,
