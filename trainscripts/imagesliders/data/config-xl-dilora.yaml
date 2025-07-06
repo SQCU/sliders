@@ -17,6 +17,7 @@ train:
   optimizer: "AdamW"
   lr_scheduler: "cosine"  #or "constant" or "cosine"
   max_denoising_steps: 850
+  batch_size: 4 #now must be assigned here
 save:
   name: "molKM_IL_imageslider" #unused? need to write name as --name "string"
   path: "./models"

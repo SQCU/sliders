@@ -25,6 +25,9 @@ class AttrDict(dict):
             if isinstance(value, dict):
                 self[key] = AttrDict(value)
 
+#this is RADIOACTIVE FUCKING POISON WHY IS THERE LOGIC IN HERE!!!
+#SOMEHOW THIS IS CAUSING THE COLLATE_FN TO REMOVE RANDOM PARTS OF TEXT EMBEDDDING TENSORS WHICH EXIST INSIDE OF OTHER LOGIC!!!!!!
+
 class ImageScaleDataset(Dataset):
     def __init__(self, config, vae, device, weight_dtype, use_latents=True):
         self.config = config
@@ -36,6 +39,9 @@ class ImageScaleDataset(Dataset):
         self.image_paths = []
         self.scales = []
         self.latents = []
+
+        print(config.keys())
+        #print(config.keys().keys())
 
         self.latent_cache_dir = Path(self.config.dataset_config.dataset.folder_main) / "latents"
         os.makedirs(self.latent_cache_dir, exist_ok=True)
@@ -61,7 +67,7 @@ class ImageScaleDataset(Dataset):
 
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.latents)
 
     def __getitem__(self, idx):
         if self.use_latents:
@@ -90,6 +96,8 @@ def collate_fn(batch, tokenizers, text_encoders, config, device, weight_dtype, u
         num_images_per_prompt=len(latents),
     )
 
+    print(f"from collate_fn: te{text_embeddings.shape},pe{pooled_embeds.shape}")
+
     add_time_ids = batch_train_util.get_add_time_ids(
         1024, 1024, False, dtype=latents.dtype
     ).repeat(len(latents), 1).to(device, dtype=weight_dtype)
@@ -104,30 +112,8 @@ def collate_fn(batch, tokenizers, text_encoders, config, device, weight_dtype, u
 
 def dataset_constructor(config, environment, use_latents=True):
     """
-    Initializes and returns a DataLoader for the ImageScaleDataset.
-
-    This function sets up the dataset which pairs images with scaling factors,
-    and then wraps it in a DataLoader for batching. It also handles latent
-    caching and can operate in two modes: either by loading latents directly
-    into memory (`use_latents=True`) or by providing paths to cached latent
-    files (`use_latents=False`).
-
-    Args:
-        config (AttrDict): 
-            A configuration object containing dataset and training parameters.
-            Expected to have `dataset_config` and `train.batch_size`.
-        environment (dict): 
-            A dictionary containing the necessary components for data processing,
-            including the VAE (`vae`), `device`, `weight_dtype`, `tokenizers`,
-            and `text_encoders`.
-        use_latents (bool, optional): 
-            If True, the DataLoader provides batches of pre-loaded latents.
-            If False, it provides batches of paths to latent files.
-            Defaults to True.
-
-    Returns:
-        DataLoader: 
-            A PyTorch DataLoader instance configured for the training loop.
+    THIS IS RADIOACTIVE FUCKING POISON!!!!
+    IT BROKE EVERYTHING WE'RE WOKRING WITH AND FOR SOME REASON HJIDES / ABSTRACTS THE CREATION OF THE ACTUAL DATA!
     """
     dataset = ImageScaleDataset(config, environment['vae'], environment['device'], environment['weight_dtype'], use_latents=use_latents)
     
@@ -178,6 +164,7 @@ class TrainConfig(BaseModel):
     lr_scheduler: str = "constant"
 
     max_denoising_steps: int = 50
+    batch_size: int = 1 #now must be assigned here
 
 
 class SaveConfig(BaseModel):
@@ -229,6 +216,7 @@ def parse_precision(precision: str) -> torch.dtype:
     raise ValueError(f"Invalid precision type: {precision}")
 
 
+#WHY DOES THIS EXIST WHY ARE THERE TWO WAYS TO LOAD A CONFIG THIS HAS BROKEN SO MANY THIGNS
 def load_config_from_yaml_and_merge(config_path: str) -> RootConfig:
     with open(config_path, "r") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)

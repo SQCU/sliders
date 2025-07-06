@@ -53,79 +53,50 @@ def get_batched_noisy_images(
 
 # --- Modular functions for predict_noise_xl and guidance ---
 
-
-def run_unet_inference(
-    unet: torch.nn.Module,
-    latent_model_input: torch.FloatTensor,
-    timestep: torch.Tensor,  # Changed to torch.Tensor
-    text_embeddings: torch.FloatTensor,
-    add_text_embeddings: torch.FloatTensor,
-    add_time_ids: torch.FloatTensor,
-) -> torch.FloatTensor:
-    """
-    Performs the UNet forward pass to predict the noise residual.
-    """
-
-    print(f"latent_model_input shape: {latent_model_input.shape}")
-    print(f"timestep shape: {timestep.shape}")
-    print(f"text_embeddings shape: {text_embeddings.shape}")
-    print(f"add_text_embeddings shape: {add_text_embeddings.shape}")
-    print(f"add_time_ids shape: {add_time_ids.shape}")
-    added_cond_kwargs = {
-        "text_embeds": add_text_embeddings,
-        "time_ids": add_time_ids,
-    }
-    noise_pred = unet(
-        latent_model_input.to(unet.dtype),
-        timestep.to(unet.dtype), # Explicitly cast timestep to unet's dtype
-        encoder_hidden_states=text_embeddings,
-        added_cond_kwargs=added_cond_kwargs,
-    ).sample
-
-
-    return noise_pred
-
-def apply_cfg_guidance(
-    noise_pred: torch.FloatTensor,
-    guidance_scale: float,
-) -> torch.FloatTensor:
-    """
-    Applies classifier-free guidance to the predicted noise.
-    """
-    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-    guided_target = noise_pred_uncond + guidance_scale * (
-        noise_pred_text - noise_pred_uncond
-    )
-    return guided_target
-
 def batched_predict_noise_xl_modular(
     unet: torch.nn.Module,
     scheduler,
     timestep: torch.Tensor, # Changed to torch.Tensor
     latents: torch.FloatTensor,
-    text_embeddings: torch.FloatTensor,
-    add_text_embeddings: torch.FloatTensor,
+    text_embeddings: torch.FloatTensor, # uncond な text embed と cond な text embed を結合したもの
+    add_text_embeddings: torch.FloatTensor, # pooled なやつ
     add_time_ids: torch.FloatTensor,
     guidance_scale: float = 7.5,
-    guidance_rescale: float = 0.7,
 ) -> torch.FloatTensor:
     """
     A modular version of predict_noise_xl, orchestrating the sub-components.
     This function can be easily modified to swap out different guidance strategies.
     """
+
     device = unet.device
     latent_model_input = latents
     latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
 
-    noise_pred = run_unet_inference(
-        unet,
-        latent_model_input.to(device),
-        timestep,
-        text_embeddings.to(device),
-        add_text_embeddings.to(device),
-        add_time_ids.to(device),
-    )
+    added_cond_kwargs = {
+        "text_embeds": add_text_embeddings,
+        "time_ids": add_time_ids,
+    }
+
+    #debugging logging block:
+    print(f"latent_model_input shape: {latent_model_input.shape}")
+    print(f"timestep shape: {timestep.shape}")
+    print(f"text_embeddings shape: {text_embeddings.shape}")
+    print(f"add_text_embeddings shape: {add_text_embeddings.shape}")
+    print(f"add_time_ids shape: {add_time_ids.shape}")
+
+
+    noise_pred = unet(
+        latent_model_input.to(unet.dtype),
+        timestep.to(unet.dtype),
+        text_embeddings.to(unet.dtype),
+        added_cond_kwargs
+    ).sample
     
+    #expects latents to be pre-doubled, 
+    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+    guided_target = noise_pred_uncond + guidance_scale * (
+        noise_pred_text - noise_pred_uncond
+    )
     guided_target = apply_cfg_guidance(noise_pred, guidance_scale)
     
     return guided_target
@@ -133,7 +104,7 @@ def batched_predict_noise_xl_modular(
 def simple_predict_noise_xl(
     unet: UNet2DConditionModel,
     scheduler: SchedulerMixin,
-    timestep: int,
+    timestep: torch.Tensor,
     latents: torch.FloatTensor,
     text_embeddings: torch.FloatTensor,
     add_text_embeddings: torch.FloatTensor,
@@ -149,6 +120,7 @@ def simple_predict_noise_xl(
 
     latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
 
+    #line950 of unet_2d_condition.py. read it and weep.
     added_cond_kwargs = {
         "text_embeds": add_text_embeddings,
         "time_ids": add_time_ids,
@@ -212,17 +184,23 @@ def text_tokenize(
 def text_encode_xl(
     text_encoder: SDXL_TEXT_ENCODER_TYPE,
     tokens: torch.FloatTensor,
-    num_images_per_prompt: int = 1,
+    #num_images_per_prompt: int = 1,
+    #get rid of that horrible operand
 ):
     prompt_embeds = text_encoder(
         tokens.to(text_encoder.device), output_hidden_states=True
     )
     pooled_prompt_embeds = prompt_embeds[0]
+    print(F"pre concatenation pooled prompt embeds of shape:{pooled_prompt_embeds.shape}")
     prompt_embeds = prompt_embeds.hidden_states[-2]  # always penultimate layer
-
-    bs_embed, seq_len, _ = prompt_embeds.shape
-    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-    prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+    print(F"1/3pre concatenation prompt hidden states of shape:{prompt_embeds.shape}")
+    #something weird is happening here.
+    #i think it's part of the upstream batch code they *couldn't get working*.
+    #bs_embed, seq_len, _ = prompt_embeds.shape
+    #prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    #print(F"2/3pre concatenation prompt hidden states of shape:{prompt_embeds.shape}")
+    #prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+    #print(F"3/3pre concatenation prompt hidden states of shape:{prompt_embeds.shape}")
 
     return prompt_embeds, pooled_prompt_embeds
 
@@ -230,7 +208,8 @@ def encode_prompts_xl(
     tokenizers: list[CLIPTokenizer],
     text_encoders: list[SDXL_TEXT_ENCODER_TYPE],
     prompts: list[str],
-    num_images_per_prompt: int = 1,
+    #num_images_per_prompt: int = 1,
+    #get rid of horrible thing
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
     # text_encoder and text_encoder_2's penuultimate layer's output
     text_embeds_list = []
@@ -239,15 +218,20 @@ def encode_prompts_xl(
     for tokenizer, text_encoder in zip(tokenizers, text_encoders):
         text_tokens_input_ids = text_tokenize(tokenizer, prompts)
         text_embeds, pooled_text_embeds = text_encode_xl(
-            text_encoder, text_tokens_input_ids, num_images_per_prompt
+            text_encoder, text_tokens_input_ids, #num_images_per_prompt
         )
 
         text_embeds_list.append(text_embeds)
 
-    bs_embed = pooled_text_embeds.shape[0]
-    pooled_text_embeds = pooled_text_embeds.repeat(1, num_images_per_prompt).view(
-        bs_embed * num_images_per_prompt, -1
-    )
+    print(F"pre susblock prompt hidden states of shape:{pooled_text_embeds.shape}")
+    #suspicious block
+    #something weird is happening here.
+    #i think it's part of the upstream batch code they *couldn't get working*.
+    #bs_embed = pooled_text_embeds.shape[0]
+    #pooled_text_embeds = pooled_text_embeds.repeat(1, num_images_per_prompt).view(
+    #    bs_embed * num_images_per_prompt, -1
+    #)
+    print(F"post susblock prompt hidden states of shape:{pooled_text_embeds.shape}")
 
     return torch.concat(text_embeds_list, dim=-1), pooled_text_embeds
 
@@ -257,6 +241,8 @@ def create_batched_prompt_embeddings(
     text_encoders: list[SDXL_TEXT_ENCODER_TYPE],
     prompts: dict,
     num_images_per_prompt: int = 1,
+    #deprecated but must still accept it for now.
+    #get rid of that horrible thing
 ):
     """
     Creates a batched prompt embedding tensor for use in the training loop.
@@ -267,13 +253,13 @@ def create_batched_prompt_embeddings(
 
     # Encode all prompts
     positive_text_embeds, positive_pooled_embeds = encode_prompts_xl(
-        tokenizers, text_encoders, positive_prompts, num_images_per_prompt
+        tokenizers, text_encoders, positive_prompts, #num_images_per_prompt
     )
     unconditional_text_embeds, unconditional_pooled_embeds = encode_prompts_xl(
-        tokenizers, text_encoders, unconditional_prompts, num_images_per_prompt
+        tokenizers, text_encoders, unconditional_prompts, #num_images_per_prompt
     )
     neutral_text_embeds, neutral_pooled_embeds = encode_prompts_xl(
-        tokenizers, text_encoders, neutral_prompts, num_images_per_prompt
+        tokenizers, text_encoders, neutral_prompts, #num_images_per_prompt
     )
 
     # Concatenate for the UNet
@@ -282,13 +268,14 @@ def create_batched_prompt_embeddings(
         unconditional_text_embeds,
         neutral_text_embeds,
     ], dim=0)
-
+    print(F"from batched_prompt_embeddings post concatenation prompt hidden states of shape:{text_embeddings_for_noise_pred.shape}")
     # Pooled embeds are also needed for XL
     pooled_embeds_for_noise_pred = torch.cat([
         positive_pooled_embeds,
         unconditional_pooled_embeds,
         neutral_pooled_embeds,
     ], dim=0)
+    print(F"from batched_prompt_embeddings post concatenation pooled prompt embeds of shape:{pooled_embeds_for_noise_pred.shape}")
 
     return text_embeddings_for_noise_pred, positive_pooled_embeds
 

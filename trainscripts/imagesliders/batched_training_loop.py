@@ -34,12 +34,12 @@ def config_io():
     config = load_config_from_yaml(args.batchtrainconfig)
     
     inner_config_path = config['obsolete_config']['refpath']
-    print(f"Loading and merging inner config from: {inner_config_path}")
+    #print(f"Loading and merging inner config from: {inner_config_path}")
     # This function is not ideal, but it's what the original code used.
     # It returns a Pydantic model, which we convert to a dict.
-    inner_config_model = load_config_from_yaml_and_merge(inner_config_path)
-    inner_config = inner_config_model.dict()
-    config.update(inner_config)
+    # GET RID OF IT GET RID OF IT GET RID OF IT NO MORE PYDANTIC ERROR FUCK PYDANTIC
+    # NONE OF MY HOMIES USE PYDANTIC
+    config['inner_config']= load_config_from_yaml(inner_config_path)
 
     dset_config_path = config['dset_config']['refpath']
     print(f"Loading dataset config from: {dset_config_path}")
@@ -49,32 +49,32 @@ def config_io():
 
 def envsetup(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    weight_dtype = parse_precision(config.train.precision)
-
-    vae, unet, tokenizers, text_encoders, noise_scheduler = batch_model_util.load_models(config, device, weight_dtype)
+    weight_dtype = parse_precision(config.inner_config.train.precision)
+    scopedconfig = config.inner_config
+    vae, unet, tokenizers, text_encoders, noise_scheduler = batch_model_util.load_models(scopedconfig, device, weight_dtype)
     
     # Cast the entire unet to the correct dtype
     unet.to(device, dtype=weight_dtype)
     
     network = lora.BatchedLoRANetwork(
         unet=unet,
-        rank=config.network.rank,
-        alpha=config.network.alpha,
-        train_method=config.network.training_method,
+        rank=scopedconfig.network.rank,
+        alpha=scopedconfig.network.alpha,
+        train_method=scopedconfig.network.training_method,
     ).to(device, dtype=weight_dtype)
     network.prepare_optimizer_params()
 
-    optimizer_name = config.train.optimizer.lower()
+    optimizer_name = scopedconfig.train.optimizer.lower()
     if optimizer_name == "adamw":
-        optimizer = optim.AdamW(network.parameters(), lr=config.train.lr)
+        optimizer = optim.AdamW(network.parameters(), lr=scopedconfig.train.lr)
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
     lr_scheduler = get_scheduler(
-        name=config.train.lr_scheduler,
+        name=scopedconfig.train.lr_scheduler,
         optimizer=optimizer,
         num_warmup_steps=0,
-        num_training_steps=config.train.iterations,
+        num_training_steps=scopedconfig.train.iterations,
     )
 
     environment = {
@@ -113,7 +113,19 @@ def train_step(environment: dict, batch: dict, seed: int):
     scales = batch["scales"].to(device, dtype=weight_dtype)
     text_embeddings = batch["text_embeddings"].to(device, dtype=weight_dtype)
     pooled_embeds = batch["pooled_embeds"].to(device, dtype=weight_dtype)
+    print(f"unpacked pooled embeds of shape: {pooled_embeds.shape}")
     add_time_ids = batch["add_time_ids"].to(device, dtype=weight_dtype)
+
+    #dataset constructor text embeddings and pooled embeds are formed from the concatenation of these 3 subtensors:
+    #[positive_*_embeds, unconditional_*_embeds, neutral_*_embeds]
+    #since they came in a batch this means they're pre-swizzled (3 per datum) and probably also don't match tensor shape?
+    #for each of our 'pairings' of high/low feature scale, we form a cfg batch like this:
+    #highfeature: cat([unconditional, positive_conditional],dim0)
+    #lowfeature: cat([unconditional, neutral_conditional],dim0) #(strange naming, right?)
+    #this means two (three?) things:
+    # 1: we should form the 'pairing' map for our training batch before loss calculation
+    # 2: we actually choose what prompts annotate a training image based on the feature manifold in that batch???
+    # (? 3: we should probably add some trainable soft prompt parameters to each of our 3 categorical 'prompts'?)
 
     print(f"Shape of initial latents (batch['latents']): {latents.shape}")
 
@@ -122,23 +134,20 @@ def train_step(environment: dict, batch: dict, seed: int):
 
     # --- TIMESTEP LOGIC ---
     with torch.no_grad():
-        noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
+        noise_scheduler.set_timesteps(config.inner_config.train.max_denoising_steps, device=device)
         generator = torch.Generator(device=device).manual_seed(seed)
         
         # Generate a random timestep for each item in the batch
         timesteps_to = torch.randint(
-            1, config.train.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
+            1, config.train.inner_config.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
         ).long()
 
-    # Add noise to latents using the generated timesteps
-    noise = torch.randn(latents.shape, device=latents.device, generator=generator)
-    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps_to)
+        # Add noise to latents using the generated timesteps
+        noise = torch.randn(latents.shape, device=latents.device, generator=generator)
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps_to)
     
     # --- END TIMESTEP LOGIC ---
 
-    # Set LoRA scales for the current batch
-    batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-    network.set_lora_scales(batched_scales)
 
     # Predict noise
     with network:
@@ -153,6 +162,10 @@ def train_step(environment: dict, batch: dict, seed: int):
         text_embeddings_cfg = torch.cat([text_embeddings, text_embeddings], dim=0)
         pooled_embeds_cfg = torch.cat([pooled_embeds, pooled_embeds], dim=0)
         add_time_ids_cfg = torch.cat([add_time_ids, add_time_ids], dim=0)
+        # Set LoRA scales, which must match the doubled cfg axis.
+        batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        batched_scales_cfg = torch.cat([batched_scales,batched_scales], dim=0)
+        network.set_lora_scales(batched_scales)
 
         print(f"Shape of unet_timesteps_cfg: {unet_timesteps_cfg.shape}")
         print(f"Shape of noisy_latents_cfg: {noisy_latents_cfg.shape}")
@@ -178,6 +191,7 @@ def train_step(environment: dict, batch: dict, seed: int):
     loss_per_item = loss_per_element.mean(dim=list(range(1, loss_per_element.ndim)))
 
     # Dynamically pair up high and low scale losses
+    # ATTNTION! REWRITE PAIR SELECTION TO START OF BATCH STEP! ATTENTION! 
     unique_scales = torch.unique(scales)
     if len(unique_scales) < 2:
         # Cannot form pairs, fall back to mean loss for the entire batch
@@ -264,6 +278,7 @@ def main():
     run the training loop, and handle shutdown.
     """
     # Load configuration using the local config_io
+    # subdicts are accessible through attrdict by name 
     config = AttrDict(config_io())
 
     # Set up the training environment using the local envsetup
@@ -271,6 +286,7 @@ def main():
 
     # Create the dataset and dataloader
     # We use use_latents=False to get paths, which are then loaded in the list comprehension
+    #must pass inner config or something 
     dataloader = dataset_constructor(config, environment, use_latents=False)
 
     # Pre-generate all batches to create a static dataset for the training loop
