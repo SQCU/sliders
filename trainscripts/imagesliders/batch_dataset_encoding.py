@@ -115,54 +115,39 @@ def save_latents_to_disk(latents, output_dir, image_path, vae_state_dict):
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=4)
 
-def check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, vae_state_dict):
+def check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, force_reencode=False):
     latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
     latent_path = os.path.join(output_dir, latent_filename)
-    metadata_filename = os.path.splitext(os.path.basename(image_path))[0] + ".json"
-    metadata_path = os.path.join(output_dir, metadata_filename)
 
-    current_image_checksum, image_checksum_time = get_sha256_checksum(image_path)
-    
-    current_vae_checksum_hasher = hashlib.sha256()
-    for k, v in vae_state_dict.items():
-        current_vae_checksum_hasher.update(k.encode('utf-8'))
-        current_vae_checksum_hasher.update(v.cpu().to(torch.float32).numpy().tobytes())
-    current_vae_checksum = current_vae_checksum_hasher.hexdigest()
-
-    total_checksum_time = image_checksum_time
     latent_encoding_time = 0
 
-    if os.path.exists(latent_path) and os.path.exists(metadata_path):
-        try:
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
-            
-            latent_file_checksum, latent_checksum_time = get_sha256_checksum(latent_path)
-            total_checksum_time += latent_checksum_time
-
-            if (metadata.get("image_checksum") == current_image_checksum and
-                metadata.get("vae_checksum") == current_vae_checksum and
-                metadata.get("latent_checksum") == latent_file_checksum):
-                # print(f"Latents for {image_path} are already cached and valid. Skipping.")
-                return True, latent_encoding_time, total_checksum_time
-            else:
-                print(f"Latents for {image_path} are outdated or corrupted. Re-encoding.")
-        except (json.JSONDecodeError, FileNotFoundError):
-            print(f"Metadata for {image_path} is corrupted or missing. Re-encoding.")
+    if not force_reencode and os.path.exists(latent_path):
+        # If not forcing re-encode and latent exists, assume it's valid for now
+        # (checksumming logic removed as per instruction)
+        return True, latent_encoding_time
     else:
-        print(f"Latents for {image_path} not found. Encoding.")
+        if force_reencode:
+            print(f"Force re-encoding latents for {image_path}.")
+        else:
+            print(f"Latents for {image_path} not found. Encoding.")
 
     image = Image.open(image_path).convert("RGB")
     latents, encoding_time = encode_images_to_latents([image], vae, device, weight_dtype)
     latent_encoding_time += encoding_time
     save_latents_to_disk(latents, output_dir, image_path, vae_state_dict)
-    return False, latent_encoding_time, total_checksum_time
+    return False, latent_encoding_time
 
-def get_latent_for_image(image_path, vae, device, weight_dtype, output_dir, vae_state_dict):
-    _, encoding_time, checksum_time = check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, vae_state_dict)
+def get_latent_for_image(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, force_reencode=False):
+    is_cached, encoding_time = check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, force_reencode=force_reencode)
     latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
     latent_path = os.path.join(output_dir, latent_filename)
-    return torch.load(latent_path), encoding_time, checksum_time
+    
+    load_start_time = time.time()
+    loaded_latent = torch.load(latent_path, weights_only=True)
+    load_end_time = time.time()
+    latent_load_time = load_end_time - load_start_time
+
+    return loaded_latent, encoding_time, latent_load_time
 
 # --- Copied from batch_train_util.py for self-containment ---
 
@@ -318,19 +303,27 @@ class ImageScaleDataset(Dataset):
 def collate_fn(batch, tokenizers, text_encoders, config, vae, device, weight_dtype):
     image_paths, scales, prompts_data = zip(*batch)
     
+    def collate_fn(batch, tokenizers, text_encoders, config, vae, device, weight_dtype):
+    image_paths, scales, prompts_data = zip(*batch)
+    
     latents = []
     total_encoding_time_batch = 0
-    total_checksum_time_batch = 0
+    total_latent_load_time_batch = 0
+
+    force_reencode = config.train.get("force_reencode_latents", False)
 
     for img_path in image_paths:
-        latent, encoding_time, checksum_time = get_latent_for_image(
-            img_path, vae, device, weight_dtype, Path(config.dataset_config.dataset.folder_main) / "latents", vae.state_dict()
+        latent, encoding_time, latent_load_time = get_latent_for_image(
+            img_path, vae, device, weight_dtype, Path(config.dataset_config.dataset.folder_main) / "latents", vae.state_dict(), force_reencode=force_reencode
         )
         latents.append(latent)
         total_encoding_time_batch += encoding_time
-        total_checksum_time_batch += checksum_time
+        total_latent_load_time_batch += latent_load_time
 
+    cat_latents_start_time = time.time()
     latents = torch.cat(latents, dim=0).to(device, dtype=weight_dtype)
+    cat_latents_end_time = time.time()
+    cat_latents_time = cat_latents_end_time - cat_latents_start_time
 
     scales = torch.tensor(scales, dtype=weight_dtype, device=device)
     
@@ -346,8 +339,15 @@ def collate_fn(batch, tokenizers, text_encoders, config, vae, device, weight_dty
         all_text_embeddings.append(text_embeddings)
         all_pooled_embeds.append(pooled_embeds)
 
+    cat_text_embeds_start_time = time.time()
     text_embeddings_batch = torch.cat(all_text_embeddings, dim=0).to(device, dtype=weight_dtype)
+    cat_text_embeds_end_time = time.time()
+    cat_text_embeds_time = cat_text_embeds_end_time - cat_text_embeds_start_time
+
+    cat_pooled_embeds_start_time = time.time()
     pooled_embeds_batch = torch.cat(all_pooled_embeds, dim=0).to(device, dtype=weight_dtype)
+    cat_pooled_embeds_end_time = time.time()
+    cat_pooled_embeds_time = cat_pooled_embeds_end_time - cat_pooled_embeds_start_time
 
     add_time_ids = get_add_time_ids(
         1024, 1024, False, dtype=latents.dtype
@@ -360,7 +360,10 @@ def collate_fn(batch, tokenizers, text_encoders, config, vae, device, weight_dty
         "pooled_embeds": pooled_embeds_batch,
         "add_time_ids": add_time_ids,
         "profiling_encoding_time": total_encoding_time_batch,
-        "profiling_checksum_time": total_checksum_time_batch,
+        "profiling_latent_load_time": total_latent_load_time_batch,
+        "profiling_cat_latents_time": cat_latents_time,
+        "profiling_cat_text_embeds_time": cat_text_embeds_time,
+        "profiling_cat_pooled_embeds_time": cat_pooled_embeds_time,
     }
 
 def dataset_constructor(config, environment):
@@ -382,16 +385,25 @@ def prepare_cached_batches(config, environment):
     print("Pre-generating and caching all batches...")
     static_batches = []
     total_latent_encoding_time = 0
-    total_checksum_time = 0
+    total_latent_load_time = 0
+    total_cat_latents_time = 0
+    total_cat_text_embeds_time = 0
+    total_cat_pooled_embeds_time = 0
 
     for i, batch in enumerate(tqdm(dataloader, desc="Caching batches")):
         static_batches.append(batch)
         total_latent_encoding_time += batch["profiling_encoding_time"]
-        total_checksum_time += batch["profiling_checksum_time"]
+        total_latent_load_time += batch["profiling_latent_load_time"]
+        total_cat_latents_time += batch["profiling_cat_latents_time"]
+        total_cat_text_embeds_time += batch["profiling_cat_text_embeds_time"]
+        total_cat_pooled_embeds_time += batch["profiling_cat_pooled_embeds_time"]
     
     print(f"Cached {len(static_batches)} batches.")
     print(f"Total time spent in latent encoding: {total_latent_encoding_time:.4f} seconds")
-    print(f"Total time spent in checksums: {total_checksum_time:.4f} seconds")
+    print(f"Total time spent in latent loading: {total_latent_load_time:.4f} seconds")
+    print(f"Total time spent concatenating latents: {total_cat_latents_time:.4f} seconds")
+    print(f"Total time spent concatenating text embeddings: {total_cat_text_embeds_time:.4f} seconds")
+    print(f"Total time spent concatenating pooled embeddings: {total_cat_pooled_embeds_time:.4f} seconds")
 
     return static_batches
 
