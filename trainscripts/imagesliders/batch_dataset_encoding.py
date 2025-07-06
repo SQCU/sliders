@@ -303,25 +303,42 @@ class ImageScaleDataset(Dataset):
 def collate_fn(batch, tokenizers, text_encoders, config, vae, device, weight_dtype):
     image_paths, scales, prompts_data = zip(*batch)
     
-    def collate_fn(batch, tokenizers, text_encoders, config, vae, device, weight_dtype):
-    image_paths, scales, prompts_data = zip(*batch)
+    images_to_encode_paths = []
+    images_to_encode = []
+    latents = [None] * len(image_paths)
     
-    latents = []
     total_encoding_time_batch = 0
     total_latent_load_time_batch = 0
 
     force_reencode = config.train.get("force_reencode_latents", False)
 
-    for img_path in image_paths:
-        latent, encoding_time, latent_load_time = get_latent_for_image(
-            img_path, vae, device, weight_dtype, Path(config.dataset_config.dataset.folder_main) / "latents", vae.state_dict(), force_reencode=force_reencode
-        )
-        latents.append(latent)
+    # First pass: check for cached latents and collect images that need encoding
+    for i, img_path in enumerate(image_paths):
+        latent_path = os.path.join(Path(config.dataset_config.dataset.folder_main) / "latents", os.path.splitext(os.path.basename(img_path))[0] + ".pt")
+        if not force_reencode and os.path.exists(latent_path):
+            # Load from cache
+            load_start_time = time.time()
+            latents[i] = torch.load(latent_path, weights_only=True)
+            total_latent_load_time_batch += time.time() - load_start_time
+        else:
+            images_to_encode_paths.append(img_path)
+            images_to_encode.append(Image.open(img_path).convert("RGB"))
+
+    # Batch encode the collected images
+    if images_to_encode:
+        encoded_latents, encoding_time = encode_images_to_latents(images_to_encode, vae, device, weight_dtype)
         total_encoding_time_batch += encoding_time
-        total_latent_load_time_batch += latent_load_time
+        
+        # Save the newly encoded latents and place them in the correct positions in the latents list
+        current_latent_idx = 0
+        for i, img_path in enumerate(image_paths):
+            if latents[i] is None:
+                save_latents_to_disk(encoded_latents[current_latent_idx].unsqueeze(0), Path(config.dataset_config.dataset.folder_main) / "latents", img_path, vae.state_dict())
+                latents[i] = encoded_latents[current_latent_idx]
+                current_latent_idx += 1
 
     cat_latents_start_time = time.time()
-    latents = torch.cat(latents, dim=0).to(device, dtype=weight_dtype)
+    latents = torch.stack(latents).to(device, dtype=weight_dtype)
     cat_latents_end_time = time.time()
     cat_latents_time = cat_latents_end_time - cat_latents_start_time
 
@@ -375,11 +392,73 @@ def dataset_constructor(config, environment):
     dataloader = DataLoader(dataset, batch_size=config.train.batch_size, shuffle=True, collate_fn=collate_wrapper)
     return dataloader
 
+def initialize_latent_cache(config, environment):
+    dataset = ImageScaleDataset(config)
+    unique_image_paths = sorted(list(set(dataset.image_paths))) # sorted for determinism
+    print(f"Found {len(unique_image_paths)} unique images to process for latent cache initialization.")
+
+    vae = environment['vae']
+    device = environment['device']
+    weight_dtype = environment['weight_dtype']
+    output_dir = Path(config.dataset_config.dataset.folder_main) / "latents"
+    
+    # Let's use a batch size from the config, or a default.
+    # The main training batch size might be too large for VAE encoding depending on image size.
+    # Let's add a specific config for this.
+    vae_batch_size = config.train.get("vae_encoding_batch_size", 4)
+    print(f"Using VAE encoding batch size: {vae_batch_size}")
+
+    total_comparison_time = 0
+    mismatched_files = 0
+
+    for i in tqdm(range(0, len(unique_image_paths), vae_batch_size), desc="Initializing latent cache"):
+        batch_paths = unique_image_paths[i:i+vae_batch_size]
+        
+        images_to_encode = [Image.open(p).convert("RGB") for p in batch_paths]
+        
+        # Encode the batch of images
+        new_latents_gpu, encoding_time = encode_images_to_latents(images_to_encode, vae, device, weight_dtype)
+        new_latents_cpu = new_latents_gpu.cpu()
+
+        # Compare and save for each image in the batch
+        for j, img_path in enumerate(batch_paths):
+            new_latent_single = new_latents_cpu[j].unsqueeze(0)
+            
+            latent_filename = os.path.splitext(os.path.basename(img_path))[0] + ".pt"
+            latent_path = os.path.join(output_dir, latent_filename)
+
+            if os.path.exists(latent_path):
+                try:
+                    old_latent = torch.load(latent_path, map_location='cpu')
+                    
+                    comparison_start_time = time.time()
+                    are_close = torch.allclose(old_latent, new_latent_single, atol=1e-4, rtol=1e-3) # Use tolerances
+                    comparison_time = time.time() - comparison_start_time
+                    total_comparison_time += comparison_time
+                    
+                    if not are_close:
+                        mismatched_files += 1
+                        diff = torch.mean(torch.abs(old_latent - new_latent_single))
+                        print(f"Latent mismatch for {img_path}. Mean absolute difference: {diff.item()}. Comparison took {comparison_time:.4f}s.")
+                except Exception as e:
+                    print(f"Warning: Could not load or compare existing latent for {img_path}: {e}")
+
+            # Save the new latent, overwriting if it exists
+            torch.save(new_latent_single, latent_path)
+            
+    print(f"Latent cache initialization finished.")
+    print(f"Total time spent on parity checks: {total_comparison_time:.4f} seconds.")
+    if mismatched_files > 0:
+        print(f"Found {mismatched_files} mismatched latents that were updated.")
+
 def prepare_cached_batches(config, environment):
     """
     Pre-generates and caches all batches for the training loop.
     Includes profiling for latent encoding and parity checks.
     """
+    if config.train.get("force_init_latentcache", False):
+        initialize_latent_cache(config, environment)
+
     dataloader = dataset_constructor(config, environment)
 
     print("Pre-generating and caching all batches...")
@@ -548,6 +627,85 @@ def setup_logging():
     return log_filename, original_stdout, original_stderr
 
 
+import torch.cuda as cuda
+
+def get_memory_usage():
+    # Return memory usage in MB
+    return {
+        'allocated': cuda.memory_allocated() / 1024**2,
+        'reserved': cuda.memory_reserved() / 1024**2,
+        'peak': cuda.max_memory_allocated() / 1024**2
+    }
+
+def find_optimal_vae_batch_size(config, environment):
+    print("--- Starting VAE Batch Size Bounds Test ---")
+    dataset = ImageScaleDataset(config)
+    unique_image_paths = sorted(list(set(dataset.image_paths)))
+    if not unique_image_paths:
+        print("No unique images found to perform bounds test.")
+        return
+
+    vae = environment['vae']
+    device = environment['device']
+    weight_dtype = environment['weight_dtype']
+
+    # Get a representative subset of images for the test
+    num_test_images = min(len(unique_image_paths), 64) # Use up to 64 images for the test
+    test_images = [Image.open(p).convert("RGB") for p in unique_image_paths[:num_test_images]]
+
+    results = []
+    max_batch_size_to_test = 32 # A reasonable upper limit to test
+
+    for batch_size in range(1, max_batch_size_to_test + 1):
+        print(f"\nTesting VAE encoding with batch size: {batch_size}")
+        
+        # Reset peak memory stats
+        cuda.reset_peak_memory_stats()
+
+        try:
+            # Warm-up run
+            _ = encode_images_to_latents(test_images[:batch_size], vae, device, weight_dtype)
+
+            # Timed run
+            start_time = time.time()
+            num_iterations = (num_test_images // batch_size)
+            for i in range(num_iterations):
+                batch_images = test_images[i*batch_size:(i+1)*batch_size]
+                if not batch_images: continue
+                _, _ = encode_images_to_latents(batch_images, vae, device, weight_dtype)
+            
+            torch.cuda.synchronize() # Wait for all kernels to complete
+            end_time = time.time()
+
+            total_time = end_time - start_time
+            images_per_second = (num_iterations * batch_size) / total_time
+            peak_mem = get_memory_usage()['peak']
+
+            results.append({
+                'batch_size': batch_size,
+                'images_per_second': images_per_second,
+                'peak_vram_mb': peak_mem
+            })
+            print(f"  Throughput: {images_per_second:.2f} images/sec, Peak VRAM: {peak_mem:.2f} MB")
+
+        except Exception as e:
+            print(f"  Failed with batch size {batch_size}: {e}")
+            # Assuming OOM or similar, we stop here
+            break
+
+    print("\n--- VAE Batch Size Bounds Test Summary ---")
+    if not results:
+        print("No successful runs to summarize.")
+        return
+
+    for res in results:
+        print(f"Batch Size: {res['batch_size']:<10} | Throughput: {res['images_per_second']:<8.2f} images/sec | Peak VRAM: {res['peak_vram_mb']:<8.2f} MB")
+
+    # Find the batch size with the best throughput
+    best_result = max(results, key=lambda x: x['images_per_second'])
+    print(f"\nOptimal VAE batch size based on throughput: {best_result['batch_size']}")
+    print("Consider setting 'vae_encoding_batch_size' in your config to this value.")
+
 def main():
     log_file_path, orig_stdout, orig_stderr = setup_logging()
     try:
@@ -556,15 +714,18 @@ def main():
         
         config = config_io()
         environment = envsetup(config)
-        
-        # We only need VAE, tokenizers, text_encoders for batch caching
-        # Unet and noise_scheduler are not used in prepare_cached_batches
-        # but are part of the environment returned by envsetup.
-        # We can clean them up if memory is an issue, but for now, keep for simplicity.
 
-        static_batches = prepare_cached_batches(config, environment)
-        
-        print(f"Successfully prepared {len(static_batches)} batches.", file=orig_stdout)
+        if config.train.get("bounds_test_vae_batch_size", False):
+            find_optimal_vae_batch_size(config, environment)
+        else:
+            # We only need VAE, tokenizers, text_encoders for batch caching
+            # Unet and noise_scheduler are not used in prepare_cached_batches
+            # but are part of the environment returned by envsetup.
+            # We can clean them up if memory is an issue, but for now, keep for simplicity.
+
+            static_batches = prepare_cached_batches(config, environment)
+            
+            print(f"Successfully prepared {len(static_batches)} batches.", file=orig_stdout)
         
     except Exception as e:
         import traceback
@@ -580,6 +741,7 @@ def main():
         sys.stdout = orig_stdout
         sys.stderr = orig_stderr
         print(f"--- Script finished. Log saved to {log_file_path} ---", file=orig_stdout)
+
 
 if __name__ == "__main__":
     main()
