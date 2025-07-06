@@ -37,21 +37,23 @@ import argparse
 # The current issue is that the latent caching process is slow, often re-computing latents for unchanged images.
 # This suggests issues with the cache validation or the VAE encoding process itself.
 
-# --- Checklist for Diagnosing Latent Caching and Batching Slowdown ---
-# 1.  **Verify Cache Invalidation Logic:**
-#     *   Ensure the VAE checksum calculation is stable and accurately reflects VAE changes, not just string representations.
-#     *   Confirm that image checksums are correctly generated and compared.
-# 2.  **Profile Latent Encoding Time:**
-#     *   Measure the time taken for `vae.encode()` calls with varying batch sizes.
-#     *   Compare the time for individual image encoding vs. batched encoding.
-# 3.  **Optimize VAE Input Batching:**
-#     *   Determine the largest VAE input image batch that can be processed concurrently without OOM errors.
-#     *   Adjust the `collate_fn` to create batches of images (not just paths) for VAE encoding, up to the optimal batch size.
-# 4.  **Profile Parity Check Mechanism:**
-#     *   Measure the time cost of `get_sha256_checksum` for both image files and latent files.
-#     *   Evaluate if the overhead of checksumming is significant compared to re-encoding.
-# 5.  **Analyze Dataset Repetition:**
-#     *   Confirm that the `ImageScaleDataset.__getitem__` correctly cycles through `image_paths` and `prompts_data` to avoid redundant computations for the same physical image/prompt combination within a single epoch.
+#            #scale_to_look = abs(random.choice(list(scales_unique)))
+#cales_to_look = random.sample(list(scales_unique),2)   #2 choices
+scales_to_look.sort()   #smaller first idx
+
+#folder1 = folders[scales==-scale_to_look][0]
+#folder2 = folders[scales==scale_to_look][0]
+#use lowest then highest
+folder1 = folders[scales==scales_to_look[-1]][0]
+folder2 = folders[scales==scales_to_look[0]][0]
+
+ims = os.listdir(f'{folder_main}/{folder1}/')
+ims = [im_ for im_ in ims if '.png' in im_ or '.jpg' in im_ or '.jpeg' in im_ or '.webp' in im_]
+random_sampler = random.randint(0, len(ims)-1)
+
+#...
+img1 = Image.open(f'{folder_main}/{folder1}/{ims[random_sampler]}').resize((512,512))#
+img2 = Image.open(f'{folder_main}/{folder2}/{ims[random_sampler]}').resize((512,512))#
 
 #DO NOT DELETE THESE HYPERPARAMETERS. WHY WOULD YOU EVEN THINK OF SUCH A THING.
 UNET_ATTENTION_TIME_EMBED_DIM = 256  # XL
