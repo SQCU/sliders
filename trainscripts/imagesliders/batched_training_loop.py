@@ -20,6 +20,8 @@ from .batch_config_util import (
 from . import batch_lora as lora
 from . import batch_train_util
 from . import batch_model_util
+#new slider algo related tensor formation code
+from . import batch_slider_algo
 
 
 def config_io():
