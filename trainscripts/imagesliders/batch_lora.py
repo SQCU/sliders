@@ -91,15 +91,30 @@ class BatchedLoRAModule(nn.Module):
         print(f"  LoRA down weight shape: {self.lora_down.weight.shape}")
         """
         lora_output = self.lora_up(self.lora_down(x))
+        # RE: MULTIPLIER SHAPE ERROR:
+        # --- THE FIX ---
+        # Get the current multiplier and ensure it's on the correct device
+        multiplier = self.current_multiplier.to(x.device, dtype=x.dtype)
+        # Reshape the multiplier to match the output dimensions for broadcasting
+        # This handles both Linear (2D) and Conv2d (4D) outputs automatically
+        while len(multiplier.shape) < len(lora_output.shape):
+            multiplier = multiplier.unsqueeze(-1)
+
+        # For a Linear layer: (16, 1) -> stays (16, 1) - works with (16, N) output
+        # For a Conv2d layer: (16, 1) -> (16, 1, 1, 1) - works with (16, C, H, W) output
+
+        original_output = self.org_forward(x)
         """
         print(f"  LoRA output shape: {lora_output.shape}")
         print(f"  Original forward output shape: {self.org_forward(x).shape}")
         print(f"  Current multiplier shape: {self.current_multiplier.shape}")
         """
-        return (
-            self.org_forward(x)
-            + lora_output * self.current_multiplier * self.scale
+        return ( original_output 
+        + lora_output * multiplier * self.scale
         )
+        
+        
+
 
 
 class BatchedLoRANetwork(nn.Module):
