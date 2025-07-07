@@ -33,13 +33,6 @@ from . import batch_train_util
 from . import batch_model_util
 from typing import List, Dict, Tuple, Any
 
-
-
-
-
-
-
-
 from .data_schedule import TrainingSchedule # Import TrainingSchedule
 
 # --- Copied from batch_dataset_encoding.py for self-containment ---
@@ -397,19 +390,19 @@ def train_step(environment: dict, batch: dict, seed: int):
     # --- END TIMESTEP LOGIC ---
 
     # Form CFG microbatch
-    latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg = prepare_cfg_batch(
-        batch,
-        noisy_latents,
-        timesteps_to,
-        noise_scheduler,
-        weight_dtype,
-    )
+        latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg = prepare_cfg_batch(
+            batch,
+            noisy_latents,
+            timesteps_to,
+            noise_scheduler,
+            weight_dtype,
+        )
 
     # Set LoRA scales, which must match the doubled cfg axis.
     #batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     #hopefully a [batchdim,1] tensor has shape (16,1) -> broadcasts to variably shaped unet layers?
-    batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
-    network.set_lora_scales(batched_scales_cfg)
+        batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
+        network.set_lora_scales(batched_scales_cfg)
 
     with network:
         print(f"Shape of unet_timesteps_cfg: {unet_timesteps_cfg.shape}")
@@ -487,7 +480,8 @@ def main():
     torch.cuda.empty_cache()
 
     # Prepare cached batches (image latents and text embeddings)
-    static_batches = prepare_cached_batches(config, environment)
+    with torch.no_grad():
+        static_batches = prepare_cached_batches(config, environment)
     
     # Unload VAE and Text Encoders to CPU after batch preparation
     vae = environment.pop('vae')
@@ -501,6 +495,10 @@ def main():
 
     # Load UNet back to GPU for training
     unet.to(environment['device'])
+    #WOOO COMPILE TIME!!!
+    #if config.other.torch_compile:
+    print("compiling unet for very fast hayai")
+    unet = torch.compile(unet, mode="reduce-overhead", fullgraph=True)
     environment['unet'] = unet
 
     # Create adapter network
@@ -510,15 +508,19 @@ def main():
         alpha=config.network.alpha,
         train_method=config.network.training_method,
     ).to(environment['device'], dtype=environment['weight_dtype'])
-    network.prepare_optimizer_params()
-    environment['network'] = network
 
-    optimizer_name = config.train.optimizer.lower()
-    if optimizer_name == "adamw":
-        optimizer = optim.AdamW(network.parameters(), lr=config.train.lr)
-    else:
-        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
-    environment['optimizer'] = optimizer
+    #slurp optimizer args from config
+    optimizer_kwargs = {}
+    if hasattr(config.train, "optimizer_args") and config.train.optimizer_args is not None and len(config.train.optimizer_args) > 0:
+        for arg in config.train.optimizer_args.split(" "):
+            key, value = arg.split("=")
+            value = ast.literal_eval(value)
+            optimizer_kwargs[key] = value
+    environment['network'] = network
+    #optimizer_module = train_util.get_optimizer(config.train.optimizer)
+    optimizer = environment['optimizer'](network.prepare_optimizer_params(),
+    lr=config.train.lr, 
+    **optimizer_kwargs )
 
     lr_scheduler = get_scheduler(
         name=config.train.lr_scheduler,
@@ -526,6 +528,7 @@ def main():
         num_warmup_steps=0,
         num_training_steps=config.train.iterations,
     )
+    environment['optimizer']=optimizer#yes this switcharoo is necessary
     environment['lr_scheduler'] = lr_scheduler
 
     # Run the training loop with the static batches

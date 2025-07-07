@@ -17,25 +17,13 @@ class BatchedLoRAModule(nn.Module):
     The `multiplier` is expected to be a torch.Tensor, allowing different LoRA scales
     to be applied to different items within a batch.
     """
-
     def __init__(
         self,
         lora_name: str,
         org_module: nn.Module,
         lora_dim: int = 4,
-        alpha: Union[float, torch.Tensor] = 1.0,
+        alpha: float = 1.0, # Alpha is now a float
     ):
-        """
-        Initializes the BatchedLoRAModule.
-
-        Args:
-            lora_name (str): A unique name for this LoRA module.
-            org_module (nn.Module): The original module (e.g., nn.Linear, nn.Conv2d)
-                                     whose forward pass will be augmented.
-            lora_dim (int): The rank of the LoRA approximation matrices (A and B).
-            alpha (Union[float, torch.Tensor]): The scaling factor for the LoRA update.
-                                                 Can be a float or a tensor for batched scaling.
-        """
         super().__init__()
         self.lora_name = lora_name
         self.lora_dim = lora_dim
@@ -49,80 +37,59 @@ class BatchedLoRAModule(nn.Module):
         elif "Conv" in org_module.__class__.__name__:
             in_dim = org_module.in_channels
             out_dim = org_module.out_channels
-
             self.lora_dim = min(self.lora_dim, in_dim, out_dim)
             if self.lora_dim != lora_dim:
                 print(f"WARNING: {lora_name} dim (rank) is changed to: {self.lora_dim}")
-
             kernel_size = org_module.kernel_size
             stride = org_module.stride
             padding = org_module.padding
-            self.lora_down = nn.Conv2d(
-                in_dim, self.lora_dim, kernel_size, stride, padding, bias=False
-            )
+            self.lora_down = nn.Conv2d(in_dim, self.lora_dim, kernel_size, stride, padding, bias=False)
             self.lora_up = nn.Conv2d(self.lora_dim, out_dim, (1, 1), (1, 1), bias=False)
         else:
             raise NotImplementedError(f"LoRA not implemented for module type: {org_module.__class__.__name__}")
 
-        # Alpha can be a float or a tensor. If float, convert to tensor for consistent operations.
-        self.alpha = torch.tensor(alpha) if isinstance(alpha, (int, float)) else alpha
-        self.scale = self.alpha / self.lora_dim
-        self.register_buffer("current_multiplier", torch.tensor(0.0)) # Will be updated by BatchedLoRANetwork
+        self.scale = alpha / self.lora_dim
+        # The multiplier will be set by the network and used by LoRAInjectedLayer
+        self.register_buffer("current_multiplier", torch.tensor(0.0))
 
-        # Initialize weights
         nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_up.weight)
 
+
         self.org_module = org_module  # Keep reference to original module for forward pass
 
-    def apply_to(self):
-        """
-        Replaces the forward method of the original module with this LoRA module's forward.
-        """
-        self.org_forward = self.org_module.forward
-        self.org_module.forward = self.forward
-        # The original module reference is kept for its parameters and state_dict,
-        # but its forward method is now overridden.
+class LoRAInjectedLayer(nn.Module):
+    """
+    A container that holds an original layer and its corresponding LoRA layer.
+    This replaces the original layer in the model hierarchy and is torch.compile-friendly.
+    """
+    def __init__(self, org_module: nn.Module, lora_module: BatchedLoRAModule):
+        super().__init__()
+        self.org_module = org_module
+        self.lora_module = lora_module
 
     def forward(self, x):
-        """
-        print(f"LoRA Layer: {self.lora_name}")
-        print(f"  Input shape: {x.shape}")
-        print(f"  LoRA down weight shape: {self.lora_down.weight.shape}")
-        """
-        lora_output = self.lora_up(self.lora_down(x))
-        # RE: MULTIPLIER SHAPE ERROR:
-        # --- THE FIX ---
-        # Get the current multiplier and ensure it's on the correct device
-        multiplier = self.current_multiplier.to(x.device, dtype=x.dtype)
-        # Reshape the multiplier to match the output dimensions for broadcasting
-        # This handles both Linear (2D) and Conv2d (4D) outputs automatically
+        # Get the original output by calling the original module directly
+        original_output = self.org_module(x)
+        
+        # Calculate the lora update
+        lora_output = self.lora_module.lora_up(self.lora_module.lora_down(x))
+
+        # Get the multiplier and prepare it for broadcasting
+        multiplier = self.lora_module.current_multiplier.to(x.device, dtype=x.dtype)
         while len(multiplier.shape) < len(lora_output.shape):
             multiplier = multiplier.unsqueeze(-1)
-
-        # For a Linear layer: (16, 1) -> stays (16, 1) - works with (16, N) output
-        # For a Conv2d layer: (16, 1) -> (16, 1, 1, 1) - works with (16, C, H, W) output
-
-        original_output = self.org_forward(x)
-        """
-        print(f"  LoRA output shape: {lora_output.shape}")
-        print(f"  Original forward output shape: {self.org_forward(x).shape}")
-        print(f"  Current multiplier shape: {self.current_multiplier.shape}")
-        """
-        return ( original_output 
-        + lora_output * multiplier * self.scale
-        )
-        
-        
+            
+        # Apply the scaled LoRA update
+        return original_output + lora_output * multiplier * self.lora_module.scale
 
 
-
+    
 class BatchedLoRANetwork(nn.Module):
     """
     Manages a collection of BatchedLoRAModule instances for a UNet.
     Allows setting a batch of LoRA scales to be applied concurrently.
     """
-
     def __init__(
         self,
         unet: nn.Module, # Can be UNet2DConditionModel or any nn.Module with Linear/Conv2d layers
@@ -171,19 +138,43 @@ class BatchedLoRANetwork(nn.Module):
 
     def _create_and_apply_modules(self, root_module: nn.Module):
         """
-        Recursively finds target modules in the UNet and creates/applies BatchedLoRAModule instances.
+        Recursively finds target modules in the UNet, creates LoRA modules,
+        and REPLACES them with LoRAInjectedLayer instances.
         """
-        for name, module in root_module.named_modules():
-            if self._should_apply_lora(name, module):
-                for child_name, child_module in module.named_children():
+        modules_to_replace = []
+        # Use named_modules() to get the unique path (name) and the module instance
+        for parent_name, parent_module in root_module.named_modules():
+            if self._should_apply_lora(parent_name, parent_module):
+                for child_name, child_module in parent_module.named_children():
+                    # We check the child type directly
                     if child_module.__class__.__name__ in ["Linear", "Conv2d", "LoRACompatibleLinear", "LoRACompatibleConv"]:
-                        if self._should_apply_lora_to_child(name, child_name):
-                            lora_name = f"{LORA_PREFIX_UNET}.{name}.{child_name}".replace(".", "_")
-                            lora_module = BatchedLoRAModule(
-                                lora_name, child_module, self.lora_dim, self.alpha
-                            )
-                            lora_module.apply_to()
-                            self.unet_loras.append(lora_module)
+                        if self._should_apply_lora_to_child(parent_name, child_name):
+                            # Store the parent module, the child's name, the child module, AND the unique parent path
+                            modules_to_replace.append((parent_module, child_name, child_module, parent_name))
+
+        # Keep track of which layers have been replaced to avoid double-injection
+        replaced_layers = set()
+        for parent_module, child_name, child_module, parent_name in modules_to_replace:
+            # Create a unique key for the layer based on its parent and its own name
+            layer_key = (parent_name, child_name)
+            if layer_key in replaced_layers:
+                continue # Skip if we've already processed this exact layer
+            replaced_layers.add(layer_key)
+
+            # Use the unique parent_name for the lora_name
+            lora_name = f"{LORA_PREFIX_UNET}_{parent_name}_{child_name}".replace(".", "_")
+            
+            # 1. Create the LoRA-only module
+            lora_module = BatchedLoRAModule(
+                lora_name, child_module, self.lora_dim, self.alpha
+            )
+            self.unet_loras.append(lora_module)
+
+            # 2. Create the injection container
+            injected_layer = LoRAInjectedLayer(child_module, lora_module)
+
+            # 3. Replace the original layer with our new container
+            setattr(parent_module, child_name, injected_layer)
 
     def _should_apply_lora(self, name: str, module: nn.Module) -> bool:
         """

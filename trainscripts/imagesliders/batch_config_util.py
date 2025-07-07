@@ -53,7 +53,48 @@ def config_io():
 # I will add the import for batch_model_util here, assuming it will be created/updated.
 from .batch_model_util import load_models, create_noise_scheduler
 
+def get_optimizer(name: str):
+    name = name.lower()
+
+    if name.startswith("dadapt"):
+        import dadaptation
+
+        if name == "dadaptadam":
+            return dadaptation.DAdaptAdam
+        elif name == "dadaptlion":
+            return dadaptation.DAdaptLion
+        else:
+            raise ValueError("DAdapt optimizer must be dadaptadam or dadaptlion")
+
+    elif name.endswith("8bit"):  # 検証してない
+        import bitsandbytes as bnb
+
+        if name == "adam8bit":
+            return bnb.optim.Adam8bit
+        elif name == "lion8bit":
+            return bnb.optim.Lion8bit
+        else:
+            raise ValueError("8bit optimizer must be adam8bit or lion8bit")
+
+    else:
+        if name == "adam":
+            return torch.optim.Adam
+        elif name == "adamw":
+            return torch.optim.AdamW
+        elif name == "lion":
+            from lion_pytorch import Lion
+
+            return Lion
+        elif name == "prodigy":
+            import prodigyopt
+            
+            return prodigyopt.Prodigy
+        else:
+            raise ValueError("Optimizer must be adam, adamw, lion or Prodigy")
+
 def envsetup(config):
+    from torch.backends.cuda import enable_flash_sdp
+    enable_flash_sdp(True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = parse_precision(config.train.precision)
     vae, unet, tokenizers, text_encoders = load_models(config, device, weight_dtype)
@@ -61,6 +102,9 @@ def envsetup(config):
     vae.requires_grad_(False).eval()
     for text_encoder in text_encoders:
         text_encoder.requires_grad_(False).eval()
+
+    optimizer_name = config.train.optimizer.lower()
+    optimizer = get_optimizer(optimizer_name)
 
     noise_scheduler = create_noise_scheduler(config.train.noise_scheduler) # Initialize directly for single file
     environment = {
@@ -72,6 +116,7 @@ def envsetup(config):
         "device": device,
         "weight_dtype": weight_dtype,
         "config": config,
+        "optimizer": optimizer,
     }
     return environment
 
