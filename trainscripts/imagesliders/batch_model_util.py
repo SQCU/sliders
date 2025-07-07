@@ -21,6 +21,7 @@ def load_models(config, device, weight_dtype):
     )
 
     unet = pipe.unet.to(device, weight_dtype)
+    print(f"UNet time_embedding_dim: {unet.config.time_embedding_dim}")
     tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
     text_encoders = [pipe.text_encoder.to(device, weight_dtype), pipe.text_encoder_2.to(device, weight_dtype)]
     if len(text_encoders) == 2:

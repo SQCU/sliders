@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from diffusers import UNet2DConditionModel
 from safetensors.torch import save_file
-
+from datetime import datetime
 
 UNET_TARGET_REPLACE_MODULE_TRANSFORMER = [
 #     "Transformer2DModel",  # どうやらこっちの方らしい？ # attn1, 2
@@ -20,8 +20,9 @@ UNET_TARGET_REPLACE_MODULE_CONV = [
     "ResnetBlock2D",
     "Downsample2D",
     "Upsample2D",
-    #"DownBlock2D",
-    #"UpBlock2D"
+    "DownBlock2D",
+    "UpBlock2D",
+    
 ]  # locon, 3clier
 
 LORA_PREFIX_UNET = "lora_unet"
@@ -33,6 +34,9 @@ TRAINING_METHODS = Literal[
     "innoxattn",  # train all layers except self attention layers
     "selfattn",  # ESD-u, train only self attention layers
     "xattn",  # ESD-x, train only x attention layers
+    "xattn-up", # all up blocks only
+    "xattn-down",# all down blocks only
+    "xattn-mid",# mid blocks only
     "full",  #  train all layers
     "xattn-strict", # q and k values
     "noxattn-hspace",
@@ -44,6 +48,25 @@ TRAINING_METHODS = Literal[
     # "inmidsattn",
     # "selflayer",
 ]
+
+def load_ortho_dict(n):
+    path = f'~/orthogonal_basis/{n:09}.ckpt'
+    if os.path.isfile(path):
+        return torch.load(path)
+    else:
+        x = torch.randn(n,n)
+        eig, _, _ = torch.svd(x)
+        torch.save(eig, path)
+        return eig
+
+def init_ortho_proj(rank, weight):
+    seed = torch.seed()
+    torch.manual_seed(datetime.now().timestamp())
+    q_index = torch.randint(high=weight.size(0),size=(rank,))
+    torch.manual_seed(seed)
+
+    ortho_q_init = load_ortho_dict(weight.size(0)).to(dtype=weight.dtype)[:,q_index]
+    return nn.Parameter(ortho_q_init)
 
 
 class LoRAModule(nn.Module):
@@ -58,6 +81,7 @@ class LoRAModule(nn.Module):
         multiplier=1.0,
         lora_dim=4,
         alpha=1,
+        train_method='xattn'
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
         super().__init__()
@@ -93,9 +117,13 @@ class LoRAModule(nn.Module):
         self.register_buffer("alpha", torch.tensor(alpha))  # 定数として扱える
 
         # same as microsoft's
-        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_up.weight)
-
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=1)
+        if train_method == 'full':
+            nn.init.zeros_(self.lora_up.weight)
+        else:
+            self.lora_up.weight = init_ortho_proj(lora_dim, self.lora_up.weight)
+            self.lora_up.weight.requires_grad_(False)
+        
         self.multiplier = multiplier
         self.org_module = org_module  # remove in applying
 
@@ -119,17 +147,14 @@ class LoRANetwork(nn.Module):
         multiplier: float = 1.0,
         alpha: float = 1.0,
         train_method: TRAINING_METHODS = "full",
-        target_replace = DEFAULT_TARGET_REPLACE,
+        layers = ['Linear', 'Conv']
     ) -> None:
         super().__init__()
         self.lora_scale = 1
         self.multiplier = multiplier
         self.lora_dim = rank
         self.alpha = alpha
-        self.messageblast = None
-        self.messagebuf = None
-        self.target_replace = target_replace
-
+        self.train_method=train_method
         # LoRAのみ
         self.module = LoRAModule
 
@@ -137,10 +162,11 @@ class LoRANetwork(nn.Module):
         self.unet_loras = self.create_modules(
             LORA_PREFIX_UNET,
             unet,
-            self.target_replace,
+            DEFAULT_TARGET_REPLACE,
             self.lora_dim,
             self.multiplier,
             train_method=train_method,
+            layers = layers
         )
         print(f"create LoRA for U-Net: {len(self.unet_loras)} modules.")
 
@@ -172,7 +198,13 @@ class LoRANetwork(nn.Module):
         rank: int,
         multiplier: float,
         train_method: TRAINING_METHODS,
+        layers: List[str],
     ) -> list:
+        filt_layers = []
+        if 'Linear' in layers:
+            filt_layers.extend(["Linear", "LoRACompatibleLinear"])
+        if 'Conv' in layers:
+            filt_layers.extend(["Conv2d", "LoRACompatibleConv"])
         loras = []
         names = []
         for name, module in root_module.named_modules():
@@ -185,9 +217,18 @@ class LoRANetwork(nn.Module):
             elif train_method == "selfattn":  # Self Attention のみ学習
                 if "attn1" not in name:
                     continue
-            elif train_method == "xattn" or train_method == "xattn-strict":  # Cross Attention のみ学習
-                if "attn2" not in name:
+            elif train_method in ["xattn", "xattn-strict", "xattn-up", "xattn-down", "xattn-mid"]:  # Cross Attention
+                if "attn" not in name:
                     continue
+                if train_method == 'xattn-up':
+                    if 'up_block' not in name:
+                        continue
+                if train_method == 'xattn-down':
+                    if 'down_block' not in name:
+                        continue
+                if train_method == 'xattn-mid':
+                    if 'mid_block' not in name:
+                        continue
             elif train_method == "full":  # 全部学習
                 pass
             else:
@@ -196,9 +237,13 @@ class LoRANetwork(nn.Module):
                 )
             if module.__class__.__name__ in target_replace_modules:
                 for child_name, child_module in module.named_modules():
-                    if child_module.__class__.__name__ in ["Linear", "Conv2d", "LoRACompatibleLinear", "LoRACompatibleConv"]:
+                    if child_module.__class__.__name__ in filt_layers:
+                        
+                            
                         if train_method == 'xattn-strict':
                             if 'out' in child_name:
+                                continue
+                            if 'to_q' in child_name:
                                 continue
                         if train_method == 'noxattn-hspace':
                             if 'mid_block' not in name:
@@ -210,21 +255,25 @@ class LoRANetwork(nn.Module):
                         lora_name = lora_name.replace(".", "_")
 #                         print(f"{lora_name}")
                         lora = self.module(
-                            lora_name, child_module, multiplier, rank, self.alpha
+                            lora_name, child_module, multiplier, rank, self.alpha, train_method
                         )
 #                         print(name, child_name)
 #                         print(child_module.weight.shape)
-                        loras.append(lora)
-                        names.append(lora_name)
-#         print(f'@@@@@@@@@@@@@@@@@@@@@@@@@@@@ \n {names}')
+                        if lora_name not in names:
+                            loras.append(lora)
+                            names.append(lora_name)
+        # print(f'@@@@@@@@@@@@@@@@@@@@@@@@@@@@ \n {names}')
         return loras
 
-    def prepare_optimizer_params(self,lr=None):
+    def prepare_optimizer_params(self):
         all_params = []
 
         if self.unet_loras:  # 実質これしかない
             params = []
-            [params.extend(lora.parameters()) for lora in self.unet_loras]
+            if self.train_method == 'full':
+                [params.extend(lora.parameters()) for lora in self.unet_loras]
+            else:
+                [params.extend(lora.lora_down.parameters()) for lora in self.unet_loras]
             param_data = {"params": params}
             all_params.append(param_data)
 
@@ -239,11 +288,6 @@ class LoRANetwork(nn.Module):
                 v = v.detach().clone().to("cpu").to(dtype)
                 state_dict[key] = v
 
-#         for key in list(state_dict.keys()):
-#             if not key.startswith("lora"):
-#                 # lora以外除外
-#                 del state_dict[key]
-
         if os.path.splitext(file)[1] == ".safetensors":
             save_file(state_dict, file, metadata)
         else:
@@ -252,19 +296,8 @@ class LoRANetwork(nn.Module):
         self.lora_scale = scale
 
     def __enter__(self):
-        if self.messageblast is None:
-            self.messageblast = 0
-
         for lora in self.unet_loras:
-            if self.messageblast <= 16:
-                printstr =f"__enter__ called. ambiguous loc could make a sequence *or* do a multiply. it was:{lora.multiplier}*{self.lora_scale}"
-                if self.messagebuf != printstr:
-                    self.messagebuf = printstr
-                    mblast = f"mblast{self.messageblast}/16"
-                    print(printstr+mblast)
-                    self.messageblast +=1
             lora.multiplier = 1.0 * self.lora_scale
-
 
     def __exit__(self, exc_type, exc_value, tb):
         for lora in self.unet_loras:

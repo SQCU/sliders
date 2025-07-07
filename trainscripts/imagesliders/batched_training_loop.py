@@ -1,3 +1,4 @@
+#python -m trainscripts.imagesliders.batched_training_loop -c "F:/dox/ai/gemmy/sliders/trainscripts/imagesliders/data/batch_config.yaml"
 import torch
 import os
 import gc
@@ -247,7 +248,7 @@ def prepare_cached_batches(config, environment):
             all_pooled_embeds.append(cached_pooled_embeds.to(device, dtype=weight_dtype))
 
         cat_latents_start_time = time.time()
-        latents_batch = torch.stack(latents).to(device, dtype=weight_dtype)
+        latents_batch = torch.cat(latents).to(device, dtype=weight_dtype)
         cat_latents_time = time.time() - cat_latents_start_time
 
         scales_batch = torch.tensor(scales, dtype=weight_dtype, device=device)
@@ -279,7 +280,8 @@ def prepare_cached_batches(config, environment):
             "guidance_scale": item.prompt.get("guidance_scale", 1.0), # Get guidance_scale from prompt, default to 1.0
         }
         static_batches.append(batch)
-
+        
+        """ #comment this out for now
         if len(static_batches) == 1:
             print("\n--- Example Training Batch (First Batch) ---")
             print("Tensor Shapes:")
@@ -298,7 +300,7 @@ def prepare_cached_batches(config, environment):
                 print(f"    Pair Index: {item.pair_index}")
                 print(f"    Is Low Case: {item.is_low_case}")
             print("--------------------------------------------")
-
+        """
         total_cat_latents_time += cat_latents_time
         total_cat_text_embeds_time += cat_text_embeds_time
         total_cat_pooled_embeds_time += cat_pooled_embeds_time

@@ -391,7 +391,7 @@ def prepare_cached_batches(config, environment):
             all_pooled_embeds.append(cached_pooled_embeds.to(device, dtype=weight_dtype))
 
         cat_latents_start_time = time.time()
-        latents_batch = torch.stack(latents).to(device, dtype=weight_dtype)
+        latents_batch = torch.cat(latent, dim=0).to(device, dtype=weight_dtype)
         cat_latents_time = time.time() - cat_latents_start_time
 
         scales_batch = torch.tensor(scales, dtype=weight_dtype, device=device)

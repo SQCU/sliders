@@ -148,8 +148,8 @@ def form_cfg_microbatch(
     ordered_uncond_pool = unswizzled_data["unconditional_pool"][ordered_indices]
 
     # Assemble the final conditional embeddings
-    final_cond_text = torch.stack(selected_cond_text, dim=0)
-    final_cond_pool = torch.stack(selected_cond_pool, dim=0)
+    final_cond_text = torch.cat(selected_cond_text, dim=0)
+    final_cond_pool = torch.cat(selected_cond_pool, dim=0)
 
     # Build CFG tensors: cat([unconditional, conditional])
     microbatch = {
