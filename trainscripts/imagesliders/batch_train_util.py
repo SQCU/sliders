@@ -164,13 +164,10 @@ def batched_predict_noise_xl(
         added_cond_kwargs=added_cond_kwargs
     ).sample
     
-    #expects latents to be pre-doubled, 
     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
     guided_target = noise_pred_uncond + guidance_scale * (
         noise_pred_text - noise_pred_uncond
     )
-    guided_target = apply_cfg_guidance(noise_pred, guidance_scale)
-    
     return guided_target
 
 def diffusion(

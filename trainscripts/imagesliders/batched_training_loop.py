@@ -17,6 +17,7 @@ from pathlib import Path
 import time
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Union, Literal, List, Dict, Any
+from .batch_slider_algo import calculate_paired_loss
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
 from .batch_config_util import (
@@ -30,7 +31,15 @@ from .batch_config_util import (
 from . import batch_lora as lora
 from . import batch_train_util
 from . import batch_model_util
-from . import batch_slider_algo
+from typing import List, Dict, Tuple, Any
+
+
+
+
+
+
+
+
 from .data_schedule import TrainingSchedule # Import TrainingSchedule
 
 # --- Copied from batch_dataset_encoding.py for self-containment ---
@@ -185,14 +194,25 @@ def initialize_text_embedding_cache(config, environment, training_schedule):
     unique_prompts = training_schedule.get_unique_prompts()
     text_embedding_cache = {}
 
+    #REFACTOR THE SWIZZLING
     for prompt_dict in tqdm(unique_prompts, desc="Encoding unique prompts"):
         text_embeddings, pooled_embeds = batch_train_util.create_batched_prompt_embeddings(
             tokenizers,
             text_encoders,
             prompt_dict,
         )
+
+        # Split the concatenated embeddings
+        positive_text_embeds, uncond_text_embeds, neutral_text_embeds = text_embeddings.chunk(3)
+        positive_pooled_embeds, uncond_pooled_embeds, neutral_pooled_embeds = pooled_embeds.chunk(3)
+
         text_embedding_cache[frozenset(prompt_dict.items())] = (
-            text_embeddings.cpu(), pooled_embeds.cpu()
+            positive_text_embeds.cpu(),
+            positive_pooled_embeds.cpu(),
+            uncond_text_embeds.cpu(),
+            uncond_pooled_embeds.cpu(),
+            neutral_text_embeds.cpu(),
+            neutral_pooled_embeds.cpu(),
         )
     print(f"Cached {len(unique_prompts)} unique text embeddings.")
     return text_embedding_cache
@@ -222,10 +242,10 @@ def prepare_cached_batches(config, environment):
     text_encoders = environment['text_encoders']
 
     for batch_items in tqdm(training_schedule, desc="Caching batches"):
-        latents = []
-        scales = []
-        all_text_embeddings = []
-        all_pooled_embeds = []
+        all_cond_text_embeddings = []
+        all_cond_pooled_embeds = []
+        all_uncond_text_embeddings = []
+        all_uncond_pooled_embeds = []
 
         pair_indices = []
         is_low_cases = []
@@ -243,9 +263,24 @@ def prepare_cached_batches(config, environment):
             total_latent_encoding_time += encoding_time
             total_latent_load_time += load_time
 
-            cached_text_embeds, cached_pooled_embeds = text_embedding_cache[frozenset(item.prompt.items())]
-            all_text_embeddings.append(cached_text_embeds.to(device, dtype=weight_dtype))
-            all_pooled_embeds.append(cached_pooled_embeds.to(device, dtype=weight_dtype))
+            (
+                positive_text_embeds,
+                positive_pooled_embeds,
+                uncond_text_embeds,
+                uncond_pooled_embeds,
+                neutral_text_embeds,
+                neutral_pooled_embeds,
+            ) = text_embedding_cache[frozenset(item.prompt.items())]
+
+            if item.is_low_case:
+                all_cond_text_embeddings.append(neutral_text_embeds.to(device, dtype=weight_dtype))
+                all_cond_pooled_embeds.append(neutral_pooled_embeds.to(device, dtype=weight_dtype))
+            else:
+                all_cond_text_embeddings.append(positive_text_embeds.to(device, dtype=weight_dtype))
+                all_cond_pooled_embeds.append(positive_pooled_embeds.to(device, dtype=weight_dtype))
+            
+            all_uncond_text_embeddings.append(uncond_text_embeds.to(device, dtype=weight_dtype))
+            all_uncond_pooled_embeds.append(uncond_pooled_embeds.to(device, dtype=weight_dtype))
 
         cat_latents_start_time = time.time()
         latents_batch = torch.cat(latents).to(device, dtype=weight_dtype)
@@ -253,16 +288,10 @@ def prepare_cached_batches(config, environment):
 
         scales_batch = torch.tensor(scales, dtype=weight_dtype, device=device)
 
-        # Create pairing map here, as it's part of dataset construction
-        pairing_map = batch_slider_algo.create_pairing_map(scales_batch)
-
-        cat_text_embeds_start_time = time.time()
-        text_embeddings_batch = torch.cat(all_text_embeddings, dim=0).to(device, dtype=weight_dtype)
-        cat_text_embeds_time = time.time() - cat_text_embeds_start_time
-
-        cat_pooled_embeds_start_time = time.time()
-        pooled_embeds_batch = torch.cat(all_pooled_embeds, dim=0).to(device, dtype=weight_dtype)
-        cat_pooled_embeds_time = time.time() - cat_pooled_embeds_start_time
+        cond_text_embeddings_batch = torch.cat(all_cond_text_embeddings, dim=0).to(device, dtype=weight_dtype)
+        cond_pooled_embeds_batch = torch.cat(all_cond_pooled_embeds, dim=0).to(device, dtype=weight_dtype)
+        uncond_text_embeddings_batch = torch.cat(all_uncond_text_embeddings, dim=0).to(device, dtype=weight_dtype)
+        uncond_pooled_embeds_batch = torch.cat(all_uncond_pooled_embeds, dim=0).to(device, dtype=weight_dtype)
 
         add_time_ids = batch_train_util.get_add_time_ids(
             1024, 1024, False, dtype=latents_batch.dtype
@@ -271,50 +300,54 @@ def prepare_cached_batches(config, environment):
         batch = {
             "latents": latents_batch,
             "scales": scales_batch,
-            "text_embeddings": text_embeddings_batch,
-            "pooled_embeds": pooled_embeds_batch,
+            "cond_text_embeddings": cond_text_embeddings_batch,
+            "cond_pooled_embeds": cond_pooled_embeds_batch,
+            "uncond_text_embeddings": uncond_text_embeddings_batch,
+            "uncond_pooled_embeds": uncond_pooled_embeds_batch,
             "add_time_ids": add_time_ids,
             "pair_indices": torch.tensor(pair_indices, dtype=torch.long, device=device),
             "is_low_cases": torch.tensor(is_low_cases, dtype=torch.bool, device=device),
-            "pairing_map": pairing_map,
             "guidance_scale": item.prompt.get("guidance_scale", 1.0), # Get guidance_scale from prompt, default to 1.0
         }
         static_batches.append(batch)
         
-        """ #comment this out for now
-        if len(static_batches) == 1:
-            print("\n--- Example Training Batch (First Batch) ---")
-            print("Tensor Shapes:")
-            for key, value in batch.items():
-                if isinstance(value, torch.Tensor):
-                    print(f"  {key}: {value.shape}")
-                else:
-                    print(f"  {key}: {type(value)}")
-            
-            print("\nMetadata for Cached Items:")
-            for i, item in enumerate(batch_items):
-                print(f"  Item {i}:")
-                print(f"    Image Path: {item.image_path}")
-                print(f"    Prompt: {item.prompt}")
-                print(f"    Scale: {item.scale}")
-                print(f"    Pair Index: {item.pair_index}")
-                print(f"    Is Low Case: {item.is_low_case}")
-            print("--------------------------------------------")
-        """
         total_cat_latents_time += cat_latents_time
-        total_cat_text_embeds_time += cat_text_embeds_time
-        total_cat_pooled_embeds_time += cat_pooled_embeds_time
 
     print(f"Cached {len(static_batches)} batches.")
     print(f"Total time spent in latent encoding: {total_latent_encoding_time:.4f} seconds")
     print(f"Total time spent in latent loading: {total_latent_load_time:.4f} seconds")
     print(f"Total time spent concatenating latents: {total_cat_latents_time:.4f} seconds")
-    print(f"Total time spent concatenating text embeddings: {total_cat_text_embeds_time:.4f} seconds")
-    print(f"Total time spent concatenating pooled embeddings: {total_cat_pooled_embeds_time:.4f} seconds")
 
     return static_batches
 
 # --- End copied functions ---
+
+def prepare_cfg_batch(
+    batch: dict,
+    noisy_latents: torch.Tensor,
+    timesteps_to: torch.Tensor,
+    noise_scheduler,
+    weight_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Prepares a CFG-ready batch by concatenating unconditional and conditional embeddings.
+    """
+    cond_text_embeddings = batch['cond_text_embeddings']
+    cond_pooled_embeds = batch['cond_pooled_embeds']
+    uncond_text_embeddings = batch['uncond_text_embeddings']
+    uncond_pooled_embeds = batch['uncond_pooled_embeds']
+    add_time_ids = batch['add_time_ids']
+
+    latents_cfg = torch.cat([noisy_latents, noisy_latents], dim=0)
+    text_embeddings_cfg = torch.cat([uncond_text_embeddings, cond_text_embeddings], dim=0)
+    pooled_embeds_cfg = torch.cat([uncond_pooled_embeds, cond_pooled_embeds], dim=0)
+    add_time_ids_cfg = torch.cat([add_time_ids, add_time_ids], dim=0)
+
+    unet_timesteps = noise_scheduler.timesteps[timesteps_to].to(weight_dtype)
+    unet_timesteps_cfg = torch.cat([unet_timesteps, unet_timesteps], dim=0)
+
+    return latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg
+
 
 def train_step(environment: dict, batch: dict, seed: int):
     """
@@ -334,14 +367,10 @@ def train_step(environment: dict, batch: dict, seed: int):
     # Unpack batch data
     latents = batch["latents"].to(device, dtype=weight_dtype)
     scales = batch["scales"].to(device, dtype=weight_dtype)
-    text_embeddings = batch["text_embeddings"].to(device, dtype=weight_dtype)
-    pooled_embeds = batch["pooled_embeds"].to(device, dtype=weight_dtype)
-    add_time_ids = batch["add_time_ids"].to(device, dtype=weight_dtype)
     pair_indices = batch["pair_indices"].to(device)
     is_low_cases = batch["is_low_cases"].to(device)
     guidance_scale = batch["guidance_scale"] # Retrieve guidance_scale from batch
 
-    print(f"unpacked pooled embeds of shape: {pooled_embeds.shape}")
     print(f"Shape of initial latents (batch['latents']): {latents.shape}")
 
     # Prepare for training step
@@ -363,53 +392,41 @@ def train_step(environment: dict, batch: dict, seed: int):
     
     # --- END TIMESTEP LOGIC ---
 
-    # Unswizzle conditioning data
-    unswizzled_data = batch_slider_algo.unswizzle_conditioning_data({
-        "latents": latents,
-        "text_embeddings": text_embeddings,
-        "pooled_embeds": pooled_embeds,
-    })
-
-    # Retrieve pairing map from batch
-    pairing_map = batch["pairing_map"]
-
     # Form CFG microbatch
-    microbatch_cfg, ordered_latents, ordered_scales, ordered_indices = batch_slider_algo.form_cfg_microbatch(
-        unswizzled_data, batch, pairing_map
+    latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg = prepare_cfg_batch(
+        batch,
+        noisy_latents,
+        timesteps_to,
+        noise_scheduler,
+        weight_dtype,
     )
 
-    # The timesteps for the UNet need to be the actual timesteps from the scheduler
-    # corresponding to the `timesteps_to` indices, reordered to match the microbatch.
-    reordered_timesteps_to = timesteps_to[ordered_indices]
-    unet_timesteps = noise_scheduler.timesteps[reordered_timesteps_to].to(weight_dtype)
-    unet_timesteps_cfg = torch.cat([unet_timesteps, unet_timesteps], dim=0)
-
     # Set LoRA scales, which must match the doubled cfg axis.
-    batched_scales = ordered_scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+    batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     batched_scales_cfg = torch.cat([batched_scales, batched_scales], dim=0)
     network.set_lora_scales(batched_scales_cfg)
 
     with network:
         print(f"Shape of unet_timesteps_cfg: {unet_timesteps_cfg.shape}")
-        print(f"Shape of noisy_latents_cfg: {microbatch_cfg['latents_cfg'].shape}")
-        print(f"Shape of text_embeddings_cfg: {microbatch_cfg['text_embeds_cfg'].shape}")
-        print(f"Shape of pooled_embeds_cfg: {microbatch_cfg['pooled_embeds_cfg'].shape}")
-        print(f"Shape of add_time_ids_cfg: {microbatch_cfg['add_time_ids_cfg'].shape}")
+        print(f"Shape of noisy_latents_cfg: {latents_cfg.shape}")
+        print(f"Shape of text_embeddings_cfg: {text_embeddings_cfg.shape}")
+        print(f"Shape of pooled_embeds_cfg: {pooled_embeds_cfg.shape}")
+        print(f"Shape of add_time_ids_cfg: {add_time_ids_cfg.shape}")
         
         predicted_noise = batch_train_util.batched_predict_noise_xl(
             unet,
             noise_scheduler,
             unet_timesteps_cfg,
-            microbatch_cfg['latents_cfg'],
-            microbatch_cfg['text_embeds_cfg'],
-            microbatch_cfg['pooled_embeds_cfg'],
-            microbatch_cfg['add_time_ids_cfg'],
+            latents_cfg,
+            text_embeddings_cfg,
+            pooled_embeds_cfg,
+            add_time_ids_cfg,
             guidance_scale=guidance_scale,
         )
 
     # Calculate loss using the new paired loss function
-    target_noise_cfg = batch_slider_algo._cfg_duplicate(noise[ordered_indices])
-    loss = batch_slider_algo.calculate_paired_loss(predicted_noise, target_noise_cfg, pairing_map)
+    target_noise_cfg = torch.cat([noise, noise], dim=0)
+    loss = batch_slider_algo.calculate_paired_loss(predicted_noise, target_noise_cfg, pair_indices, is_low_cases)
 
     # Backpropagation
     loss.backward()
