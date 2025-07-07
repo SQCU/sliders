@@ -53,6 +53,35 @@ def get_sha256_checksum(file_path):
     end_time = time.time()
     return sha256.hexdigest(), (end_time - start_time)
 
+def resize_image_if_needed(image: Image.Image, max_resolution: int) -> Image.Image:
+    """
+    Resizes a PIL image to fit within a maximum resolution while preserving aspect ratio.
+    
+    Args:
+        image (Image.Image): The input image.
+        max_resolution (Tuple[int, int]): A tuple of (max_width, max_height).
+
+    Returns:
+        Image.Image: The resized image, or the original if it was already small enough.
+    """
+    max_w, max_h = max_resolution
+    if image.width <= max_w and image.height <= max_h:
+        return image
+
+    # Calculate the new size
+    width_ratio = max_w / image.width
+    height_ratio = max_h / image.height
+    ratio = min(width_ratio, height_ratio) # Use the smaller ratio to ensure both dims fit
+
+    new_width = int(image.width * ratio)
+    new_height = int(image.height * ratio)
+
+    # Use LANCZOS for high-quality downsampling
+    resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    
+    # print(f"Resized image from {image.size} to {resized_image.size}") # Optional: for debugging
+    return resized_image
+
 def encode_images_to_latents(images, vae, device, weight_dtype):
     start_time = time.time()
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
@@ -89,7 +118,7 @@ def save_latents_to_disk(latents, output_dir, image_path, vae_state_dict):
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=4)
 
-def check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, force_reencode=False):
+def check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, config, force_reencode=False):
     latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
     latent_path = os.path.join(output_dir, latent_filename)
 
@@ -103,19 +132,28 @@ def check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, v
         else:
             print(f"Latents for {image_path} not found. Encoding.")
 
+    max_resolution = tuple(config.train.get("resolution", (512, 512)))
     image = Image.open(image_path).convert("RGB")
-    latents, encoding_time = encode_images_to_latents([image], vae, device, weight_dtype)
+    image = resize_image_if_needed(image, max_resolution)
+
+    latents_gpu, encoding_time = encode_images_to_latents([image], vae, device, weight_dtype)
     latent_encoding_time += encoding_time
-    save_latents_to_disk(latents, output_dir, image_path, vae_state_dict)
+    save_latents_to_disk(latents.cpu(), output_dir, image_path, vae_state_dict)
     return False, latent_encoding_time
 
-def get_latent_for_image(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, force_reencode=False):
-    is_cached, encoding_time = check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, force_reencode=force_reencode)
+def get_latent_for_image(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, config, force_reencode=False):
+     # This function now has an internal 'device' argument for the VAE call,
+    # but the returned latent will be on the CPU.
+    is_cached, encoding_time = check_and_encode_latent(image_path, vae, 
+    device, weight_dtype, output_dir, vae_state_dict, config, 
+    force_reencode=force_reencode)
     latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
     latent_path = os.path.join(output_dir, latent_filename)
     
     load_start_time = time.time()
-    loaded_latent = torch.load(latent_path, weights_only=True)
+    # Load the latent tensor. It's already on the CPU since we save it that way.
+    # The map_location is a good safeguard.
+    loaded_latent = torch.load(latent_path, map_location="cpu",  weights_only=True)
     load_end_time = time.time()
     latent_load_time = load_end_time - load_start_time
 
@@ -137,13 +175,20 @@ def initialize_latent_cache(config, environment):
     vae_batch_size = config.train.get("vae_encoding_batch_size", 4)
     print(f"Using VAE encoding batch size: {vae_batch_size}")
 
+    max_resolution = tuple(config.train.get("resolution", (512, 512)))
+    print(f"Using max resolution for preprocessing: {max_resolution}")
+
     total_comparison_time = 0
     mismatched_files = 0
 
     for i in tqdm(range(0, len(unique_image_paths), vae_batch_size), desc="Initializing latent cache"):
         batch_paths = unique_image_paths[i:i+vae_batch_size]
         
-        images_to_encode = [Image.open(p).convert("RGB") for p in batch_paths]
+        images_to_encode = []
+        for path in batch_paths:
+            image = Image.open(path).convert("RGB")
+            image = resize_image_if_needed(image, max_resolution)
+            images_to_encode.append(image)
         
         new_latents_gpu, encoding_time = encode_images_to_latents(images_to_encode, vae, device, weight_dtype)
         new_latents_cpu = new_latents_gpu.cpu()
@@ -249,6 +294,7 @@ def prepare_cached_batches(config, environment):
                 item.image_path, vae, device, weight_dtype, 
                 Path(config.dataset.folder_main) / "latents", 
                 vae.state_dict(),
+                config,
                 force_reencode=config.train.get("force_reencode_latents", False)
             )
             latents.append(latent)
@@ -268,30 +314,31 @@ def prepare_cached_batches(config, environment):
             ) = text_embedding_cache[frozenset(item.prompt.items())]
 
             if item.is_low_case:
-                all_cond_text_embeddings.append(neutral_text_embeds.to(device, dtype=weight_dtype))
-                all_cond_pooled_embeds.append(neutral_pooled_embeds.to(device, dtype=weight_dtype))
+                all_cond_text_embeddings.append(neutral_text_embeds)
+                all_cond_pooled_embeds.append(neutral_pooled_embeds)
             else:
-                all_cond_text_embeddings.append(positive_text_embeds.to(device, dtype=weight_dtype))
-                all_cond_pooled_embeds.append(positive_pooled_embeds.to(device, dtype=weight_dtype))
+                all_cond_text_embeddings.append(positive_text_embeds)
+                all_cond_pooled_embeds.append(positive_pooled_embeds)
             
-            all_uncond_text_embeddings.append(uncond_text_embeds.to(device, dtype=weight_dtype))
-            all_uncond_pooled_embeds.append(uncond_pooled_embeds.to(device, dtype=weight_dtype))
+            all_uncond_text_embeddings.append(uncond_text_embeds)
+            all_uncond_pooled_embeds.append(uncond_pooled_embeds)
 
         cat_latents_start_time = time.time()
-        latents_batch = torch.cat(latents).to(device, dtype=weight_dtype)
+        latents_batch = torch.cat(latents).to(dtype=weight_dtype)
         cat_latents_time = time.time() - cat_latents_start_time
 
-        scales_batch = torch.tensor(scales, dtype=weight_dtype, device=device)
+        scales_batch = torch.tensor(scales, dtype=weight_dtype)
 
-        cond_text_embeddings_batch = torch.cat(all_cond_text_embeddings, dim=0).to(device, dtype=weight_dtype)
-        cond_pooled_embeds_batch = torch.cat(all_cond_pooled_embeds, dim=0).to(device, dtype=weight_dtype)
-        uncond_text_embeddings_batch = torch.cat(all_uncond_text_embeddings, dim=0).to(device, dtype=weight_dtype)
-        uncond_pooled_embeds_batch = torch.cat(all_uncond_pooled_embeds, dim=0).to(device, dtype=weight_dtype)
+        cond_text_embeddings_batch = torch.cat(all_cond_text_embeddings, dim=0)
+        cond_pooled_embeds_batch = torch.cat(all_cond_pooled_embeds, dim=0)
+        uncond_text_embeddings_batch = torch.cat(all_uncond_text_embeddings, dim=0)
+        uncond_pooled_embeds_batch = torch.cat(all_uncond_pooled_embeds, dim=0)
 
         #keep time ids float32
+        #hardcode 512x512 for now no wait a second wrong place.
         add_time_ids = batch_train_util.get_add_time_ids(
             1024, 1024, False, dtype=torch.float32
-        ).repeat(len(latents_batch), 1).to(device)
+        ).repeat(len(latents_batch), 1)
 
         batch = {
             "latents": latents_batch,
@@ -361,12 +408,20 @@ def train_step(environment: dict, batch: dict, seed: int):
     device = environment["device"]
     weight_dtype = environment["weight_dtype"]
 
-    # Unpack batch data
+    # move batch data to gpu
     latents = batch["latents"].to(device, dtype=weight_dtype)
     scales = batch["scales"].to(device, dtype=weight_dtype)
     pair_indices = batch["pair_indices"].to(device)
     is_low_cases = batch["is_low_cases"].to(device)
-    guidance_scale = batch["guidance_scale"] # Retrieve guidance_scale from batch
+    guidance_scale = batch["guidance_scale"] 
+    # We also need to move the embeddings that are used in prepare_cfg_batch
+    # Let's just modify the `batch` dict in-place for simplicity before passing it
+    batch['cond_text_embeddings'] = batch['cond_text_embeddings'].to(device, dtype=weight_dtype)
+    batch['cond_pooled_embeds'] = batch['cond_pooled_embeds'].to(device, dtype=weight_dtype)
+    batch['uncond_text_embeddings'] = batch['uncond_text_embeddings'].to(device, dtype=weight_dtype)
+    batch['uncond_pooled_embeds'] = batch['uncond_pooled_embeds'].to(device, dtype=weight_dtype)
+    batch['add_time_ids'] = batch['add_time_ids'].to(device, dtype=torch.float32) # Remember to keep this float32!
+    # Retrieve guidance_scale from batch
 
     print(f"Shape of initial latents (batch['latents']): {latents.shape}")
 

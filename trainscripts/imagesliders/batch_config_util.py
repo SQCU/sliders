@@ -39,6 +39,12 @@ def config_io():
     print(f"Loading batch config from: {args.batchtrainconfig}")
     config = AttrDict(load_config_from_yaml(args.batchtrainconfig))
 
+    if 'dataset' in config and 'prompts_file_path' in config.dataset:
+        prompts_file_path = "trainscripts/imagesliders/data/prompts-xl-dilora-bracket.yaml"
+        print(f"Loading and merging promptsfile from: {prompts_file_path}")
+        prompts_config = AttrDict(load_config_from_yaml(prompts_file_path))
+        config.dataset.update(prompts_config)
+
     # Load and merge model config if specified
     if 'model_config' in config and 'refpath' in config.model_config:
         model_config_path = config.model_config.refpath
