@@ -160,7 +160,7 @@ def form_cfg_microbatch(
     }
     
     # Return the microbatch and the corresponding ordered latents/scales needed by the main loop
-    return microbatch, ordered_latents, ordered_scales
+    return microbatch, ordered_latents, ordered_scales, ordered_indices
 
 def calculate_paired_loss(
     predicted_noise: torch.Tensor,
