@@ -123,6 +123,7 @@ def get_add_time_ids(
         )
 
     add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
+    print(f"Shape of add_time_ids in get_add_time_ids: {add_time_ids.shape}")
     return add_time_ids
 
 def batched_predict_noise_xl(
@@ -143,24 +144,24 @@ def batched_predict_noise_xl(
     device = unet.device
     latent_model_input = latents
     latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
-
+    
     added_cond_kwargs = {
         "text_embeds": add_text_embeddings,
-        "time_ids": add_time_ids,
+        "time_ids": add_time_ids.to(torch.float32),
     }
 
     #debugging logging block:
     print(f"latent_model_input shape: {latent_model_input.shape}")
-    print(f"timestep shape: {timestep.shape}")
+    print(f"timestep shape,dtype: {timestep.shape},{timestep.dtype}")
     print(f"text_embeddings shape: {text_embeddings.shape}")
     print(f"add_text_embeddings shape: {add_text_embeddings.shape}")
     print(f"add_time_ids shape: {add_time_ids.shape}")
-
+    print(f"add_time_ids dtype: {add_time_ids.dtype}")
 
     noise_pred = unet(
         latent_model_input.to(unet.dtype),
-        timestep.to(unet.dtype),
-        text_embeddings.to(unet.dtype),
+        timestep,   #don't cast to network dtype, these need to be torch.long
+        encoder_hidden_states=text_embeddings.to(unet.dtype),
         added_cond_kwargs=added_cond_kwargs
     ).sample
     

@@ -85,15 +85,17 @@ class BatchedLoRAModule(nn.Module):
         # but its forward method is now overridden.
 
     def forward(self, x):
+        """
         print(f"LoRA Layer: {self.lora_name}")
         print(f"  Input shape: {x.shape}")
         print(f"  LoRA down weight shape: {self.lora_down.weight.shape}")
-        
+        """
         lora_output = self.lora_up(self.lora_down(x))
-        
+        """
         print(f"  LoRA output shape: {lora_output.shape}")
         print(f"  Original forward output shape: {self.org_forward(x).shape}")
         print(f"  Current multiplier shape: {self.current_multiplier.shape}")
+        """
         return (
             self.org_forward(x)
             + lora_output * self.current_multiplier * self.scale

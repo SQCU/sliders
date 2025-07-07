@@ -242,6 +242,8 @@ def prepare_cached_batches(config, environment):
     text_encoders = environment['text_encoders']
 
     for batch_items in tqdm(training_schedule, desc="Caching batches"):
+        latents = []
+        scales = []
         all_cond_text_embeddings = []
         all_cond_pooled_embeds = []
         all_uncond_text_embeddings = []
@@ -293,9 +295,10 @@ def prepare_cached_batches(config, environment):
         uncond_text_embeddings_batch = torch.cat(all_uncond_text_embeddings, dim=0).to(device, dtype=weight_dtype)
         uncond_pooled_embeds_batch = torch.cat(all_uncond_pooled_embeds, dim=0).to(device, dtype=weight_dtype)
 
+        #keep time ids float32
         add_time_ids = batch_train_util.get_add_time_ids(
-            1024, 1024, False, dtype=latents_batch.dtype
-        ).repeat(len(latents_batch), 1).to(device, dtype=weight_dtype)
+            1024, 1024, False, dtype=torch.float32
+        ).repeat(len(latents_batch), 1).to(device)
 
         batch = {
             "latents": latents_batch,
@@ -343,7 +346,8 @@ def prepare_cfg_batch(
     pooled_embeds_cfg = torch.cat([uncond_pooled_embeds, cond_pooled_embeds], dim=0)
     add_time_ids_cfg = torch.cat([add_time_ids, add_time_ids], dim=0)
 
-    unet_timesteps = noise_scheduler.timesteps[timesteps_to].to(weight_dtype)
+    #not to unet.dtype! these need to be a torch.long
+    unet_timesteps = noise_scheduler.timesteps[timesteps_to]#.to(weight_dtype)
     unet_timesteps_cfg = torch.cat([unet_timesteps, unet_timesteps], dim=0)
 
     return latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg
@@ -402,8 +406,9 @@ def train_step(environment: dict, batch: dict, seed: int):
     )
 
     # Set LoRA scales, which must match the doubled cfg axis.
-    batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-    batched_scales_cfg = torch.cat([batched_scales, batched_scales], dim=0)
+    #batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+    #hopefully a [batchdim,1] tensor has shape (16,1) -> broadcasts to variably shaped unet layers?
+    batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
     network.set_lora_scales(batched_scales_cfg)
 
     with network:
@@ -425,8 +430,9 @@ def train_step(environment: dict, batch: dict, seed: int):
         )
 
     # Calculate loss using the new paired loss function
-    target_noise_cfg = torch.cat([noise, noise], dim=0)
-    loss = batch_slider_algo.calculate_paired_loss(predicted_noise, target_noise_cfg, pair_indices, is_low_cases)
+    #target_noise_cfg = torch.cat([noise, noise], dim=0)
+    #target noise should be `noise` because CFG reduces by batch dimension again
+    loss = batch_slider_algo.calculate_paired_loss(predicted_noise, noise, pair_indices, is_low_cases)
 
     # Backpropagation
     loss.backward()

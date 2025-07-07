@@ -1,12 +1,11 @@
-from typing import Optional, Union, List
+from typing import Optional, Union
 
 import torch
-from PIL import Image
 
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import UNet2DConditionModel, SchedulerMixin
 from diffusers.image_processor import VaeImageProcessor
-from .model_util import SDXL_TEXT_ENCODER_TYPE
+# from model_util import SDXL_TEXT_ENCODER_TYPE
 from diffusers.utils.torch_utils import randn_tensor
 
 from tqdm import tqdm
@@ -92,7 +91,7 @@ def encode_prompts(
 
 # https://github.com/huggingface/diffusers/blob/78922ed7c7e66c20aa95159c7b7a6057ba7d590d/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py#L334-L348
 def text_encode_xl(
-    text_encoder: SDXL_TEXT_ENCODER_TYPE,
+    text_encoder,
     tokens: torch.FloatTensor,
     num_images_per_prompt: int = 1,
 ):
@@ -110,8 +109,8 @@ def text_encode_xl(
 
 
 def encode_prompts_xl(
-    tokenizers: list[CLIPTokenizer],
-    text_encoders: list[SDXL_TEXT_ENCODER_TYPE],
+    tokenizers,
+    text_encoders,
     prompts: list[str],
     num_images_per_prompt: int = 1,
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
@@ -152,8 +151,10 @@ def predict_noise(
     text_embeddings: torch.FloatTensor,  # uncond な text embed と cond な text embed を結合したもの
     guidance_scale=7.5,
 ) -> torch.FloatTensor:
-    # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-    latent_model_input = torch.cat([latents] * 2)
+    latent_model_input = latents
+    if guidance_scale!=0:
+        # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+        latent_model_input = torch.cat([latents] * 2)
 
     latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
 
@@ -165,13 +166,13 @@ def predict_noise(
     ).sample
 
     # perform guidance
-    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-    guided_target = noise_pred_uncond + guidance_scale * (
-        noise_pred_text - noise_pred_uncond
-    )
+    if guidance_scale != 1 and guidance_scale!=0:
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (
+            noise_pred_text - noise_pred_uncond
+        )
 
-    return guided_target
-
+    return noise_pred
 
 
 # ref: https://github.com/huggingface/diffusers/blob/0bab447670f47c28df60fbd2f6a0f833f75a16f5/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L746
@@ -183,55 +184,37 @@ def diffusion(
     text_embeddings: torch.FloatTensor,
     total_timesteps: int = 1000,
     start_timesteps=0,
+    guidance_scale=1,
+    composition=False,
     **kwargs,
 ):
     # latents_steps = []
 
-    for timestep in tqdm(scheduler.timesteps[start_timesteps:total_timesteps]):
-        noise_pred = predict_noise(
-            unet, scheduler, timestep, latents, text_embeddings, **kwargs
-        )
-
+    for timestep in scheduler.timesteps[start_timesteps:total_timesteps]:
+        if not composition:
+            noise_pred = predict_noise(
+                unet, scheduler, timestep, latents, text_embeddings, guidance_scale=guidance_scale
+            )
+            if guidance_scale==1:
+                _, noise_pred = noise_pred.chunk(2)
+        else:
+            for idx in range(text_embeddings.shape[0]):
+                pred = predict_noise(
+                    unet, scheduler, timestep, latents, text_embeddings[idx:idx+1], guidance_scale=1
+                )
+                uncond, pred = noise_pred.chunk(2)
+                if idx == 0:
+                    noise_pred = guidance_scale * pred
+                else:
+                    noise_pred += guidance_scale * pred
+            noise_pred += uncond
+        
+        
         # compute the previous noisy sample x_t -> x_t-1
         latents = scheduler.step(noise_pred, timestep, latents).prev_sample
 
     # return latents_steps
     return latents
-
-@torch.no_grad()
-def get_noisy_image(
-    imgs: Union[Image.Image, List[Image.Image]],
-    vae,
-    generator,
-    unet: UNet2DConditionModel,
-    scheduler: SchedulerMixin,
-    total_timesteps: int = 1000,
-    start_timesteps=0,
-    
-    **kwargs,
-):
-    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
-    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
-
-    if isinstance(imgs, Image.Image):
-        imgs = [imgs] # Convert single image to a list for consistent processing
-
-    image_tensors = [image_processor.preprocess(img).to(vae.device, dtype=vae.dtype) for img in imgs]
-    image_batch = torch.cat(image_tensors, dim=0)
-
-    init_latents = vae.encode(image_batch).latent_dist.sample(None)
-    init_latents = vae.config.scaling_factor * init_latents
-
-    shape = init_latents.shape
-
-    noise = randn_tensor(shape, generator=generator, device=vae.device) # Use vae.device for noise
-
-    time_ = total_timesteps
-    timestep = scheduler.timesteps[time_:time_+1]
-    # get latents
-    init_latents = scheduler.add_noise(init_latents, noise, timestep)
-
-    return init_latents, noise
 
 
 def rescale_noise_cfg(
@@ -267,8 +250,10 @@ def predict_noise_xl(
     guidance_rescale=0.7,
 ) -> torch.FloatTensor:
     # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-    latent_model_input = torch.cat([latents] * 2)
-
+    latent_model_input = latents
+    if guidance_scale !=0:
+        latent_model_input = torch.cat([latents] * 2)
+    
     latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
 
     added_cond_kwargs = {
@@ -283,19 +268,26 @@ def predict_noise_xl(
         encoder_hidden_states=text_embeddings,
         added_cond_kwargs=added_cond_kwargs,
     ).sample
-
     # perform guidance
-    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-    guided_target = noise_pred_uncond + guidance_scale * (
-        noise_pred_text - noise_pred_uncond
-    )
+    if guidance_scale != 1 and guidance_scale!=0:
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (
+            noise_pred_text - noise_pred_uncond
+        )
 
-    # https://github.com/huggingface/diffusers/blob/7a91ea6c2b53f94da930a61ed571364022b21044/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py#L775
-    noise_pred = rescale_noise_cfg(
-        noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
-    )
+    return noise_pred
+    # # perform guidance
+    # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+    # guided_target = noise_pred_uncond + guidance_scale * (
+    #     noise_pred_text - noise_pred_uncond
+    # )
 
-    return guided_target
+    # # https://github.com/huggingface/diffusers/blob/7a91ea6c2b53f94da930a61ed571364022b21044/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py#L775
+    # noise_pred = rescale_noise_cfg(
+    #     noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
+    # )
+
+    # return guided_target
 
 
 @torch.no_grad()
@@ -309,22 +301,25 @@ def diffusion_xl(
     guidance_scale: float = 1.0,
     total_timesteps: int = 1000,
     start_timesteps=0,
+    composition=False,
 ):
     # latents_steps = []
 
-    for timestep in tqdm(scheduler.timesteps[start_timesteps:total_timesteps]):
-        noise_pred = predict_noise_xl(
-            unet,
-            scheduler,
-            timestep,
-            latents,
-            text_embeddings,
-            add_text_embeddings,
-            add_time_ids,
-            guidance_scale=guidance_scale,
-            guidance_rescale=0.7,
-        )
-
+    for timestep in scheduler.timesteps[start_timesteps:total_timesteps]:
+        if not composition:
+            noise_pred = predict_noise_xl(
+                unet,
+                scheduler,
+                timestep,
+                latents,
+                text_embeddings,
+                add_text_embeddings,
+                add_time_ids,
+                guidance_scale=guidance_scale,
+                guidance_rescale=0.7,
+            )
+            if guidance_scale==1:
+                _, noise_pred = noise_pred.chunk(2)
         # compute the previous noisy sample x_t -> x_t-1
         latents = scheduler.step(noise_pred, timestep, latents).prev_sample
 
@@ -410,6 +405,43 @@ def get_optimizer(name: str):
         else:
             raise ValueError("Optimizer must be adam, adamw, lion or Prodigy")
 
+@torch.no_grad()
+def get_noisy_image(
+    img,
+    vae,
+    generator,
+    unet: UNet2DConditionModel,
+    scheduler: SchedulerMixin,
+    total_timesteps: int = 1000,
+    start_timesteps=0,
+    
+    **kwargs,
+):
+    # latents_steps = []
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
+
+    image = img
+    im_orig = image
+    device = vae.device
+    image = image_processor.preprocess(image).to(device).to(vae.dtype)
+
+    init_latents = vae.encode(image).latent_dist.sample(None)
+    init_latents = vae.config.scaling_factor * init_latents
+
+    init_latents = torch.cat([init_latents], dim=0)
+
+    shape = init_latents.shape
+
+    noise = randn_tensor(shape, generator=generator, device=device)
+
+    time_ = total_timesteps
+    timestep = scheduler.timesteps[time_:time_+1]
+    # get latents
+    init_latents = scheduler.add_noise(init_latents, noise, timestep)
+    
+    return init_latents, noise
+
 
 def get_lr_scheduler(
     name: Optional[str],
@@ -442,4 +474,16 @@ def get_lr_scheduler(
         )
 
 
+def get_random_resolution_in_bucket(bucket_resolution: int = 512) -> tuple[int, int]:
+    max_resolution = bucket_resolution
+    min_resolution = bucket_resolution // 2
 
+    step = 64
+
+    min_step = min_resolution // step
+    max_step = max_resolution // step
+
+    height = torch.randint(min_step, max_step, (1,)).item() * step
+    width = torch.randint(min_step, max_step, (1,)).item() * step
+
+    return height, width
