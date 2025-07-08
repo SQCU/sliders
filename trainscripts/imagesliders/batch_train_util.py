@@ -123,7 +123,8 @@ def get_add_time_ids(
         )
 
     add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
-    print(f"Shape of add_time_ids in get_add_time_ids: {add_time_ids.shape}")
+    #debug print no longer needed.
+    #print(f"Shape of add_time_ids in get_add_time_ids: {add_time_ids.shape}")
     return add_time_ids
 
 def batched_predict_noise_xl(

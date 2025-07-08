@@ -398,40 +398,41 @@ def train_step(environment: dict, batch: dict, seed: int):
     Performs a single training step. The function is simplified to accept
     the environment dictionary, a single batch of data, and a seed for reproducibility.
     """
-    # --- State Capture ---
-    # Create a directory to save the captured state
-    capture_dir = Path(f"F:/dox/ai/gemmy/sliders/state_capture/train_step_{seed}")
-    capture_dir.mkdir(parents=True, exist_ok=True)
+    with torch.no_grad():
+        # --- State Capture ---
+        # Create a directory to save the captured state
+        capture_dir = Path(f"F:/dox/ai/gemmy/sliders/state_capture/train_step_{seed}")
+        capture_dir.mkdir(parents=True, exist_ok=True)
 
-    # Unpack necessary components from the environment
-    unet = environment["unet"]
-    noise_scheduler = environment["noise_scheduler"]
-    network = environment["network"]
-    optimizer = environment["optimizer"]
-    lr_scheduler = environment["lr_scheduler"]
-    config = environment["config"]
-    device = environment["device"]
-    weight_dtype = environment["weight_dtype"]
+        # Unpack necessary components from the environment
+        unet = environment["unet"]
+        noise_scheduler = environment["noise_scheduler"]
+        network = environment["network"]
+        optimizer = environment["optimizer"]
+        lr_scheduler = environment["lr_scheduler"]
+        config = environment["config"]
+        device = environment["device"]
+        weight_dtype = environment["weight_dtype"]
 
-    # move batch data to gpu
-    latents = batch["latents"].to(device, dtype=weight_dtype)
-    scales = batch["scales"].to(device, dtype=weight_dtype)
-    pair_indices = batch["pair_indices"].to(device)
-    is_low_cases = batch["is_low_cases"].to(device)
-    guidance_scale = batch["guidance_scale"]
-    # We also need to move the embeddings that are used in prepare_cfg_batch
-    # Let's just modify the `batch` dict in-place for simplicity before passing it
-    batch['cond_text_embeddings'] = batch['cond_text_embeddings'].to(device, dtype=weight_dtype)
-    batch['cond_pooled_embeds'] = batch['cond_pooled_embeds'].to(device, dtype=weight_dtype)
-    batch['uncond_text_embeddings'] = batch['uncond_text_embeddings'].to(device, dtype=weight_dtype)
-    batch['uncond_pooled_embeds'] = batch['uncond_pooled_embeds'].to(device, dtype=weight_dtype)
-    batch['add_time_ids'] = batch['add_time_ids'].to(device, dtype=torch.float32) # Remember to keep this float32!
-    # Retrieve guidance_scale from batch
+        # move batch data to gpu
+        latents = batch["latents"].to(device, dtype=weight_dtype)
+        scales = batch["scales"].to(device, dtype=weight_dtype)
+        pair_indices = batch["pair_indices"].to(device)
+        is_low_cases = batch["is_low_cases"].to(device)
+        guidance_scale = batch["guidance_scale"]
+        # We also need to move the embeddings that are used in prepare_cfg_batch
+        # Let's just modify the `batch` dict in-place for simplicity before passing it
+        batch['cond_text_embeddings'] = batch['cond_text_embeddings'].to(device, dtype=weight_dtype)
+        batch['cond_pooled_embeds'] = batch['cond_pooled_embeds'].to(device, dtype=weight_dtype)
+        batch['uncond_text_embeddings'] = batch['uncond_text_embeddings'].to(device, dtype=weight_dtype)
+        batch['uncond_pooled_embeds'] = batch['uncond_pooled_embeds'].to(device, dtype=weight_dtype)
+        batch['add_time_ids'] = batch['add_time_ids'].to(device, dtype=torch.float32) # Remember to keep this float32!
+        # Retrieve guidance_scale from batch
 
-    # --- Capture initial batch ---
-    torch.save(batch, capture_dir / "00_initial_batch.pt")
+        # --- Capture initial batch ---
+        torch.save(batch, capture_dir / "00_initial_batch.pt")
 
-    print(f"Shape of initial latents (batch['latents']): {latents.shape}")
+        print(f"Shape of initial latents (batch['latents']): {latents.shape}")
 
     # Prepare for training step
     optimizer.zero_grad()
@@ -544,44 +545,48 @@ def main():
     Main function to set up the environment, create the dataset,
     run the training loop, and handle shutdown.
     """
-    config = config_io()
-    environment = config_envsetup(config) # Use the envsetup from batch_config_util
-
-    tdcpu = torch.device("cpu")
-    # Unload UNet to CPU to free VRAM for VAE and Text Encoders during batch preparation
-    unet1 = environment.pop('unet')
-    unet2 = unet1.to(device=tdcpu)
-    del unet1
-    environment['unet'] = unet2
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-    # Prepare cached batches (image latents and text embeddings)
     with torch.no_grad():
-        static_batches = prepare_cached_batches(config, environment)
-    
-    # Unload VAE and Text Encoders to CPU after batch preparation
-    vae = environment.pop('vae')
-    tokenizers = environment.pop('tokenizers')
-    text_encoders = environment.pop('text_encoders')
-    vae=vae.to(device=tdcpu)
-    for te in text_encoders:
-        te=te.to(device=tdcpu)
-    gc.collect()
-    torch.cuda.empty_cache()
+        config = config_io()
+        environment = config_envsetup(config) # Use the envsetup from batch_config_util
 
-    # Load UNet back to GPU for training
-    unet1 = environment['unet']
-    unet2 = unet1.to(environment['device'])
-    del unet1
-    gc.collect()
-    torch.cuda.empty_cache()
-    #WOOO COMPILE TIME!!!
-    #if config.other.torch_compile:
-    print("compiling unet for very fast hayai")
-    unet2 = torch.compile(unet2, mode="reduce-overhead", fullgraph=True)
-    environment['unet'] = unet2
+        tdcpu = torch.device("cpu")
+        # Unload UNet to CPU to free VRAM for VAE and Text Encoders during batch preparation
+        unet1 = environment.pop('unet')
+        unet2 = unet1.to(device=tdcpu)
+        del unet1
+        environment['unet'] = unet2
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+        # Prepare cached batches (image latents and text embeddings)
+        static_batches = prepare_cached_batches(config, environment)
+        
+        # Unload VAE and Text Encoders to CPU after batch preparation
+        vae = environment.pop('vae')
+        tokenizers = environment.pop('tokenizers')
+        text_encoders = environment.pop('text_encoders')
+        vae=vae.to(device=tdcpu)
+        for te in text_encoders:
+            te=te.to(device=tdcpu)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Load UNet back to GPU for training
+        unet1 = environment['unet']
+        unet2 = unet1.to(environment['device'])
+        del unet1
+        gc.collect()
+        torch.cuda.empty_cache()
+        #WOOO COMPILE TIME!!!
+        #if config.other.torch_compile:
+        hardcode_allow_compile = False
+        if hardcode_allow_compile:
+            print("compiling unet for very fast hayai")
+            unet2 = torch.compile(unet2, mode="reduce-overhead", fullgraph=True)
+        else:
+            print("skipped compile because something dubious was happening in debug.")
+        environment['unet'] = unet2
 
 
     # Create adapter network

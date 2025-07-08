@@ -525,43 +525,47 @@ def main():
     Main function to set up the environment, create the dataset,
     run the training loop, and handle shutdown.
     """
-    config = config_io()
-    environment = config_envsetup(config) # Use the envsetup from batch_config_util
-
-    tdcpu = torch.device("cpu")
-    # Unload UNet to CPU to free VRAM for VAE and Text Encoders during batch preparation
-    unet1 = environment.pop('unet')
-    unet2 = unet1.to(device=tdcpu)
-    del unet1
-    environment['unet'] = unet2
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # Prepare cached batches (image latents and text embeddings)
     with torch.no_grad():
-        static_batches = prepare_cached_batches(config, environment)
-    
-    # Unload VAE and Text Encoders to CPU after batch preparation
-    vae = environment.pop('vae')
-    tokenizers = environment.pop('tokenizers')
-    text_encoders = environment.pop('text_encoders')
-    vae=vae.to(device=tdcpu)
-    for te in text_encoders:
-        te=te.to(device=tdcpu)
-    gc.collect()
-    torch.cuda.empty_cache()
+        config = config_io()
+        environment = config_envsetup(config) # Use the envsetup from batch_config_util
 
-    # Load UNet back to GPU for training
-    unet1 = environment['unet']
-    unet2 = unet1.to(environment['device'])
-    del unet1
-    gc.collect()
-    torch.cuda.empty_cache()
-    #WOOO COMPILE TIME!!!
-    #if config.other.torch_compile:
-    print("compiling unet for very fast hayai")
-    unet2 = torch.compile(unet2, mode="reduce-overhead", fullgraph=True)
-    environment['unet'] = unet2
+        tdcpu = torch.device("cpu")
+        # Unload UNet to CPU to free VRAM for VAE and Text Encoders during batch preparation
+        unet1 = environment.pop('unet')
+        unet2 = unet1.to(device=tdcpu)
+        del unet1
+        environment['unet'] = unet2
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Prepare cached batches (image latents and text embeddings)
+        static_batches = prepare_cached_batches(config, environment)
+        
+        # Unload VAE and Text Encoders to CPU after batch preparation
+        vae = environment.pop('vae')
+        tokenizers = environment.pop('tokenizers')
+        text_encoders = environment.pop('text_encoders')
+        vae=vae.to(device=tdcpu)
+        for te in text_encoders:
+            te=te.to(device=tdcpu)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Load UNet back to GPU for training
+        unet1 = environment['unet']
+        unet2 = unet1.to(environment['device'])
+        del unet1
+        gc.collect()
+        torch.cuda.empty_cache()
+        #WOOO COMPILE TIME!!!
+        #if config.other.torch_compile:
+        hardcode_allow_compile = False
+        if hardcode_allow_compile:
+            print("compiling unet for very fast hayai")
+            unet2 = torch.compile(unet2, mode="reduce-overhead", fullgraph=True)
+        else:
+            print("skipped compile because something dubious was happening in debug.")
+        environment['unet'] = unet2
 
     # Create adapter network
     network = lora.BatchedLoRANetwork(
