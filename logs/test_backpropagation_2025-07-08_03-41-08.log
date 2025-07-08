@@ -1,0 +1,6 @@
+Logging output to logs\test_backpropagation_2025-07-08_03-41-08.log
+--- Starting Backpropagation Test ---
+All output will be redirected to: logs\test_backpropagation_2025-07-08_03-41-08.log
+Loading models from F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors to device: cuda with dtype: torch.bfloat16
+Fetching 17 files:   0%|                                                                                                                | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 17/17 [00:00<00:00, 33164.26it/s]
+Loading pipeline components...:   0%|                                                                                                    | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  29%|██████████████████████████▎                                                                 | 2/7 [00:00<00:00, 15.45it/s]Loading pipeline components...:  29%|██████████████████████████▎                                                                 | 2/7 [00:00<00:01,  4.96it/s]

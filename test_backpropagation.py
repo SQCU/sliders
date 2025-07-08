@@ -34,7 +34,7 @@ from diffusers import DDPMScheduler, UNet2DConditionModel, AutoencoderKL, Stable
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, EulerAncestralDiscreteScheduler, SchedulerMixin
 from trainscripts.imagesliders.batch_train_util import nocfg_predict_noise_xl as batched_predict_noise_xl # Renamed for clarity
-from trainscripts.imagesliders import batch_lora_trois as batch_lora
+from trainscripts.imagesliders import batch_lora
 from trainscripts.imagesliders import lora as regular_lora # Import original lora
 
 # NEW: scale_n_tuple_loss function
@@ -75,6 +75,16 @@ def load_models(config, device, weight_dtype):
 
     unet = pipe.unet.to(device, dtype=weight_dtype)
     unet.requires_grad_(False).eval()
+
+    # Ensure config.other exists and enable gradient checkpointing
+    if not hasattr(config, 'other'):
+        config.other = AttrDict()
+    config.other.gradient_checkpointing = True
+
+    # Enable gradient checkpointing if configured
+    if hasattr(config, 'other') and hasattr(config.other, 'gradient_checkpointing') and config.other.gradient_checkpointing:
+        print("Enabling gradient checkpointing for UNet.")
+        unet.enable_gradient_checkpointing()
 
     vae = pipe.vae.to(device, dtype=weight_dtype)
     vae.requires_grad_(False).eval()
@@ -233,7 +243,7 @@ def test_backpropagation():
     
     # Now, create the batched LoRA network
     # Initialize LoRA network
-    network = batch_lora.BatchedLoRANetworkTrois(
+    network = batch_lora.BatchedLoRANetwork(
         unet=unet,
         rank=config.network.rank,
         alpha=config.network.alpha,
@@ -324,26 +334,26 @@ def test_backpropagation():
             predicted_noise_text - predicted_noise_uncond
         )).to(device)
 
-    if torch.cuda.is_available():
-        print(f"VRAM (after UNet forward pass with LoRA): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+        if torch.cuda.is_available():
+            print(f"VRAM (after UNet forward pass with LoRA): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
 
-    # --- Perform loss calculation ---
-    # Ensure predicted_noise and target_noise are on the correct dtype for loss calculation if needed
-    # (Relaxed assertion allows float32 loss even with bfloat16 inputs)
-    loss = scale_n_tuple_loss(predicted_noise, target_noise, group_indices)
+        # --- Perform loss calculation ---
+        # Ensure predicted_noise and target_noise are on the correct dtype for loss calculation if needed
+        # (Relaxed assertion allows float32 loss even with bfloat16 inputs)
+        loss = scale_n_tuple_loss(predicted_noise, target_noise, group_indices)
 
-    if torch.cuda.is_available():
-        print(f"VRAM (after loss calculation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+        if torch.cuda.is_available():
+            print(f"VRAM (after loss calculation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
 
-    # --- Perform backpropagation ---
-    print("Performing backpropagation...")
-    if torch.cuda.is_available():
-        print(f"VRAM (before backpropagation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-    
-    loss.backward()
+        # --- Perform backpropagation ---
+        print("Performing backpropagation...")
+        if torch.cuda.is_available():
+            print(f"VRAM (before backpropagation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+        
+        loss.backward()
 
-    if torch.cuda.is_available():
-        print(f"VRAM (after backpropagation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+        if torch.cuda.is_available():
+            print(f"VRAM (after backpropagation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
 
     # --- Assertions ---
     assert isinstance(loss, torch.Tensor), "Loss should be a torch.Tensor"
