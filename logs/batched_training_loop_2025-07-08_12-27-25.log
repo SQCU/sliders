@@ -1,50 +1,0 @@
-Logging output to logs\batched_training_loop_2025-07-08_12-27-25.log
-Loading batch config from: F:/dox/ai/gemmy/sliders/trainscripts/imagesliders/data/batch_config.yaml
-Loading and merging model config from: trainscripts/imagesliders/data/config-xl-batchtest.yaml
-Loading models from F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors to device: cuda with dtype: torch.bfloat16
-Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<00:00, 33272.59it/s]
-Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  29%|██▊       | 2/7 [00:00<00:00, 14.69it/s]Loading pipeline components...:  57%|█████▋    | 4/7 [00:00<00:00,  4.20it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:03<00:00,  1.51it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:03<00:00,  2.18it/s]
-UNet time_embedding_dim: None
-Enabling gradient checkpointing for UNet.
-Building pseudo-randomized training schedule...
-Using random seed: 42
-Collecting all possible training data combinations...
-Created data pool with 2 unique image filenames across scales.
-Built schedule with 20 batches of size 8.
-Initializing text embedding cache...
-Encoding unique prompts:   0%|          | 0/1 [00:00<?, ?it/s]Encoding unique prompts: 100%|██████████| 1/1 [00:00<00:00,  1.99it/s]Encoding unique prompts: 100%|██████████| 1/1 [00:00<00:00,  1.99it/s]
-Cached 1 unique text embeddings.
-Pre-generating and caching all batches from schedule...
-Caching batches:   0%|          | 0/20 [00:00<?, ?it/s]Caching batches:   5%|▌         | 1/20 [00:00<00:01,  9.60it/s]Caching batches:  60%|██████    | 12/20 [00:00<00:00, 66.56it/s]Caching batches: 100%|██████████| 20/20 [00:00<00:00, 70.10it/s]
-Cached 20 batches.
-Total time spent in latent encoding: 0.0000 seconds
-Total time spent in latent loading: 0.0417 seconds
-Total time spent concatenating latents: 0.0030 seconds
-skipped compile because something dubious was happening in debug.
-WARNING: lora_unet_conv_in dim (rank) is changed to: 4
-WARNING: lora_unet_conv_out dim (rank) is changed to: 4
-DEBUG: Total BatchedLoRAModule creations: 512
-DEBUG: Total module replacements: 512
-Using seed 438503372045700 for training.
-Shape of initial latents (batch['latents']): torch.Size([8, 4, 96, 96])
-Shape of unet_timesteps_cfg: torch.Size([16])
-Shape of noisy_latents_cfg: torch.Size([16, 4, 96, 96])
-Shape of text_embeddings_cfg: torch.Size([16, 77, 2048])
-Shape of pooled_embeds_cfg: torch.Size([16, 1280])
-Shape of add_time_ids_cfg: torch.Size([16, 6])
-Shape of predicted_noise_cfg_reduced: torch.Size([4, 4, 96, 96])
-Shape of noise: torch.Size([8, 4, 96, 96])
-Configured batch size: 8
---- EXCEPTION OCCURRED ---
-Traceback (most recent call last):
-  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 511, in <module>
-    main()
-  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 498, in main
-    environment = training_loop(environment, static_batches)
-  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 395, in training_loop
-    loss = train_step(environment, batch, seed + i)
-  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 376, in train_step
-    loss = calculate_paired_loss(predicted_noise_cfg_reduced, noise, pair_indices, is_low_cases)
-  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batch_slider_algo.py", line 86, in calculate_paired_loss
-    loss_per_item_cfg = (predicted_noise - target_noise).pow(2).mean(dim=[1, 2, 3])
-RuntimeError: The size of tensor a (4) must match the size of tensor b (8) at non-singleton dimension 0

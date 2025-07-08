@@ -21,7 +21,8 @@ def process_and_cache_item(
     load_from_persistent_storage_fn: Callable = None, # Optional: Function to load from disk
     environment: Dict[str, Any] = None, # Pass environment if needed by encoder/invalidation/save/load
     config: Any = None, # Pass config if needed by encoder/invalidation/save/load
-    item_type: str = "item" # For logging/context
+    item_type: str = "item", # For logging/context
+    force_reencode: bool = False # New parameter: if True, bypass invalidation check
 ) -> None:
     """
     Processes an item, encodes it, and caches it if not already validly cached.
@@ -37,12 +38,14 @@ def process_and_cache_item(
     if load_from_persistent_storage_fn:
         existing_data = load_from_persistent_storage_fn(item_identifier, environment, config) # Pass item_identifier to load_fn
 
-    if existing_data is not None and invalidation_check_fn(item_identifier, existing_data, environment, config):
+    if existing_data is not None and not force_reencode and invalidation_check_fn(item_identifier, existing_data, environment, config):
         cache_map[key] = existing_data
         return
     else:
-        if existing_data is not None:
+        if existing_data is not None and not force_reencode:
             print(f"[{item_type}] Cached data for {key} is invalid or not found. Re-encoding.")
+        elif force_reencode:
+            print(f"[{item_type}] Forcing re-encoding for {key} due to invalidate_latent_cache flag.")
 
     encoded_data = encoder_fn(item_identifier, environment, config)
     cache_map[key] = encoded_data
@@ -52,45 +55,83 @@ def process_and_cache_item(
 
 # --- Helper functions for Images ---
 
-def _image_encoder_fn(image_path: str, environment: Dict[str, Any], config: Any) -> torch.Tensor:
+def _image_encoder_fn(image_path: str, environment: Dict[str, Any], config: Any) -> Tuple[Dict[Tuple[int, int], torch.Tensor], Tuple[int, int]]:
     vae = environment['vae']
     device = environment['device']
     weight_dtype = environment['weight_dtype']
-    max_resolution = tuple(config.train.get("resolution", (512, 512)))
+    target_resolution = tuple(config.train.get("resolution", (512, 512))) # This is the resolution we are currently encoding for
 
     image = Image.open(image_path).convert("RGB")
-    image = resize_image_if_needed(image, max_resolution)
+    original_image_size = image.size # Capture original size
+
+    # Resize image to the target resolution for encoding
+    resized_image = resize_image_if_needed(image, target_resolution)
     
-    # encode_images_to_latents expects a list of images
-    new_latents_gpu, _ = encode_images_to_latents([image], vae, device, weight_dtype)
-    return new_latents_gpu.cpu().squeeze(0) # Return single latent on CPU
+    # Encode the resized image to latent
+    # encode_images_to_latents expects a list of images and returns a list of latents
+    new_latent_gpu = encode_images_to_latents([resized_image], vae, device, weight_dtype)[0]
+    
+    # Store the latent keyed by its resolution
+    latents_by_resolution = {target_resolution: new_latent_gpu.cpu().squeeze(0)}
+    
+    return latents_by_resolution, original_image_size
 
 def _image_cache_key_fn(image_path: str) -> str:
     return image_path
 
-def _image_invalidation_check_fn(image_path: str, existing_latent: torch.Tensor, environment: Dict[str, Any], config: Any) -> bool:
-    # Re-encode the image to compare with existing_latent
-    new_latent = _image_encoder_fn(image_path, environment, config)
+def _image_invalidation_check_fn(image_path: str, existing_data: Dict[str, Any], environment: Dict[str, Any], config: Any) -> bool:
+    target_resolution = tuple(config.train.get("resolution", (512, 512)))
+    
+    if not existing_data or target_resolution not in existing_data["latents"]:
+        print(f"Latent for {image_path} at resolution {target_resolution} not found in cache. Re-encoding.")
+        return False
+
+    # Re-encode the image for the current target resolution to compare
+    new_latents_by_resolution, _ = _image_encoder_fn(image_path, environment, config)
+    new_latent = new_latents_by_resolution[target_resolution]
+    existing_latent = existing_data["latents"][target_resolution]
+
     are_close = torch.allclose(existing_latent, new_latent, atol=1e-4, rtol=1e-3)
     if not are_close:
         diff = torch.mean(torch.abs(existing_latent - new_latent))
-        print(f"Latent mismatch for {image_path}. Mean absolute difference: {diff.item()}.")
+        print(f"Latent mismatch for {image_path} at resolution {target_resolution}. Mean absolute difference: {diff.item()}. Re-encoding.")
     return are_close
 
-def _image_save_fn(image_path: str, latent: torch.Tensor, environment: Dict[str, Any], config: Any) -> None:
-    output_dir = Path(config.dataset_config.dataset.folder_main) / "latents" # Assuming this path structure
+def _image_save_fn(image_path: str, encoded_data: Tuple[Dict[Tuple[int, int], torch.Tensor], Tuple[int, int]], environment: Dict[str, Any], config: Any) -> None:
+    output_dir = Path(config.dataset.folder_main) / "latents"
     os.makedirs(output_dir, exist_ok=True)
     latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
     latent_path = os.path.join(output_dir, latent_filename)
-    torch.save(latent, latent_path)
 
-def _image_load_fn(image_path: str, environment: Dict[str, Any], config: Any) -> Union[torch.Tensor, None]:
-    output_dir = Path(config.dataset_config.dataset.folder_main) / "latents"
+    latents_by_resolution, original_image_size = encoded_data
+
+    # Load existing data if any, to merge new resolution latents
+    existing_data = _image_load_fn(image_path, environment, config)
+    if existing_data:
+        existing_latents = existing_data["latents"]
+        existing_latents.update(latents_by_resolution) # Merge new latents
+        latents_to_save = existing_latents
+    else:
+        latents_to_save = latents_by_resolution
+
+    data_to_save = {
+        "original_image_size": original_image_size,
+        "latents": latents_to_save
+    }
+    torch.save(data_to_save, latent_path)
+
+def _image_load_fn(image_path: str, environment: Dict[str, Any], config: Any) -> Union[Dict[str, Any], None]:
+    output_dir = Path(config.dataset.folder_main) / "latents"
     latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
     latent_path = os.path.join(output_dir, latent_filename)
     if os.path.exists(latent_path):
         try:
-            return torch.load(latent_path, map_location='cpu')
+            loaded_data = torch.load(latent_path, map_location='cpu')
+            if isinstance(loaded_data, torch.Tensor):
+                # Old format detected, invalidate by returning None to force re-encoding
+                print(f"Warning: Old latent format detected for {image_path}. Invalidating cache to force re-encoding.")
+                return None
+            return loaded_data
         except Exception as e:
             print(f"Warning: Could not load existing latent for {image_path}: {e}")
             return None
@@ -158,7 +199,8 @@ def build_unified_embedding_cache(config: Any, environment: Dict[str, Any], trai
             load_from_persistent_storage_fn=_image_load_fn,
             environment=environment,
             config=config,
-            item_type="image"
+            item_type="image",
+            force_reencode=config.train.get("invalidate_latent_cache", False)
         )
     
     # 3. Process unique prompts

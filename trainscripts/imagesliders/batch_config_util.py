@@ -54,7 +54,7 @@ def config_io():
         config.dataset.update(prompts_config)
 
     # Load and merge model config if specified
-    if 'model_config' in config and 'refpath' in config.model_config:
+    if 'model_config' in config and config.model_config is not None and 'refpath' in config.model_config:
         model_config_path = config.model_config.refpath
         print(f"Loading and merging model config from: {model_config_path}")
         model_config = AttrDict(load_config_from_yaml(model_config_path))
