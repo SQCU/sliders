@@ -338,8 +338,7 @@ def test_backpropagation():
             print(f"VRAM (after UNet forward pass with LoRA): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
 
         # --- Perform loss calculation ---
-        # Ensure predicted_noise and target_noise are on the correct dtype for loss calculation if needed
-        # (Relaxed assertion allows float32 loss even with bfloat16 inputs)
+        # ALERT: MUST BE IN THE CONTEXT MANAGER 'with network' FOR GRADIENT CHECKPOINTING OF LORA SCALES
         loss = scale_n_tuple_loss(predicted_noise, target_noise, group_indices)
 
         if torch.cuda.is_available():
