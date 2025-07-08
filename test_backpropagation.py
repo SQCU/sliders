@@ -267,19 +267,19 @@ def generate_noise_and_prepare_cfg(noise_scheduler, config, device, seed, latent
 
 @log_step("Performing UNet forward pass with LoRA...")
 @log_vram
-def perform_forward_pass(unet, noise_scheduler, unet_timesteps_cfg, latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, guidance_scale):
+def perform_forward_pass(unet, noise_scheduler, noise_data, initial_data):
     predicted_noise_raw = batched_predict_noise_xl(
         unet,
         noise_scheduler,
-        unet_timesteps_cfg,
-        latents_cfg,
-        text_embeddings_cfg,
-        pooled_embeds_cfg,
-        add_time_ids_cfg,
-        guidance_scale=guidance_scale,
+        noise_data.unet_timesteps_cfg,
+        noise_data.latents_cfg,
+        initial_data.text_embeddings_cfg,
+        initial_data.pooled_embeds_cfg,
+        initial_data.add_time_ids_cfg,
+        initial_data.guidance_scale,
     )
     predicted_noise_uncond, predicted_noise_text = predicted_noise_raw.chunk(2)
-    predicted_noise = (predicted_noise_uncond + guidance_scale * (
+    predicted_noise = (predicted_noise_uncond + initial_data.guidance_scale * (
         predicted_noise_text - predicted_noise_uncond
     )).to(unet.device)
     return predicted_noise
@@ -294,6 +294,8 @@ def calculate_loss(predicted_noise, target_noise, group_indices):
 def perform_backpropagation(loss):
     loss.backward()
 
+@log_step("Running backpropagation test...")
+@log_vram
 def test_backpropagation():
     config = load_and_prepare_config()
     environment = envsetup(config)
@@ -311,7 +313,6 @@ def test_backpropagation():
 
     data = load_initial_data(capture_dir, device, weight_dtype)
 
-    print(f"Shape of latents: {data.latents.shape}, group_indices: {data.group_indices.shape}, scales: {data.scales.shape}")
     assert data.latents.shape[0] == data.group_indices.shape[0], f"Batch size mismatch: latents.shape[0]={data.latents.shape[0]}, group_indices.shape[0]={data.group_indices.shape[0]}"
     assert data.latents.shape[0] == data.scales.shape[0], f"Batch size mismatch: latents.shape[0]={data.latents.shape[0]}, scales.shape[0]={data.scales.shape[0]}"
 
@@ -324,12 +325,8 @@ def test_backpropagation():
         predicted_noise = perform_forward_pass(
             unet,
             noise_scheduler,
-            noise_data.unet_timesteps_cfg,
-            noise_data.latents_cfg,
-            data.text_embeddings_cfg,
-            data.pooled_embeds_cfg,
-            data.add_time_ids_cfg,
-            data.guidance_scale
+            noise_data,
+            data
         )
         loss = calculate_loss(predicted_noise, noise_data.target_noise, data.group_indices)
         perform_backpropagation(loss)
@@ -339,15 +336,14 @@ def test_backpropagation():
     assert loss.device.type == device.type, f"Loss device type mismatch: expected {device.type}, got {loss.device.type}"
     assert loss.dtype == weight_dtype or (weight_dtype == torch.bfloat16 and loss.dtype == torch.float32), f"Loss dtype mismatch: expected {weight_dtype} or float32, got {loss.dtype}"
     
-    print(f"Calculated loss: {loss.item()}")
-    print("Successfully performed backpropagation and verified output.")
+    # The decorators handle logging for these steps.
+    # print(f"Calculated loss: {loss.item()}")
+    # print("Successfully performed backpropagation and verified output.")
 
 if __name__ == "__main__":
     log_file_path, orig_stdout, orig_stderr, log_file = None, None, None, None
     try:
         log_file_path, orig_stdout, orig_stderr, log_file = setup_logging()
-        print(f"--- Starting Backpropagation Test ---")
-        print(f"All output will be redirected to: {log_file_path}")
         test_backpropagation()
     except Exception as e:
         import traceback
