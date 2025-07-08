@@ -27,6 +27,7 @@ class BatchedLoRAModule(nn.Module):
         super().__init__()
         self.lora_name = lora_name
         self.lora_dim = lora_dim
+        print(f"DEBUG: Initializing BatchedLoRAModule: {lora_name}")
 
         if "Linear" in org_module.__class__.__name__:
             in_dim = org_module.in_features
@@ -114,9 +115,13 @@ class BatchedLoRANetwork(nn.Module):
         self.train_method = train_method
         self.target_replace = target_replace
         self.unet_loras: nn.ModuleList[BatchedLoRAModule] = nn.ModuleList()
+        self.module_creation_count = 0 # DEBUG
+        self.module_replacement_count = 0 # DEBUG
 
         # Create BatchedLoRAModule instances and apply them to the UNet
         self._create_and_apply_modules(unet)
+        print(f"DEBUG: Total BatchedLoRAModule creations: {self.module_creation_count}") # DEBUG
+        print(f"DEBUG: Total module replacements: {self.module_replacement_count}") # DEBUG
 
         # Ensure no duplicate lora names
         lora_names = set()
@@ -169,12 +174,14 @@ class BatchedLoRANetwork(nn.Module):
                 lora_name, child_module, self.lora_dim, self.alpha
             )
             self.unet_loras.append(lora_module)
+            self.module_creation_count += 1 # DEBUG
 
             # 2. Create the injection container
             injected_layer = LoRAInjectedLayer(child_module, lora_module)
 
             # 3. Replace the original layer with our new container
             setattr(parent_module, child_name, injected_layer)
+            self.module_replacement_count += 1 # DEBUG
 
     def _should_apply_lora(self, name: str, module: nn.Module) -> bool:
         """
