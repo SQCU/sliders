@@ -127,45 +127,55 @@ def get_add_time_ids(
     #print(f"Shape of add_time_ids in get_add_time_ids: {add_time_ids.shape}")
     return add_time_ids
 
-def batched_predict_noise_xl(
+def nocfg_predict_noise_xl(
     unet: torch.nn.Module,
     scheduler,
-    timestep: torch.Tensor, # Changed to torch.Tensor
+    timestep: torch.Tensor,
     latents: torch.FloatTensor,
-    text_embeddings: torch.FloatTensor, # uncond な text embed と cond な text embed を結合したもの
-    add_text_embeddings: torch.FloatTensor, # pooled なやつ
+    text_embeddings: torch.FloatTensor,
+    add_text_embeddings: torch.FloatTensor,
     add_time_ids: torch.FloatTensor,
-    guidance_scale: float = 7.5,
+    guidance_scale: None,
 ) -> torch.FloatTensor:
-    """
-    A modular version of predict_noise_xl, orchestrating the sub-components.
-    This function can be easily modified to swap out different guidance strategies.
-    """
-
-    device = unet.device
+    #device = unet.device
     latent_model_input = latents
     latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
-    
+    if guidance_scale is not None:
+        print("you seem to have passed a guidance scale:{guidance_scale}. this function deprecates that!\ncontinuing...\n")
     added_cond_kwargs = {
         "text_embeds": add_text_embeddings,
         "time_ids": add_time_ids.to(torch.float32),
     }
 
-    #debugging logging block:
-    print(f"latent_model_input shape: {latent_model_input.shape}")
-    print(f"timestep shape,dtype: {timestep.shape},{timestep.dtype}")
-    print(f"text_embeddings shape: {text_embeddings.shape}")
-    print(f"add_text_embeddings shape: {add_text_embeddings.shape}")
-    print(f"add_time_ids shape: {add_time_ids.shape}")
-    print(f"add_time_ids dtype: {add_time_ids.dtype}")
-
     noise_pred = unet(
         latent_model_input.to(unet.dtype),
-        timestep,   #don't cast to network dtype, these need to be torch.long
+        timestep,
         encoder_hidden_states=text_embeddings.to(unet.dtype),
         added_cond_kwargs=added_cond_kwargs
     ).sample
-    
+    return noise_pred
+
+def batched_predict_noise_xl(
+    unet: torch.nn.Module,
+    scheduler,
+    timestep: torch.Tensor,
+    latents: torch.FloatTensor,
+    text_embeddings: torch.FloatTensor,
+    add_text_embeddings: torch.FloatTensor,
+    add_time_ids: torch.FloatTensor,
+    guidance_scale: float = 7.5,
+) -> torch.FloatTensor:
+    # Call the new no-CFG prediction function
+    noise_pred = nocfg_predict_noise_xl(
+        unet,
+        scheduler,
+        timestep,
+        latents,
+        text_embeddings,
+        add_text_embeddings,
+        add_time_ids,
+    )
+
     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
     guided_target = noise_pred_uncond + guidance_scale * (
         noise_pred_text - noise_pred_uncond

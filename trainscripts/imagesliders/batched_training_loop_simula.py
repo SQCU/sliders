@@ -486,7 +486,7 @@ def train_step(environment: dict, batch: dict, seed: int):
         print(f"Shape of pooled_embeds_cfg: {pooled_embeds_cfg.shape}")
         print(f"Shape of add_time_ids_cfg: {add_time_ids_cfg.shape}")
         
-        predicted_noise = batch_train_util.batched_predict_noise_xl(
+        noise_pred = batch_train_util.nocfg_predict_noise_xl(
             unet,
             noise_scheduler,
             unet_timesteps_cfg,
@@ -494,7 +494,10 @@ def train_step(environment: dict, batch: dict, seed: int):
             text_embeddings_cfg,
             pooled_embeds_cfg,
             add_time_ids_cfg,
-            guidance_scale=guidance_scale,
+        )
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        predicted_noise = noise_pred_uncond + guidance_scale * (
+            noise_pred_text - noise_pred_uncond
         )
 
     # Calculate loss using the new paired loss function

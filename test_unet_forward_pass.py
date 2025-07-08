@@ -246,7 +246,8 @@ def test_unet_forward_pass():
 
     # Perform UNet forward pass
     with torch.no_grad(): # UNet forward pass is typically done without grad for inference/evaluation
-        predicted_noise = batched_predict_noise_xl(
+        # Use the new nocfg_predict_noise_xl function
+        predicted_noise_raw = nocfg_predict_noise_xl(
             unet,
             noise_scheduler,
             unet_timesteps_cfg,
@@ -255,6 +256,11 @@ def test_unet_forward_pass():
             pooled_embeds_cfg,
             add_time_ids_cfg,
             guidance_scale=guidance_scale,
+        )
+        # Apply CFG logic explicitly
+        predicted_noise_uncond, predicted_noise_text = predicted_noise_raw.chunk(2)
+        predicted_noise = predicted_noise_uncond + guidance_scale * (
+            predicted_noise_text - predicted_noise_uncond
         )
 
     if torch.cuda.is_available():
