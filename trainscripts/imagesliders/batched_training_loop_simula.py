@@ -580,7 +580,7 @@ def main():
     #WOOO COMPILE TIME!!!
     #if config.other.torch_compile:
     print("compiling unet for very fast hayai")
-    unet2 = torch.compile(unet, mode="reduce-overhead", fullgraph=True)
+    unet2 = torch.compile(unet2, mode="reduce-overhead", fullgraph=True)
     environment['unet'] = unet2
 
 
