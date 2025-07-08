@@ -35,9 +35,36 @@ def parse_precision(precision: str) -> torch.dtype:
 from diffusers import DDPMScheduler, UNet2DConditionModel, AutoencoderKL, StableDiffusionXLPipeline
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, EulerAncestralDiscreteScheduler, SchedulerMixin
-from trainscripts.imagesliders.batch_train_util import nocfg_predict_noise_xl
+from trainscripts.imagesliders.batch_train_util import nocfg_predict_noise_xl as batched_predict_noise_xl # Renamed for clarity
 
-# Re-implement load_models and create_noise_scheduler to load actual models
+# NEW: scale_n_tuple_loss function
+def scale_n_tuple_loss(
+    predicted_noise: torch.Tensor,
+    target_noise: torch.Tensor,
+    group_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Calculates a loss for scale-n-tuple groups.
+    Assumes predicted_noise and target_noise are already CFG-processed and N_eff sized.
+    """
+    # Calculate MSE loss per-element, then reduce to a per-item scalar
+    # This will have shape (N_eff,)
+    loss_per_item = (predicted_noise - target_noise).pow(2).mean(dim=[-3, -2, -1])
+
+    # Group losses by group_indices and sum them
+    unique_groups = torch.unique(group_indices)
+    summed_group_losses = []
+    for group_id in unique_groups:
+        group_mask = (group_indices == group_id)
+        summed_group_losses.append(loss_per_item[group_mask].sum()) # Sum within each group
+
+    if not summed_group_losses:
+        return torch.tensor(0.0, device=predicted_noise.device, dtype=predicted_noise.dtype)
+
+    # Average the summed group losses
+    return torch.stack(summed_group_losses).mean()
+
+
 def load_models(config, device, weight_dtype):
     print(f"Loading models from {config.pretrained_model.name_or_path} to device: {device} with dtype: {weight_dtype}")
 
@@ -126,7 +153,7 @@ def envsetup(config):
     }
     return environment
 
-def setup_logging(runname="test_unet_forward_pass"):
+def setup_logging(runname="test_loss_calculation"):
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -144,53 +171,8 @@ def setup_logging(runname="test_unet_forward_pass"):
 
     return log_filename, original_stdout, original_stderr, log_file
 
-# --- Copied from batch_train_util.py for self-containment ---
-UNET_ATTENTION_TIME_EMBED_DIM = 256  # XL
-TEXT_ENCODER_2_PROJECTION_DIM = 1280
-UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM = 2816
-
-def batched_predict_noise_xl(
-    unet: torch.nn.Module,
-    scheduler,
-    timestep: torch.Tensor, # Changed to torch.Tensor
-    latents: torch.FloatTensor,
-    text_embeddings: torch.FloatTensor, # uncond な text embed と cond な text embed を結合したもの
-    add_text_embeddings: torch.FloatTensor, # pooled なやつ
-    add_time_ids: torch.FloatTensor,
-    guidance_scale: float = 7.5,
-) -> torch.FloatTensor:
-    """
-    A modular version of predict_noise_xl, orchestrating the sub-components.
-    This function can be easily modified to swap out different guidance strategies.
-    """
-
-    device = unet.device
-    latent_model_input = latents
-    latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
-    
-    added_cond_kwargs = {
-        "text_embeds": add_text_embeddings,
-        "time_ids": add_time_ids.to(torch.float32),
-    }
-
-    noise_pred = unet(
-        latent_model_input.to(unet.dtype),
-        timestep,   #don't cast to network dtype, these need to be torch.long
-        encoder_hidden_states=text_embeddings.to(unet.dtype),
-        added_cond_kwargs=added_cond_kwargs
-    ).sample
-    
-    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-    guided_target = noise_pred_uncond + guidance_scale * (
-        noise_pred_text - noise_pred_uncond
-    )
-    return guided_target
-# --- End copied functions ---
-
-def test_unet_forward_pass():
-    # i am writing this documentation to understand the flow of data and flow of control in the executed program.
-    # i am not editing control flow or data flow. i am here to understand and judge without controlling what i read.
-    # This test specifically tracks VRAM usage during the UNet forward pass.
+def test_loss_calculation():
+    # This test specifically tracks VRAM usage during the loss calculation.
 
     # Simulate command-line arguments for config_io
     original_argv = sys.argv
@@ -229,26 +211,58 @@ def test_unet_forward_pass():
         print(f"VRAM (initial): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
 
     # Load captured inputs for UNet forward pass
-    latents_cfg = torch.load(capture_dir / "02_latents_cfg.pt").to(device, dtype=weight_dtype)
+    # We will re-generate noisy_latents and noise, but use captured text embeddings etc.
     text_embeddings_cfg = torch.load(capture_dir / "03_text_embeddings_cfg.pt").to(device, dtype=weight_dtype)
     pooled_embeds_cfg = torch.load(capture_dir / "04_pooled_embeds_cfg.pt").to(device, dtype=weight_dtype)
     add_time_ids_cfg = torch.load(capture_dir / "05_add_time_ids_cfg.pt").to(device, dtype=torch.float32) # Keep float32
-    unet_timesteps_cfg = torch.load(capture_dir / "06_unet_timesteps_cfg.pt").to(device) # Timesteps are long
-
-    if torch.cuda.is_available():
-        print(f"VRAM (after loading and moving captured data): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+    # unet_timesteps_cfg will be generated based on timesteps_to
 
     # Get guidance_scale from the initial batch (assuming it's consistent)
     initial_batch = torch.load(capture_dir / "00_initial_batch.pt")
+    latents = initial_batch["latents"].to(device, dtype=weight_dtype) # Original noiseless latents
+    group_indices = initial_batch["pair_indices"].to(device) # Using pair_indices as group_indices for now
+    is_low_cases = initial_batch["is_low_cases"].to(device)
     guidance_scale = initial_batch["guidance_scale"]
 
-    if torch.cuda.is_available():
-        print(f"VRAM (before UNet forward pass): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+    # --- Batch validation logic ---
+    print(f"Shape of latents from initial_batch: {latents.shape}")
+    print(f"Shape of group_indices (pair_indices) from initial_batch: {group_indices.shape}")
+    print(f"Shape of is_low_cases from initial_batch: {is_low_cases.shape}")
+    # Assert that the batch dimensions are consistent
+    assert latents.shape[0] == group_indices.shape[0], \
+        f"Batch size mismatch: latents.shape[0]={latents.shape[0]}, group_indices.shape[0]={group_indices.shape[0]}"
+    assert latents.shape[0] == is_low_cases.shape[0], \
+        f"Batch size mismatch: latents.shape[0]={latents.shape[0]}, is_low_cases.shape[0]={is_low_cases.shape[0]}"
 
-    # Perform UNet forward pass
+    if torch.cuda.is_available():
+        print(f"VRAM (after loading initial data): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+
+    # --- Replicate TIMESTEP LOGIC from train_step ---
+    with torch.no_grad():
+        noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
+        generator = torch.Generator(device=device).manual_seed(seed)
+        
+        # Generate a random timestep for each item in the batch
+        timesteps_to = torch.randint(
+            1, config.train.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
+        ).long()
+
+        # Generate noise (this will be our target_noise)
+        target_noise = torch.randn(latents.shape, device=latents.device, generator=generator)
+        
+        # Add noise to latents to get noisy_latents (input to UNet)
+        noisy_latents = noise_scheduler.add_noise(latents, target_noise, timesteps_to)
+
+        # Prepare CFG-ready latents and timesteps for UNet
+        latents_cfg = torch.cat([noisy_latents, noisy_latents], dim=0)
+        unet_timesteps_cfg = torch.cat([timesteps_to, timesteps_to], dim=0)
+
+    if torch.cuda.is_available():
+        print(f"VRAM (after noise generation and CFG prep): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+
+    # Perform UNet forward pass to get predicted_noise
     with torch.no_grad(): # UNet forward pass is typically done without grad for inference/evaluation
-        # Use the new nocfg_predict_noise_xl function
-        predicted_noise_raw = nocfg_predict_noise_xl(
+        predicted_noise_raw = batched_predict_noise_xl(
             unet,
             noise_scheduler,
             unet_timesteps_cfg,
@@ -258,7 +272,7 @@ def test_unet_forward_pass():
             add_time_ids_cfg,
             guidance_scale=guidance_scale,
         )
-        # Apply CFG logic explicitly
+        # Apply CFG logic explicitly to get N_eff sized predicted_noise
         predicted_noise_uncond, predicted_noise_text = predicted_noise_raw.chunk(2)
         predicted_noise = (predicted_noise_uncond + guidance_scale * (
             predicted_noise_text - predicted_noise_uncond
@@ -267,30 +281,29 @@ def test_unet_forward_pass():
     if torch.cuda.is_available():
         print(f"VRAM (after UNet forward pass): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
 
-    # Assertions for output shape and type (we don't have a captured predicted_noise)
-    
-    print(f"Predicted noise raw shape: {predicted_noise_raw.shape}")
-    print(f"Predicted noise cfg shape: {predicted_noise.shape}")
-    print(f"Latents CFG shape: {latents_cfg.shape}")
-    assert predicted_noise_raw.shape == latents_cfg.shape
-    assert predicted_noise.dtype == weight_dtype
-    print(f"Expected device: {device}")
-    print(f"Predicted noise device: {predicted_noise.device}")
-    assert predicted_noise.device.type == device.type
+    # --- Perform loss calculation using the new scale_n_tuple_loss ---
+    with torch.no_grad(): # Loss calculation is typically done without grad for testing
+        loss = scale_n_tuple_loss(predicted_noise, target_noise, group_indices)
 
-    print("Successfully simulated UNet forward pass. Review VRAM logs for memory behavior.")
+    if torch.cuda.is_available():
+        print(f"VRAM (after loss calculation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+
+    # --- Assertions ---
+    assert isinstance(loss, torch.Tensor), "Loss should be a torch.Tensor"
+    assert loss.ndim == 0, "Loss should be a scalar tensor"
+    assert loss.device.type == device.type, f"Loss device type mismatch: expected {device.type}, got {loss.device.type}"
+    assert loss.dtype == weight_dtype or (weight_dtype == torch.bfloat16 and loss.dtype == torch.float32), f"Loss dtype mismatch: expected {weight_dtype} or float32, got {loss.dtype}"
     
-    # Save predicted_noise for the next test
-    torch.save(predicted_noise, capture_dir / '08_predicted_noise.pt')
-    print(f"Saved predicted_noise to {capture_dir / '08_predicted_noise.pt'}")
+    print(f"Calculated loss: {loss.item()}")
+    print("Successfully calculated scale-n-tuple loss and verified output.")
 
 if __name__ == "__main__":
     log_file_path, orig_stdout, orig_stderr, log_file = None, None, None, None
     try:
         log_file_path, orig_stdout, orig_stderr, log_file = setup_logging()
-        print(f"--- Starting UNet Forward Pass Test ---")
+        print(f"--- Starting Loss Calculation Test ---")
         print(f"All output will be redirected to: {log_file_path}")
-        test_unet_forward_pass()
+        test_loss_calculation()
     except Exception as e:
         import traceback
         print("--- EXCEPTION OCCURRED ---", file=sys.stderr)

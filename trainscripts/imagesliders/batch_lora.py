@@ -229,7 +229,7 @@ class BatchedLoRANetwork(nn.Module):
             #lora_module.current_multiplier = scales.to(lora_module.lora_down.weight.device)
             #what is this curious and inexplicable gemini 2.5 code saying to do?
             #the reference lora.py does the same thing i just wrote below btw.
-            lora_module.current_multiplier = scales
+            lora_module.current_multiplier = scales.detach()
 
     def __enter__(self):
         """
