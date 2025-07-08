@@ -149,6 +149,7 @@ def envsetup(config):
         "weight_dtype": weight_dtype,
         "config": config,
         "optimizer": optimizer,
+        "generator": torch.Generator(device=device).manual_seed(config.train.seed),
     }
     return environment
 

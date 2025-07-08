@@ -44,6 +44,18 @@ UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM = 2816
 SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
 DIFFUSERS_CACHE_DIR = None # if you want to change the cache dir, change this
 
+def rectify_batch_fn(batch: dict, device: torch.device, weight_dtype: torch.dtype) -> dict:
+    """
+    Moves batch data to the appropriate device and dtype.
+    """
+    batch['latents'] = batch['latents'].to(device, dtype=weight_dtype)
+    batch['scales'] = batch['scales'].to(device, dtype=weight_dtype)
+    batch['pair_indices'] = batch['pair_indices'].to(device)
+    batch['is_low_cases'] = batch['is_low_cases'].to(device)
+    batch['cfg_text_embeddings'] = batch['cfg_text_embeddings'].to(device, dtype=weight_dtype)
+    batch['cfg_pooled_embeds'] = batch['cfg_pooled_embeds'].to(device, dtype=weight_dtype)
+    batch['add_time_ids'] = batch['add_time_ids'].to(device, dtype=torch.float32) # Keep this float32!
+    return batch
 
 
 def prepare_cached_batches(config, environment):
@@ -64,12 +76,8 @@ def prepare_cached_batches(config, environment):
     for batch_items in tqdm(training_schedule, desc="Caching batches"):
         latents = []
         scales = []
-        all_positive_text_embeddings = []
-        all_positive_pooled_embeds = []
-        all_neutral_text_embeddings = []
-        all_neutral_pooled_embeds = []
-        all_uncond_text_embeddings = []
-        all_uncond_pooled_embeds = []
+        all_cfg_text_embeddings = []
+        all_cfg_pooled_embeds = []
 
         pair_indices = []
         is_low_cases = []
@@ -89,24 +97,29 @@ def prepare_cached_batches(config, environment):
                 neutral_pooled_embeds,
             ) = text_embeddings_cache[frozenset(item.prompt.items())]
 
+            # Select the appropriate conditional embeddings based on is_low_case
             if item.is_low_case:
-                all_cond_text_embeddings.append(neutral_text_embeds)
-                all_cond_pooled_embeds.append(neutral_pooled_embeds)
+                selected_cond_text_embeds = neutral_text_embeds
+                selected_cond_pooled_embeds = neutral_pooled_embeds
             else:
-                all_cond_text_embeddings.append(positive_text_embeds)
-                all_cond_pooled_embeds.append(positive_pooled_embeds)
+                selected_cond_text_embeds = positive_text_embeds
+                selected_cond_pooled_embeds = positive_pooled_embeds
             
-            all_uncond_text_embeddings.append(uncond_text_embeds)
-            all_uncond_pooled_embeds.append(uncond_pooled_embeds)
+            # Concatenate unconditional and selected conditional embeddings for CFG
+            # Order: [unconditional, selected_conditional]
+            cfg_text_embeds_for_item = torch.cat([uncond_text_embeds, selected_cond_text_embeds], dim=0)
+            cfg_pooled_embeds_for_item = torch.cat([uncond_pooled_embeds, selected_cond_pooled_embeds], dim=0)
+
+            all_cfg_text_embeddings.append(cfg_text_embeds_for_item)
+            all_cfg_pooled_embeds.append(cfg_pooled_embeds_for_item)
 
         latents_batch = torch.cat(latents).to(dtype=weight_dtype)
-
         scales_batch = torch.tensor(scales, dtype=weight_dtype)
-
-        cond_text_embeddings_batch = torch.cat(all_cond_text_embeddings, dim=0)
-        cond_pooled_embeds_batch = torch.cat(all_cond_pooled_embeds, dim=0)
-        uncond_text_embeddings_batch = torch.cat(all_uncond_text_embeddings, dim=0)
-        uncond_pooled_embeds_batch = torch.cat(all_uncond_pooled_embeds, dim=0)
+        
+        # Concatenate all CFG-ready embeddings for the batch
+        # This will result in a tensor of shape (batch_size * 2, ...)
+        cfg_text_embeddings_batch = torch.cat(all_cfg_text_embeddings, dim=0)
+        cfg_pooled_embeds_batch = torch.cat(all_cfg_pooled_embeds, dim=0)
 
         #keep time ids float32
         #hardcode 512x512 for now no wait a second wrong place.
@@ -117,10 +130,8 @@ def prepare_cached_batches(config, environment):
         batch = {
             "latents": latents_batch,
             "scales": scales_batch,
-            "cond_text_embeddings": cond_text_embeddings_batch,
-            "cond_pooled_embeds": cond_pooled_embeds_batch,
-            "uncond_text_embeddings": uncond_text_embeddings_batch,
-            "uncond_pooled_embeds": uncond_pooled_embeds_batch,
+            "cfg_text_embeddings": cfg_text_embeddings_batch,
+            "cfg_pooled_embeds": cfg_pooled_embeds_batch,
             "add_time_ids": add_time_ids,
             "pair_indices": torch.tensor(pair_indices, dtype=torch.long, device=device),
             "is_low_cases": torch.tensor(is_low_cases, dtype=torch.bool, device=device),
@@ -133,21 +144,19 @@ def prepare_cached_batches(config, environment):
     return static_batches
 
 def prepare_cfg_batch(
-    batch: dict,
     noisy_latents: torch.Tensor,
     timesteps_to: torch.Tensor,
     noise_scheduler,
     weight_dtype: torch.dtype,
+    uncond_text_embeddings: torch.Tensor,
+    cond_text_embeddings: torch.Tensor,
+    uncond_pooled_embeds: torch.Tensor,
+    cond_pooled_embeds: torch.Tensor,
+    add_time_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Prepares a CFG-ready batch by concatenating unconditional and conditional embeddings.
     """
-    cond_text_embeddings = batch['cond_text_embeddings']
-    cond_pooled_embeds = batch['cond_pooled_embeds']
-    uncond_text_embeddings = batch['uncond_text_embeddings']
-    uncond_pooled_embeds = batch['uncond_pooled_embeds']
-    add_time_ids = batch['add_time_ids']
-
     latents_cfg = torch.cat([noisy_latents, noisy_latents], dim=0)
     text_embeddings_cfg = torch.cat([uncond_text_embeddings, cond_text_embeddings], dim=0)
     pooled_embeds_cfg = torch.cat([uncond_pooled_embeds, cond_pooled_embeds], dim=0)
@@ -160,7 +169,7 @@ def prepare_cfg_batch(
     return latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg
 
 
-def train_step(environment: dict, batch: dict, seed: int):
+def train_step(environment: dict, batch: dict):
     """
     Performs a single training step. The function is simplified to accept
     the environment dictionary, a single batch of data, and a seed for reproducibility.
@@ -175,20 +184,23 @@ def train_step(environment: dict, batch: dict, seed: int):
     device = environment["device"]
     weight_dtype = environment["weight_dtype"]
 
-    # move batch data to gpu
-    latents = batch["latents"].to(device, dtype=weight_dtype)
-    scales = batch["scales"].to(device, dtype=weight_dtype)
-    pair_indices = batch["pair_indices"].to(device)
-    is_low_cases = batch["is_low_cases"].to(device)
-    guidance_scale = batch["guidance_scale"] 
-    # We also need to move the embeddings that are used in prepare_cfg_batch
-    # Let's just modify the `batch` dict in-place for simplicity before passing it
-    batch['cond_text_embeddings'] = batch['cond_text_embeddings'].to(device, dtype=weight_dtype)
-    batch['cond_pooled_embeds'] = batch['cond_pooled_embeds'].to(device, dtype=weight_dtype)
-    batch['uncond_text_embeddings'] = batch['uncond_text_embeddings'].to(device, dtype=weight_dtype)
-    batch['uncond_pooled_embeds'] = batch['uncond_pooled_embeds'].to(device, dtype=weight_dtype)
-    batch['add_time_ids'] = batch['add_time_ids'].to(device, dtype=torch.float32) # Remember to keep this float32!
-    # Retrieve guidance_scale from batch
+    generator = environment["generator"] # Retrieve the generator from environment
+
+    # Move batch data to gpu
+    batch = rectify_batch_fn(batch, device, weight_dtype)
+
+    latents = batch["latents"]
+    scales = batch["scales"]
+    pair_indices = batch["pair_indices"]
+    is_low_cases = batch["is_low_cases"]
+    guidance_scale = batch["guidance_scale"]
+    cfg_text_embeddings = batch['cfg_text_embeddings']
+    cfg_pooled_embeds = batch['cfg_pooled_embeds']
+    add_time_ids = batch['add_time_ids']
+
+    # Split CFG-ready embeddings into unconditional and conditional parts
+    uncond_text_embeddings, cond_text_embeddings = cfg_text_embeddings.chunk(2)
+    uncond_pooled_embeds, cond_pooled_embeds = cfg_pooled_embeds.chunk(2)
 
     print(f"Shape of initial latents (batch['latents']): {latents.shape}")
 
@@ -212,19 +224,23 @@ def train_step(environment: dict, batch: dict, seed: int):
     # --- END TIMESTEP LOGIC ---
 
     # Form CFG microbatch
-        latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg = prepare_cfg_batch(
-            batch,
-            noisy_latents,
-            timesteps_to,
-            noise_scheduler,
-            weight_dtype,
-        )
+    latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg = prepare_cfg_batch(
+        noisy_latents,
+        timesteps_to,
+        noise_scheduler,
+        weight_dtype,
+        uncond_text_embeddings,
+        cond_text_embeddings,
+        uncond_pooled_embeds,
+        cond_pooled_embeds,
+        add_time_ids,
+    )
 
     # Set LoRA scales, which must match the doubled cfg axis.
     #batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     #hopefully a [batchdim,1] tensor has shape (16,1) -> broadcasts to variably shaped unet layers?
-        batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
-        network.set_lora_scales(batched_scales_cfg)
+    batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
+    network.set_lora_scales(batched_scales_cfg)
 
     with network:
         print(f"Shape of unet_timesteps_cfg: {unet_timesteps_cfg.shape}")
@@ -268,12 +284,11 @@ def training_loop(environment: dict, static_batches: list):
     """
     Main training loop that iterates over a static list of pre-generated batches.
     """
-    seed = torch.initial_seed()
-    print(f"Using seed {seed} for training.")
+    print(f"Starting training loop.")
     
     for i in range(environment["config"].train.iterations):
         batch = static_batches[i % len(static_batches)]
-        loss = train_step(environment, batch, seed + i)
+        loss = train_step(environment, batch)
 
         if i % 10 == 0:
             print(f"Iteration {i+1}/{environment['config'].train.iterations}, Loss: {loss}")

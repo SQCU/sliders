@@ -1,84 +1,90 @@
-def prepare_cached_batches(config, environment):
+def main():
     """
-    Pre-generates and caches all batches for the training loop using the TrainingSchedule.
+    Main function to set up the environment, create the dataset,
+    run the training loop, and handle shutdown.
     """
-    training_schedule = TrainingSchedule(config)
-    unified_cache = build_unified_embedding_cache(config, environment, training_schedule)
-    image_latents_cache = unified_cache["image_latents"]
-    text_embeddings_cache = unified_cache["text_embeddings"]
+    with torch.no_grad():
+        config = config_io()
+        environment = config_envsetup(config) # Use the envsetup from batch_config_util
 
-    print("Pre-generating and caching all batches from schedule...")
-    static_batches = []
+        # Initialize and seed the torch generator for reproducibility
+        generator = torch.Generator(device=environment['device']).manual_seed(config.train.seed)
+        environment['generator'] = generator
 
-    device = environment['device']
-    weight_dtype = environment['weight_dtype']
+        # NOTE: The following VRAM management logic (moving UNet, VAE, Text Encoders to/from CPU)
+        # is intentionally kept as-is, despite its apparent complexity and manual nature,
+        # as per user instruction. It is understood that this is a deliberate design choice
+        # for specific memory optimization needs.
+        tdcpu = torch.device("cpu")
+        # Unload UNet to CPU to free VRAM for VAE and Text Encoders during batch preparation
+        unet1 = environment.pop('unet')
+        unet2 = unet1.to(device=tdcpu)
+        del unet1
+        environment['unet'] = unet2
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    for batch_items in tqdm(training_schedule, desc="Caching batches"):
-        latents = []
-        scales = []
-        all_cfg_text_embeddings = []
-        all_cfg_pooled_embeds = []
-
-        pair_indices = []
-        is_low_cases = []
-        for item in batch_items:
-            latent = image_latents_cache[item.image_path]
-            latents.append(latent)
-            scales.append(item.scale)
-            pair_indices.append(item.pair_index)
-            is_low_cases.append(item.is_low_case)
-
-            (
-                positive_text_embeds,
-                positive_pooled_embeds,
-                uncond_text_embeds,
-                uncond_pooled_embeds,
-                neutral_text_embeds,
-                neutral_pooled_embeds,
-            ) = text_embeddings_cache[frozenset(item.prompt.items())]
-
-            # Select the appropriate conditional embeddings based on is_low_case
-            if item.is_low_case:
-                selected_cond_text_embeds = neutral_text_embeds
-                selected_cond_pooled_embeds = neutral_pooled_embeds
-            else:
-                selected_cond_text_embeds = positive_text_embeds
-                selected_cond_pooled_embeds = positive_pooled_embeds
-            
-            # Concatenate unconditional and selected conditional embeddings for CFG
-            # Order: [unconditional, selected_conditional]
-            cfg_text_embeds_for_item = torch.cat([uncond_text_embeds, selected_cond_text_embeds], dim=0)
-            cfg_pooled_embeds_for_item = torch.cat([uncond_pooled_embeds, selected_cond_pooled_embeds], dim=0)
-
-            all_cfg_text_embeddings.append(cfg_text_embeds_for_item)
-            all_cfg_pooled_embeds.append(cfg_pooled_embeds_for_item)
-
-        latents_batch = torch.cat(latents).to(dtype=weight_dtype)
-        scales_batch = torch.tensor(scales, dtype=weight_dtype)
+        # Prepare cached batches (image latents and text embeddings)
+        static_batches = prepare_cached_batches(config, environment)
         
-        # Concatenate all CFG-ready embeddings for the batch
-        # This will result in a tensor of shape (batch_size * 2, ...)
-        cfg_text_embeddings_batch = torch.cat(all_cfg_text_embeddings, dim=0)
-        cfg_pooled_embeds_batch = torch.cat(all_cfg_pooled_embeds, dim=0)
+        # Unload VAE and Text Encoders to CPU after batch preparation
+        vae = environment.pop('vae')
+        tokenizers = environment.pop('tokenizers')
+        text_encoders = environment.pop('text_encoders')
+        vae=vae.to(device=tdcpu)
+        for te in text_encoders:
+            te=te.to(device=tdcpu)
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        #keep time ids float32
-        #hardcode 512x512 for now no wait a second wrong place.
-        add_time_ids = batch_train_util.get_add_time_ids(
-            1024, 1024, False, dtype=torch.float32
-        ).repeat(len(latents_batch), 1)
+        # Load UNet back to GPU for training
+        unet1 = environment['unet']
+        unet2 = unet1.to(environment['device'])
+        del unet1
+        gc.collect()
+        torch.cuda.empty_cache()
+        #WOOO COMPILE TIME!!!
+        #if config.other.torch_compile:
+        hardcode_allow_compile = False
+        if hardcode_allow_compile:
+            print("compiling unet for very fast hayai")
+            unet2 = torch.compile(unet2, mode="reduce-overhead", fullgraph=True)
+        else:
+            print("skipped compile because something dubious was happening in debug.")
+        environment['unet'] = unet2
 
-        batch = {
-            "latents": latents_batch,
-            "scales": scales_batch,
-            "cfg_text_embeddings": cfg_text_embeddings_batch,
-            "cfg_pooled_embeds": cfg_pooled_embeds_batch,
-            "add_time_ids": add_time_ids,
-            "pair_indices": torch.tensor(pair_indices, dtype=torch.long, device=device),
-            "is_low_cases": torch.tensor(is_low_cases, dtype=torch.bool, device=device),
-            "guidance_scale": item.prompt.get("guidance_scale", 1.0), # Get guidance_scale from prompt, default to 1.0
-        }
-        static_batches.append(batch)
-        
-    print(f"Cached {len(static_batches)} batches.")
+    # Create adapter network
+    network = lora.BatchedLoRANetwork(
+        unet=environment['unet'],
+        rank=config.network.rank,
+        alpha=config.network.alpha,
+        train_method=config.network.training_method,
+    ).to(environment['device'], dtype=environment['weight_dtype'])
 
-    return static_batches
+    #slurp optimizer args from config
+    optimizer_kwargs = {}
+    if hasattr(config.train, "optimizer_args") and config.train.optimizer_args is not None and len(config.train.optimizer_args) > 0:
+        for arg in config.train.optimizer_args.split(" "):
+            key, value = arg.split("=")
+            value = ast.literal_eval(value)
+            optimizer_kwargs[key] = value
+    environment['network'] = network
+    #optimizer_module = train_util.get_optimizer(config.train.optimizer)
+    optimizer = environment['optimizer'](network.prepare_optimizer_params(),
+    lr=config.train.lr, 
+    **optimizer_kwargs )
+
+    lr_scheduler = get_scheduler(
+        name=config.train.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=config.train.iterations,
+    )
+    environment['optimizer']=optimizer#yes this switcharoo is necessary
+    environment['lr_scheduler'] = lr_scheduler
+
+    # Run the training loop with the static batches
+    environment = training_loop(environment, static_batches)
+
+    # Save the final model
+    graceful_shutdown(environment)
