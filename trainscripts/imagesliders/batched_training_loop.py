@@ -86,11 +86,11 @@ def encode_images_to_latents(images, vae, device, weight_dtype):
     start_time = time.time()
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
-    image_tensors = [image_processor.preprocess(image).to(device, dtype=weight_dtype) for image in images]
+    image_tensors = [image_processor.preprocess(image).to(dtype=weight_dtype) for image in images]
     image_batch = torch.cat(image_tensors, dim=0)
     latents = vae.encode(image_batch).latent_dist.sample(None)
     end_time = time.time()
-    return latents, (end_time - start_time)
+    return latents.to(device=torch.device("cpu")), (end_time - start_time)
 
 def save_latents_to_disk(latents, output_dir, image_path, vae_state_dict):
     if not os.path.exists(output_dir):

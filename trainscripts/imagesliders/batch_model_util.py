@@ -20,13 +20,13 @@ def load_models(config, device, weight_dtype):
         cache_dir=DIFFUSERS_CACHE_DIR,
     )
 
-    unet = pipe.unet.to(device, weight_dtype)
+    unet = pipe.unet
     print(f"UNet time_embedding_dim: {unet.config.time_embedding_dim}")
     tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
-    text_encoders = [pipe.text_encoder.to(device, weight_dtype), pipe.text_encoder_2.to(device, weight_dtype)]
+    text_encoders = [pipe.text_encoder, pipe.text_encoder_2]
     if len(text_encoders) == 2:
         text_encoders[1].pad_token_id = 0
-    vae = pipe.vae.to(device, weight_dtype)
+    vae = pipe.vae
     del pipe
     #GET RID OF PIPE!!! 
     #you HAVE TO GET RID OF THE PIPE EVERY TIME!!!

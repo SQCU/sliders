@@ -86,11 +86,11 @@ def encode_images_to_latents(images, vae, device, weight_dtype):
     start_time = time.time()
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
-    image_tensors = [image_processor.preprocess(image).to(device, dtype=weight_dtype) for image in images]
+    image_tensors = [image_processor.preprocess(image).to(dtype=weight_dtype) for image in images]
     image_batch = torch.cat(image_tensors, dim=0)
     latents = vae.encode(image_batch).latent_dist.sample(None)
     end_time = time.time()
-    return latents, (end_time - start_time)
+    return latents.to(device=torch.device("cpu")), (end_time - start_time)
 
 def save_latents_to_disk(latents, output_dir, image_path, vae_state_dict):
     if not os.path.exists(output_dir):
@@ -348,8 +348,8 @@ def prepare_cached_batches(config, environment):
             "uncond_text_embeddings": uncond_text_embeddings_batch,
             "uncond_pooled_embeds": uncond_pooled_embeds_batch,
             "add_time_ids": add_time_ids,
-            "pair_indices": torch.tensor(pair_indices, dtype=torch.long, device=device),
-            "is_low_cases": torch.tensor(is_low_cases, dtype=torch.bool, device=device),
+            "pair_indices": torch.tensor(pair_indices, dtype=torch.long),
+            "is_low_cases": torch.tensor(is_low_cases, dtype=torch.bool),
             "guidance_scale": item.prompt.get("guidance_scale", 1.0), # Get guidance_scale from prompt, default to 1.0
         }
         static_batches.append(batch)
@@ -418,7 +418,7 @@ def train_step(environment: dict, batch: dict, seed: int):
     scales = batch["scales"].to(device, dtype=weight_dtype)
     pair_indices = batch["pair_indices"].to(device)
     is_low_cases = batch["is_low_cases"].to(device)
-    guidance_scale = batch["guidance_scale"] 
+    guidance_scale = batch["guidance_scale"]
     # We also need to move the embeddings that are used in prepare_cfg_batch
     # Let's just modify the `batch` dict in-place for simplicity before passing it
     batch['cond_text_embeddings'] = batch['cond_text_embeddings'].to(device, dtype=weight_dtype)
