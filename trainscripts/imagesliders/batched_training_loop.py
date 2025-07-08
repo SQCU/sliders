@@ -28,14 +28,11 @@ from .batch_config_util import (
 from . import batch_lora as lora
 from . import batch_train_util
 from . import batch_model_util
-from .data_processing_utils import ( # NEW IMPORT
-    get_sha256_checksum,
+from .data_processing_utils import (
     resize_image_if_needed,
     encode_images_to_latents,
-    save_latents_to_disk,
-    check_and_encode_latent,
-    get_latent_for_image,
 )
+from .embedding_cache_util import build_unified_embedding_cache
 from typing import List, Dict, Tuple, Any
 
 from .data_schedule import TrainingSchedule # Import TrainingSchedule
@@ -47,150 +44,41 @@ UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM = 2816
 SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
 DIFFUSERS_CACHE_DIR = None # if you want to change the cache dir, change this
 
-def initialize_latent_cache(config, environment):
-    # ImageScaleDataset is not directly used here, but TrainingSchedule uses it internally
-    # to get unique image paths.
-    # For now, we'll assume TrainingSchedule handles the image path collection.
-    training_schedule = TrainingSchedule(config) # Use TrainingSchedule to get unique image paths
-    unique_image_paths = sorted(list(set([item.image_path for batch in training_schedule for item in batch])))
-    print(f"Found {len(unique_image_paths)} unique images to process for latent cache initialization.")
 
-    vae = environment['vae']
-    device = environment['device']
-    weight_dtype = environment['weight_dtype']
-    output_dir = Path(config.dataset_config.dataset.folder_main) / "latents"
-    
-    vae_batch_size = config.train.get("vae_encoding_batch_size", 4)
-    print(f"Using VAE encoding batch size: {vae_batch_size}")
-
-    max_resolution = tuple(config.train.get("resolution", (512, 512)))
-    print(f"Using max resolution for preprocessing: {max_resolution}")
-
-    total_comparison_time = 0
-    mismatched_files = 0
-
-    for i in tqdm(range(0, len(unique_image_paths), vae_batch_size), desc="Initializing latent cache"):
-        batch_paths = unique_image_paths[i:i+vae_batch_size]
-        
-        images_to_encode = []
-        for path in batch_paths:
-            image = Image.open(path).convert("RGB")
-            image = resize_image_if_needed(image, max_resolution)
-            images_to_encode.append(image)
-        
-        new_latents_gpu, encoding_time = encode_images_to_latents(images_to_encode, vae, device, weight_dtype)
-        new_latents_cpu = new_latents_gpu.cpu()
-
-        for j, img_path in enumerate(batch_paths):
-            new_latent_single = new_latents_cpu[j].unsqueeze(0)
-            
-            latent_filename = os.path.splitext(os.path.basename(img_path))[0] + ".pt"
-            latent_path = os.path.join(output_dir, latent_filename)
-
-            if os.path.exists(latent_path):
-                try:
-                    old_latent = torch.load(latent_path, map_location='cpu')
-                    
-                    comparison_start_time = time.time()
-                    are_close = torch.allclose(old_latent, new_latent_single, atol=1e-4, rtol=1e-3) # Use tolerances
-                    comparison_time = time.time() - comparison_start_time
-                    total_comparison_time += comparison_time
-                    
-                    if not are_close:
-                        mismatched_files += 1
-                        diff = torch.mean(torch.abs(old_latent - new_latent_single))
-                        print(f"Latent mismatch for {img_path}. Mean absolute difference: {diff.item()}. Comparison took {comparison_time:.4f}s.")
-                except Exception as e:
-                    print(f"Warning: Could not load or compare existing latent for {img_path}: {e}")
-
-            torch.save(new_latent_single, latent_path)
-            
-    print(f"Latent cache initialization finished.")
-    print(f"Total time spent on parity checks: {total_comparison_time:.4f} seconds.")
-    if mismatched_files > 0:
-        print(f"Found {mismatched_files} mismatched latents that were updated.")
-
-def initialize_text_embedding_cache(config, environment, training_schedule):
-    print("Initializing text embedding cache...")
-    tokenizers = environment['tokenizers']
-    text_encoders = environment['text_encoders']
-    device = environment['device']
-    weight_dtype = environment['weight_dtype']
-
-    unique_prompts = training_schedule.get_unique_prompts()
-    text_embedding_cache = {}
-
-    #REFACTOR THE SWIZZLING
-    for prompt_dict in tqdm(unique_prompts, desc="Encoding unique prompts"):
-        text_embeddings, pooled_embeds = batch_train_util.create_batched_prompt_embeddings(
-            tokenizers,
-            text_encoders,
-            prompt_dict,
-        )
-
-        # Split the concatenated embeddings
-        positive_text_embeds, uncond_text_embeds, neutral_text_embeds = text_embeddings.chunk(3)
-        positive_pooled_embeds, uncond_pooled_embeds, neutral_pooled_embeds = pooled_embeds.chunk(3)
-
-        text_embedding_cache[frozenset(prompt_dict.items())] = (
-            positive_text_embeds.cpu(),
-            positive_pooled_embeds.cpu(),
-            uncond_text_embeds.cpu(),
-            uncond_pooled_embeds.cpu(),
-            neutral_text_embeds.cpu(),
-            neutral_pooled_embeds.cpu(),
-        )
-    print(f"Cached {len(unique_prompts)} unique text embeddings.")
-    return text_embedding_cache
 
 def prepare_cached_batches(config, environment):
     """
     Pre-generates and caches all batches for the training loop using the TrainingSchedule.
     """
-    if config.train.get("force_init_latentcache", False):
-        initialize_latent_cache(config, environment)
-
     training_schedule = TrainingSchedule(config)
-    text_embedding_cache = initialize_text_embedding_cache(config, environment, training_schedule)
+    unified_cache = build_unified_embedding_cache(config, environment, training_schedule)
+    image_latents_cache = unified_cache["image_latents"]
+    text_embeddings_cache = unified_cache["text_embeddings"]
 
     print("Pre-generating and caching all batches from schedule...")
     static_batches = []
-    total_latent_encoding_time = 0
-    total_latent_load_time = 0
-    total_cat_latents_time = 0
-    total_cat_text_embeds_time = 0
-    total_cat_pooled_embeds_time = 0
 
-    vae = environment['vae']
     device = environment['device']
     weight_dtype = environment['weight_dtype']
-    tokenizers = environment['tokenizers']
-    text_encoders = environment['text_encoders']
 
     for batch_items in tqdm(training_schedule, desc="Caching batches"):
         latents = []
         scales = []
-        all_cond_text_embeddings = []
-        all_cond_pooled_embeds = []
+        all_positive_text_embeddings = []
+        all_positive_pooled_embeds = []
+        all_neutral_text_embeddings = []
+        all_neutral_pooled_embeds = []
         all_uncond_text_embeddings = []
         all_uncond_pooled_embeds = []
 
         pair_indices = []
         is_low_cases = []
         for item in batch_items:
-            latent, encoding_time, load_time = get_latent_for_image(
-                item.image_path, vae, device, weight_dtype, 
-                Path(config.dataset.folder_main) / "latents", 
-                vae.state_dict(),
-                config,
-                force_reencode=config.train.get("force_reencode_latents", False)
-            )
+            latent = image_latents_cache[item.image_path]
             latents.append(latent)
             scales.append(item.scale)
             pair_indices.append(item.pair_index)
             is_low_cases.append(item.is_low_case)
-            total_latent_encoding_time += encoding_time
-            total_latent_load_time += load_time
 
             (
                 positive_text_embeds,
@@ -199,7 +87,7 @@ def prepare_cached_batches(config, environment):
                 uncond_pooled_embeds,
                 neutral_text_embeds,
                 neutral_pooled_embeds,
-            ) = text_embedding_cache[frozenset(item.prompt.items())]
+            ) = text_embeddings_cache[frozenset(item.prompt.items())]
 
             if item.is_low_case:
                 all_cond_text_embeddings.append(neutral_text_embeds)
@@ -211,9 +99,7 @@ def prepare_cached_batches(config, environment):
             all_uncond_text_embeddings.append(uncond_text_embeds)
             all_uncond_pooled_embeds.append(uncond_pooled_embeds)
 
-        cat_latents_start_time = time.time()
         latents_batch = torch.cat(latents).to(dtype=weight_dtype)
-        cat_latents_time = time.time() - cat_latents_start_time
 
         scales_batch = torch.tensor(scales, dtype=weight_dtype)
 
@@ -242,12 +128,7 @@ def prepare_cached_batches(config, environment):
         }
         static_batches.append(batch)
         
-        total_cat_latents_time += cat_latents_time
-
     print(f"Cached {len(static_batches)} batches.")
-    print(f"Total time spent in latent encoding: {total_latent_encoding_time:.4f} seconds")
-    print(f"Total time spent in latent loading: {total_latent_load_time:.4f} seconds")
-    print(f"Total time spent concatenating latents: {total_cat_latents_time:.4f} seconds")
 
     return static_batches
 
