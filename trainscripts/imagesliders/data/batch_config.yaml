@@ -3,7 +3,9 @@
 # but I will leave it in place until the batched trainer works.
 ## model section:
 model_config:
-  refpath: "trainscripts/imagesliders/data/config-xl-batchtest.yaml"
+  #deprecated don't be passing a second script like this, anymore it makes everything grody.
+  #also overwrites keys we set here on purpose.
+  #refpath: "trainscripts/imagesliders/data/config-xl-batchtest.yaml"
 pretrained_model:
   #name_or_path: "stabilityai/stable-diffusion-xl-base-1.0" # you can also use .ckpt or .safetensors models
   name_or_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors"
@@ -22,6 +24,7 @@ train:
   optimizer: "Adam8bit"
   lr_scheduler: "constant"  #or "constant" or "cosine"
   max_denoising_steps: 50
+  resolution: [512, 512]  #read from here for some reason
   batch_size: 4 #now must be assigned here
   bounds_test_vae_batch_size: true
   vae_encoding_batch_size: 20
@@ -38,6 +41,7 @@ other:
   use_pytorch_SDPA: false
   torch_compile: true
   lycorisize: false
+  gradient_checkpointing: true
 
 ## dataset section
 dset_config: #obsolete don't use this in future scripts

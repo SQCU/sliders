@@ -1,11 +1,11 @@
-Logging output to logs\test_backpropagation_2025-07-08_05-06-54.log
+Logging output to logs\test_backpropagation_2025-07-08_05-09-11.log
 STEP: Running backpropagation test...
 STEP: Loading and preparing config...
 STEP: Setting up environment...
 STEP: Loading models...
 Loading models from F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors to device: cuda with dtype: torch.bfloat16
 Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<?, ?it/s]
-Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  29%|██▊       | 2/7 [00:00<00:00, 15.33it/s]Loading pipeline components...:  57%|█████▋    | 4/7 [00:00<00:00,  4.31it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:03<00:00,  1.55it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:03<00:00,  2.22it/s]
+Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  29%|██▊       | 2/7 [00:00<00:00, 15.50it/s]Loading pipeline components...:  57%|█████▋    | 4/7 [00:00<00:00,  4.39it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:03<00:00,  1.56it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:03<00:00,  2.25it/s]
 Enabling gradient checkpointing for UNet.
 VRAM before load_models: 0.00 GB, after: 6.57 GB
 STEP: Creating noise scheduler...

@@ -28,6 +28,14 @@ def parse_precision(precision: str) -> torch.dtype:
 
     raise ValueError(f"Invalid precision type: {precision}")
 
+def deep_merge_attrdict(d1, d2):
+    for k, v in d2.items():
+        if k in d1 and isinstance(d1[k], AttrDict) and isinstance(v, AttrDict):
+            d1[k] = deep_merge_attrdict(d1[k], v)
+        else:
+            d1[k] = v
+    return d1
+
 def config_io():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batchtrainconfig", "--bconfig", "-c",
@@ -50,8 +58,20 @@ def config_io():
         model_config_path = config.model_config.refpath
         print(f"Loading and merging model config from: {model_config_path}")
         model_config = AttrDict(load_config_from_yaml(model_config_path))
-        # Merge model_config into the main config, overwriting existing keys
-        config.update(model_config)
+        # Use deep_merge_attrdict for merging model_config
+        config = deep_merge_attrdict(config, model_config)
+
+    # Ensure config.other exists and validate key performance features
+    if not hasattr(config, 'other'):
+        config.other = AttrDict() # Initialize if missing to avoid further errors
+
+    # Validate gradient_checkpointing
+    if not hasattr(config.other, 'gradient_checkpointing'):
+        error_msg = "CRITICAL ERROR: 'gradient_checkpointing' attribute is missing from 'config.other'. Please specify 'gradient_checkpointing: true' or 'gradient_checkpointing: false' in your config file."
+        print(f"!!! {error_msg} !!!", file=sys.stderr)
+        raise ValueError(error_msg)
+    
+    # TODO: Add similar validation for torch_compile and VAE batchsize autocalibration
 
     return config
 
@@ -103,11 +123,17 @@ def envsetup(config):
     enable_flash_sdp(True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = parse_precision(config.train.precision)
+    
+    # Load UNet to the specified device (GPU if available)
     vae, unet, tokenizers, text_encoders = load_models(config, device, weight_dtype)
     unet.requires_grad_(False).eval()
+
+    # Load VAE and Text Encoders to CPU initially
+    vae = vae.to(torch.device("cpu"))
     vae.requires_grad_(False).eval()
-    for text_encoder in text_encoders:
-        text_encoder.requires_grad_(False).eval()
+    for i in range(len(text_encoders)):
+        text_encoders[i] = text_encoders[i].to(torch.device("cpu"))
+        text_encoders[i].requires_grad_(False).eval()
 
     optimizer_name = config.train.optimizer.lower()
     optimizer = get_optimizer(optimizer_name)

@@ -1,4 +1,4 @@
-#python -m trainscripts.imagesliders.batched_training_loop -c "F:/dox/ai/gemmy/sliders/trainscripts/imagesliders/data/batch_config.yaml"
+#python -m trainscripts.imagesliders.batched_training_loop -c F:/dox/ai/gemmy/sliders/trainscripts/imagesliders/data/batch_config.yaml
 import torch
 import os
 import gc
@@ -11,8 +11,6 @@ from diffusers.optimization import get_scheduler
 import torch.optim as optim
 import hashlib
 from PIL import Image
-from diffusers import AutoencoderKL
-from diffusers.image_processor import VaeImageProcessor
 from pathlib import Path
 import time
 from torch.utils.data import Dataset, DataLoader
@@ -24,18 +22,23 @@ from .batch_config_util import (
     setup_logging,
     AttrDict,
     load_config_from_yaml,
-    parse_precision,
     config_io,
     envsetup as config_envsetup, # Renamed to avoid conflict
 )
 from . import batch_lora as lora
 from . import batch_train_util
 from . import batch_model_util
+from .data_processing_utils import ( # NEW IMPORT
+    get_sha256_checksum,
+    resize_image_if_needed,
+    encode_images_to_latents,
+    save_latents_to_disk,
+    check_and_encode_latent,
+    get_latent_for_image,
+)
 from typing import List, Dict, Tuple, Any
 
 from .data_schedule import TrainingSchedule # Import TrainingSchedule
-
-# --- Copied from batch_dataset_encoding.py for self-containment ---
 
 UNET_ATTENTION_TIME_EMBED_DIM = 256  # XL
 TEXT_ENCODER_2_PROJECTION_DIM = 1280
@@ -43,121 +46,6 @@ UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM = 2816
 
 SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
 DIFFUSERS_CACHE_DIR = None # if you want to change the cache dir, change this
-
-def get_sha256_checksum(file_path):
-    start_time = time.time()
-    sha256 = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256.update(byte_block)
-    end_time = time.time()
-    return sha256.hexdigest(), (end_time - start_time)
-
-def resize_image_if_needed(image: Image.Image, max_resolution: int) -> Image.Image:
-    """
-    Resizes a PIL image to fit within a maximum resolution while preserving aspect ratio.
-    
-    Args:
-        image (Image.Image): The input image.
-        max_resolution (Tuple[int, int]): A tuple of (max_width, max_height).
-
-    Returns:
-        Image.Image: The resized image, or the original if it was already small enough.
-    """
-    max_w, max_h = max_resolution
-    if image.width <= max_w and image.height <= max_h:
-        return image
-
-    # Calculate the new size
-    width_ratio = max_w / image.width
-    height_ratio = max_h / image.height
-    ratio = min(width_ratio, height_ratio) # Use the smaller ratio to ensure both dims fit
-
-    new_width = int(image.width * ratio)
-    new_height = int(image.height * ratio)
-
-    # Use LANCZOS for high-quality downsampling
-    resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    
-    # print(f"Resized image from {image.size} to {resized_image.size}") # Optional: for debugging
-    return resized_image
-
-def encode_images_to_latents(images, vae, device, weight_dtype):
-    start_time = time.time()
-    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
-    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
-    image_tensors = [image_processor.preprocess(image).to(dtype=weight_dtype) for image in images]
-    image_batch = torch.cat(image_tensors, dim=0)
-    latents = vae.encode(image_batch).latent_dist.sample(None)
-    end_time = time.time()
-    return latents.to(device=torch.device("cpu")), (end_time - start_time)
-
-def save_latents_to_disk(latents, output_dir, image_path, vae_state_dict):
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
-    latent_path = os.path.join(output_dir, latent_filename)
-    torch.save(latents, latent_path)
-
-    vae_checksum_hasher = hashlib.sha256()
-    for k, v in vae_state_dict.items():
-        vae_checksum_hasher.update(k.encode('utf-8'))
-        vae_checksum_hasher.update(v.cpu().to(torch.float32).numpy().tobytes())
-    vae_checksum = vae_checksum_hasher.hexdigest()
-
-    latent_checksum, _ = get_sha256_checksum(latent_path) # Get checksum without timing here
-    metadata = {
-        "image_checksum": get_sha256_checksum(image_path)[0], # Get checksum without timing here
-        "vae_checksum": vae_checksum,
-        "latent_checksum": latent_checksum,
-    }
-
-    metadata_filename = os.path.splitext(os.path.basename(image_path))[0] + ".json"
-    metadata_path = os.path.join(output_dir, metadata_filename)
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=4)
-
-def check_and_encode_latent(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, config, force_reencode=False):
-    latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
-    latent_path = os.path.join(output_dir, latent_filename)
-
-    latent_encoding_time = 0
-
-    if not force_reencode and os.path.exists(latent_path):
-        return True, latent_encoding_time
-    else:
-        if force_reencode:
-            print(f"Force re-encoding latents for {image_path}.")
-        else:
-            print(f"Latents for {image_path} not found. Encoding.")
-
-    max_resolution = tuple(config.train.get("resolution", (512, 512)))
-    image = Image.open(image_path).convert("RGB")
-    image = resize_image_if_needed(image, max_resolution)
-
-    latents_gpu, encoding_time = encode_images_to_latents([image], vae, device, weight_dtype)
-    latent_encoding_time += encoding_time
-    save_latents_to_disk(latents.cpu(), output_dir, image_path, vae_state_dict)
-    return False, latent_encoding_time
-
-def get_latent_for_image(image_path, vae, device, weight_dtype, output_dir, vae_state_dict, config, force_reencode=False):
-     # This function now has an internal 'device' argument for the VAE call,
-    # but the returned latent will be on the CPU.
-    is_cached, encoding_time = check_and_encode_latent(image_path, vae, 
-    device, weight_dtype, output_dir, vae_state_dict, config, 
-    force_reencode=force_reencode)
-    latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
-    latent_path = os.path.join(output_dir, latent_filename)
-    
-    load_start_time = time.time()
-    # Load the latent tensor. It's already on the CPU since we save it that way.
-    # The map_location is a good safeguard.
-    loaded_latent = torch.load(latent_path, map_location="cpu",  weights_only=True)
-    load_end_time = time.time()
-    latent_load_time = load_end_time - load_start_time
-
-    return loaded_latent, encoding_time, latent_load_time
 
 def initialize_latent_cache(config, environment):
     # ImageScaleDataset is not directly used here, but TrainingSchedule uses it internally
@@ -363,8 +251,6 @@ def prepare_cached_batches(config, environment):
 
     return static_batches
 
-# --- End copied functions ---
-
 def prepare_cfg_batch(
     batch: dict,
     noisy_latents: torch.Tensor,
@@ -477,10 +363,17 @@ def train_step(environment: dict, batch: dict, seed: int):
             guidance_scale=guidance_scale,
         )
 
+    predicted_noise_uncond, predicted_noise_text = predicted_noise.chunk(2)
+    predicted_noise_cfg_reduced = (predicted_noise_uncond + guidance_scale * (
+        predicted_noise_text - predicted_noise_uncond
+    )).to(device)
+
+    print(f"Shape of predicted_noise_cfg_reduced: {predicted_noise_cfg_reduced.shape}")
+    print(f"Shape of noise: {noise.shape}")
+    print(f"Configured batch size: {config.train.batch_size}")
+
     # Calculate loss using the new paired loss function
-    #target_noise_cfg = torch.cat([noise, noise], dim=0)
-    #target noise should be `noise` because CFG reduces by batch dimension again
-    loss = batch_slider_algo.calculate_paired_loss(predicted_noise, noise, pair_indices, is_low_cases)
+    loss = calculate_paired_loss(predicted_noise_cfg_reduced, noise, pair_indices, is_low_cases)
 
     # Backpropagation
     loss.backward()
@@ -529,6 +422,10 @@ def main():
         config = config_io()
         environment = config_envsetup(config) # Use the envsetup from batch_config_util
 
+        # NOTE: The following VRAM management logic (moving UNet, VAE, Text Encoders to/from CPU)
+        # is intentionally kept as-is, despite its apparent complexity and manual nature,
+        # as per user instruction. It is understood that this is a deliberate design choice
+        # for specific memory optimization needs.
         tdcpu = torch.device("cpu")
         # Unload UNet to CPU to free VRAM for VAE and Text Encoders during batch preparation
         unet1 = environment.pop('unet')

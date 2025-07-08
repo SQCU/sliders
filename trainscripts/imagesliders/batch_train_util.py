@@ -135,7 +135,7 @@ def nocfg_predict_noise_xl(
     text_embeddings: torch.FloatTensor,
     add_text_embeddings: torch.FloatTensor,
     add_time_ids: torch.FloatTensor,
-    guidance_scale: None,
+    guidance_scale = None,
 ) -> torch.FloatTensor:
     #device = unet.device
     latent_model_input = latents

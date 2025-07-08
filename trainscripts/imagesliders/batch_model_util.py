@@ -32,6 +32,11 @@ def load_models(config, device, weight_dtype):
     #you HAVE TO GET RID OF THE PIPE EVERY TIME!!!
     #if you do a 'blah = pipe.blah.to(device, dtype)' you DOUBLE LOAD THE MODEL,
 
+    # Enable gradient checkpointing if configured
+    if hasattr(config, 'other') and hasattr(config.other, 'gradient_checkpointing') and config.other.gradient_checkpointing:
+        print("Enabling gradient checkpointing for UNet.")
+        unet.enable_gradient_checkpointing()
+
     return vae, unet, tokenizers, text_encoders
 
 
