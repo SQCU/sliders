@@ -1,0 +1,122 @@
+Logging output to logs\batched_training_loop_2025-07-06_23-39-41.log
+Loading batch config from: F:/dox/ai/gemmy/sliders/trainscripts/imagesliders/data/batch_config.yaml
+Loading and merging model config from: trainscripts/imagesliders/data/config-xl-batchtest.yaml
+Loading models from F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors to device: cuda with dtype: torch.bfloat16
+Fetching 17 files:   0%|                                                                                                            | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████| 17/17 [00:00<?, ?it/s]
+Loading pipeline components...:   0%|                                                                                                | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  29%|█████████████████████████▏                                                              | 2/7 [00:00<00:00, 14.85it/s]Loading pipeline components...:  57%|██████████████████████████████████████████████████▎                                     | 4/7 [00:00<00:00,  4.42it/s]Loading pipeline components...:  86%|███████████████████████████████████████████████████████████████████████████▍            | 6/7 [00:03<00:00,  1.58it/s]Loading pipeline components...: 100%|████████████████████████████████████████████████████████████████████████████████████████| 7/7 [00:03<00:00,  2.27it/s]
+UNet time_embedding_dim: None
+Building pseudo-randomized training schedule...
+Using random seed: 42
+Collecting all possible training data combinations...
+Created data pool with 2 unique image filenames across scales.
+Built schedule with 20 batches of size 8.
+Initializing text embedding cache...
+Encoding unique prompts:   0%|                                                                                                       | 0/1 [00:00<?, ?it/s]Encoding unique prompts: 100%|███████████████████████████████████████████████████████████████████████████████████████████████| 1/1 [00:00<00:00,  4.93it/s]Encoding unique prompts: 100%|███████████████████████████████████████████████████████████████████████████████████████████████| 1/1 [00:00<00:00,  4.93it/s]
+Cached 1 unique text embeddings.
+Pre-generating and caching all batches from schedule...
+Caching batches:   0%|                                                                                                              | 0/20 [00:00<?, ?it/s]Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Caching batches:  65%|█████████████████████████████████████████████████████████████████                                   | 13/20 [00:00<00:00, 122.50it/s]Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Caching batches: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 20/20 [00:00<00:00, 122.61it/s]
+Cached 20 batches.
+Total time spent in latent encoding: 0.0000 seconds
+Total time spent in latent loading: 0.0340 seconds
+Total time spent concatenating latents: 0.0030 seconds
+compiling unet for very fast hayai
+WARNING: lora_unet__orig_mod_conv_in dim (rank) is changed to: 4
+WARNING: lora_unet__orig_mod_conv_out dim (rank) is changed to: 4
+Using seed 306037841660200 for training.
+Shape of initial latents (batch['latents']): torch.Size([8, 4, 96, 96])
+Shape of unet_timesteps_cfg: torch.Size([16])
+Shape of noisy_latents_cfg: torch.Size([16, 4, 96, 96])
+Shape of text_embeddings_cfg: torch.Size([16, 77, 2048])
+Shape of pooled_embeds_cfg: torch.Size([16, 1280])
+Shape of add_time_ids_cfg: torch.Size([16, 6])
+latent_model_input shape: torch.Size([16, 4, 96, 96])
+timestep shape,dtype: torch.Size([16]),torch.int64
+text_embeddings shape: torch.Size([16, 77, 2048])
+add_text_embeddings shape: torch.Size([16, 1280])
+add_time_ids shape: torch.Size([16, 6])
+add_time_ids dtype: torch.float32
+--- EXCEPTION OCCURRED ---
+Traceback (most recent call last):
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 603, in <module>
+    main()
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 590, in main
+    environment = training_loop(environment, static_batches)
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 502, in training_loop
+    loss = train_step(environment, batch, seed + i)
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 469, in train_step
+    predicted_noise = batch_train_util.batched_predict_noise_xl(
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batch_train_util.py", line 161, in batched_predict_noise_xl
+    noise_pred = unet(
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_dynamo\eval_frame.py", line 465, in _fn
+    return fn(*args, **kwargs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\nn\modules\module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\nn\modules\module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\diffusers\models\unets\unet_2d_condition.py", line 1038, in forward
+    def forward(
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_dynamo\eval_frame.py", line 632, in _fn
+    return fn(*args, **kwargs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_functorch\aot_autograd.py", line 1100, in forward
+    return compiled_fn(full_args)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_functorch\_aot_autograd\runtime_wrappers.py", line 308, in runtime_wrapper
+    all_outs = call_func_at_runtime_with_args(
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_functorch\_aot_autograd\utils.py", line 124, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_functorch\_aot_autograd\utils.py", line 98, in g
+    return f(*args)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\autograd\function.py", line 575, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_functorch\_aot_autograd\runtime_wrappers.py", line 1525, in forward
+    fw_outs = call_func_at_runtime_with_args(
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_functorch\_aot_autograd\utils.py", line 124, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_functorch\_aot_autograd\runtime_wrappers.py", line 488, in wrapper
+    return compiled_fn(runtime_args)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_functorch\_aot_autograd\runtime_wrappers.py", line 667, in inner_fn
+    outs = compiled_fn(args)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_inductor\codecache.py", line 1478, in __call__
+    return self.current_callable(inputs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_inductor\compile_fx.py", line 1008, in run
+    return compiled_fn(new_inputs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_inductor\cudagraph_trees.py", line 398, in deferred_cudagraphify
+    fn, out = cudagraphify(model, inputs, new_static_input_idxs, *args, **kwargs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_inductor\cudagraph_trees.py", line 428, in cudagraphify
+    return manager.add_function(
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_inductor\cudagraph_trees.py", line 2213, in add_function
+    return fn, fn(inputs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_inductor\cudagraph_trees.py", line 1919, in run
+    out = self._run(new_inputs, function_id)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_inductor\cudagraph_trees.py", line 2023, in _run
+    return self.run_eager(new_inputs, function_id)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_inductor\cudagraph_trees.py", line 2179, in run_eager
+    return node.run(new_inputs)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_inductor\cudagraph_trees.py", line 644, in run
+    out = self.wrapped_function.model(new_inputs)
+  File "C:\Users\neet\AppData\Local\Temp\torchinductor_neet\tj\ctjiupfcudozmitevpq2pkgzg3lwoisr3v3jeipi67cktq74a4qm.py", line 17834, in call
+    buf4450 = empty_strided_cuda((16, 640, 96, 96), (5898240, 9216, 96, 1), torch.bfloat16)
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 180.00 MiB. GPU 0 has a total capacity of 23.99 GiB of which 0 bytes is free. Of the allocated memory 53.51 GiB is allocated by PyTorch, with 550.86 MiB allocated in private pools (e.g., CUDA Graphs), and 60.30 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

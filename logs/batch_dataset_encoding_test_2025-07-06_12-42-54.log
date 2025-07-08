@@ -1,0 +1,82 @@
+Logging output to logs\batch_dataset_encoding_test_2025-07-06_12-42-54.log
+Loading batch config from: trainscripts/imagesliders/data/batch_config.yaml
+Loading and merging inner config from: trainscripts/imagesliders/data/config-xl-batchtest.yaml
+Loading dataset config from: trainscripts/imagesliders/data/bracket_dataset.yaml
+Loading models from F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors to device: cuda with dtype: torch.bfloat16
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<?, ?it/s]
+Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  29%|██▊       | 2/7 [00:00<00:00, 14.93it/s]Loading pipeline components...:  57%|█████▋    | 4/7 [00:00<00:00,  4.29it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:03<00:00,  1.53it/s]Loading pipeline components...: 100%|██████████| 7/7 [00:03<00:00,  2.20it/s]
+Building pseudo-randomized training schedule...
+Using random seed: 42
+Collecting all possible training data combinations...
+Created data pool with 6 unique combinations.
+Built schedule with 20 batches of size 8.
+Initializing text embedding cache...
+Encoding unique prompts:   0%|          | 0/1 [00:00<?, ?it/s]Encoding unique prompts: 100%|██████████| 1/1 [00:00<00:00,  1.78it/s]Encoding unique prompts: 100%|██████████| 1/1 [00:00<00:00,  1.78it/s]
+Cached 1 unique text embeddings.
+Pre-generating and caching all batches from schedule...
+Caching batches:   0%|          | 0/20 [00:00<?, ?it/s]
+--- Example Training Batch (First Batch) ---
+Tensor Shapes:
+  latents: torch.Size([8, 1, 4, 96, 96])
+  scales: torch.Size([8])
+  text_embeddings: torch.Size([24, 77, 2048])
+  pooled_embeds: torch.Size([24, 1280])
+  add_time_ids: torch.Size([8, 6])
+
+Metadata for Cached Items:
+  Item 0:
+    Image Path: datasets\bracket\2\B.png
+    Prompt: {'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False}
+    Scale: 2.0
+    Pair Index: 0
+    Is Low Case: False
+  Item 1:
+    Image Path: datasets\bracket\0\A.png
+    Prompt: {'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False}
+    Scale: 0.15
+    Pair Index: 0
+    Is Low Case: True
+  Item 2:
+    Image Path: datasets\bracket\0\A.png
+    Prompt: {'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False}
+    Scale: 0.15
+    Pair Index: 1
+    Is Low Case: False
+  Item 3:
+    Image Path: datasets\bracket\2\B.png
+    Prompt: {'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False}
+    Scale: 2.0
+    Pair Index: 1
+    Is Low Case: True
+  Item 4:
+    Image Path: datasets\bracket\1\A.png
+    Prompt: {'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False}
+    Scale: 1.0
+    Pair Index: 2
+    Is Low Case: False
+  Item 5:
+    Image Path: datasets\bracket\0\B.png
+    Prompt: {'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False}
+    Scale: 0.15
+    Pair Index: 2
+    Is Low Case: True
+  Item 6:
+    Image Path: datasets\bracket\0\B.png
+    Prompt: {'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False}
+    Scale: 0.15
+    Pair Index: 3
+    Is Low Case: False
+  Item 7:
+    Image Path: datasets\bracket\0\B.png
+    Prompt: {'target': 'simple background ', 'positive': 'bracketed, simple background chalk drawing cartoon sketch', 'unconditional': 'simple background chalk drawing cartoon sketch', 'neutral': 'simple background', 'action': 'enhance', 'guidance_scale': 2, 'resolution': 1024, 'dynamic_resolution': False}
+    Scale: 0.15
+    Pair Index: 3
+    Is Low Case: True
+--------------------------------------------
+Caching batches:  15%|█▌        | 3/20 [00:00<00:00, 28.85it/s]Caching batches:  65%|██████▌   | 13/20 [00:00<00:00, 66.19it/s]Caching batches: 100%|██████████| 20/20 [00:00<00:00, 71.43it/s]
+Cached 20 batches.
+Total time spent in latent encoding: 0.0000 seconds
+Total time spent in latent loading: 0.0500 seconds
+Total time spent concatenating latents: 0.0230 seconds
+Total time spent concatenating text embeddings: 0.0020 seconds
+Total time spent concatenating pooled embeddings: 0.0000 seconds

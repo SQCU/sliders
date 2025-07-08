@@ -1,0 +1,37 @@
+Logging output to logs\batched_training_loop_simula_2025-07-07_19-23-56.log
+Loading batch config from: F:/dox/ai/gemmy/sliders/trainscripts/imagesliders/data/batch_config.yaml
+Loading and merging model config from: trainscripts/imagesliders/data/config-xl-batchtest.yaml
+Loading models from F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors to device: cuda with dtype: torch.bfloat16
+Fetching 17 files:   0%|          | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████| 17/17 [00:00<?, ?it/s]
+Loading pipeline components...:   0%|          | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  29%|██▊       | 2/7 [00:01<00:02,  1.74it/s]Loading pipeline components...:  43%|████▎     | 3/7 [00:04<00:06,  1.60s/it]Loading pipeline components...:  71%|███████▏  | 5/7 [00:04<00:01,  1.30it/s]Loading pipeline components...:  86%|████████▌ | 6/7 [00:15<00:03,  3.55s/it]Loading pipeline components...: 100%|██████████| 7/7 [00:15<00:00,  2.15s/it]
+UNet time_embedding_dim: None
+Building pseudo-randomized training schedule...
+Using random seed: 42
+Collecting all possible training data combinations...
+Created data pool with 2 unique image filenames across scales.
+Built schedule with 20 batches of size 8.
+Initializing text embedding cache...
+Encoding unique prompts:   0%|          | 0/1 [00:00<?, ?it/s]Encoding unique prompts: 100%|██████████| 1/1 [00:00<00:00,  1.15it/s]Encoding unique prompts: 100%|██████████| 1/1 [00:00<00:00,  1.15it/s]
+Cached 1 unique text embeddings.
+Pre-generating and caching all batches from schedule...
+Caching batches:   0%|          | 0/20 [00:00<?, ?it/s]Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Caching batches:  40%|████      | 8/20 [00:00<00:00, 72.73it/s]Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Caching batches:  90%|█████████ | 18/20 [00:00<00:00, 85.25it/s]Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Shape of add_time_ids in get_add_time_ids: torch.Size([1, 6])
+Caching batches: 100%|██████████| 20/20 [00:00<00:00, 84.03it/s]

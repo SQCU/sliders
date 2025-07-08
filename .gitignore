@@ -5,4 +5,5 @@ trainscripts/imagesliders/__pycache__/**
 
 *.deb
 #do we want all of these in our git history? no probably.
-logs/*.log
+#suspended for now bc gemini-cli changed behavior
+#logs/*.log

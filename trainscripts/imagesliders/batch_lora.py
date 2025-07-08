@@ -129,97 +129,90 @@ class BatchedLoRANetwork(nn.Module):
             assert lora_module.lora_name not in lora_names, f"Duplicate LoRA name: {lora_module.lora_name}"
             lora_names.add(lora_module.lora_name)
         
-        # from gemini 2.5:
-        # The original UNet reference is kept, but its forward methods are now augmented.
-        # We don't delete unet here as it's passed in and might be used elsewhere.
-        # torch.cuda.empty_cache() # Not necessary here, manage memory externally
-        # from sqcu:
-        # nice try i'm deleting the unet anyways because the reference implementation does that.
         del unet
-
         torch.cuda.empty_cache()
-        #if you don't like these lines of code demonstrate an error they introduce in control flow.
-
 
     def _create_and_apply_modules(self, root_module: nn.Module):
         """
-        Recursively finds target modules in the UNet, creates LoRA modules,
-        and REPLACES them with LoRAInjectedLayer instances.
+        Finds and replaces target modules with LoRA-injected versions.
+        This implementation iterates through all modules and replaces them based on a single, precise filtering function,
+        preventing the memory issues from excessive module creation.
         """
         modules_to_replace = []
-        # Use named_modules() to get the unique path (name) and the module instance
-        for parent_name, parent_module in root_module.named_modules():
-            if self._should_apply_lora(parent_name, parent_module):
-                for child_name, child_module in parent_module.named_children():
-                    # We check the child type directly
-                    if child_module.__class__.__name__ in ["Linear", "Conv2d", "LoRACompatibleLinear", "LoRACompatibleConv"]:
-                        if self._should_apply_lora_to_child(parent_name, child_name):
-                            # Store the parent module, the child's name, the child module, AND the unique parent path
-                            modules_to_replace.append((parent_module, child_name, child_module, parent_name))
+        for name, module in root_module.named_modules():
+            if self._is_target_module(name, module):
+                modules_to_replace.append((name, module))
 
-        # Keep track of which layers have been replaced to avoid double-injection
-        replaced_layers = set()
-        for parent_module, child_name, child_module, parent_name in modules_to_replace:
-            # Create a unique key for the layer based on its parent and its own name
-            layer_key = (parent_name, child_name)
-            if layer_key in replaced_layers:
-                continue # Skip if we've already processed this exact layer
-            replaced_layers.add(layer_key)
-
-            # Use the unique parent_name for the lora_name
-            lora_name = f"{LORA_PREFIX_UNET}_{parent_name}_{child_name}".replace(".", "_")
+        for name, module in modules_to_replace:
+            path_parts = name.split('.')
+            parent_module = root_module
+            for part in path_parts[:-1]:
+                parent_module = getattr(parent_module, part)
             
-            # 1. Create the LoRA-only module
+            child_name = path_parts[-1]
+            
+            lora_name = f"{LORA_PREFIX_UNET}_{name.replace('.', '_')}"
             lora_module = BatchedLoRAModule(
-                lora_name, child_module, self.lora_dim, self.alpha
+                lora_name, module, self.lora_dim, self.alpha
             )
             self.unet_loras.append(lora_module)
-            self.module_creation_count += 1 # DEBUG
+            self.module_creation_count += 1
 
-            # 2. Create the injection container
-            injected_layer = LoRAInjectedLayer(child_module, lora_module)
-
-            # 3. Replace the original layer with our new container
+            injected_layer = LoRAInjectedLayer(module, lora_module)
             setattr(parent_module, child_name, injected_layer)
-            self.module_replacement_count += 1 # DEBUG
+            self.module_replacement_count += 1
 
-    def _should_apply_lora(self, name: str, module: nn.Module) -> bool:
+    def _is_target_module(self, name: str, module: nn.Module) -> bool:
         """
-        Determines if LoRA should be applied to a given module based on training method and target replace modules.
+        Determines if a specific module should be replaced with a LoRA version based on its type and name.
         """
+        if module.__class__.__name__ not in ["Linear", "Conv2d", "LoRACompatibleLinear", "LoRACompatibleConv"]:
+            return False
+
+        # Name-based filtering logic adapted from the original lora.py
         if "time_embed" in name:
             return False
-            
-        if self.train_method == "noxattn":
-            return "attn2" not in name
-        elif self.train_method == "innoxattn":
-            return "attn2" not in name
-        elif self.train_method == "selfattn":
-            return "attn1" in name
-        elif self.train_method == "xattn":
-            return "attn2" in name
-        elif self.train_method == "full":
-            return module.__class__.__name__ in self.target_replace
-        elif self.train_method == "xattn-strict":
-            return "attn2" in name
-        elif self.train_method == "noxattn-hspace":
-            return "attn2" not in name and "mid_block" in name
-        elif self.train_method == "noxattn-hspace-last":
-            return "attn2" not in name and "mid_block" in name
-        else:
-            raise NotImplementedError(f"train_method: {self.train_method} is not implemented.")
 
-    def _should_apply_lora_to_child(self, parent_name: str, child_name: str) -> bool:
-        """
-        Further filters child modules based on specific training methods.
-        """
-        if self.train_method == 'xattn-strict':
-            return 'out' not in child_name
-        elif self.train_method == 'noxattn-hspace':
-            return True # Already filtered by parent_name
-        elif self.train_method == 'noxattn-hspace-last':
-            return '.1' in parent_name and 'conv2' in child_name
-        return True # Default for other train methods
+        train_method = self.train_method
+        if train_method == "full":
+            # In 'full' mode, we check if the module is part of a container specified in target_replace
+            is_in_target = False
+            for target_name in self.target_replace:
+                if target_name in name:
+                    is_in_target = True
+                    break
+            if not is_in_target:
+                return False
+        elif train_method == "noxattn" or train_method == "noxattn-hspace" or train_method == "noxattn-hspace-last":
+            if "attn2" in name:
+                return False
+        elif train_method == "innoxattn":
+            if "attn2" in name:
+                return False
+        elif train_method == "selfattn":
+            if "attn1" not in name:
+                return False
+        elif train_method in ["xattn", "xattn-strict", "xattn-up", "xattn-down", "xattn-mid"]:
+            if "attn2" not in name: # Note: diffusers uses attn2 for cross-attention
+                return False
+            if train_method == 'xattn-up' and 'up_block' not in name:
+                return False
+            if train_method == 'xattn-down' and 'down_block' not in name:
+                return False
+            if train_method == 'xattn-mid' and 'mid_block' not in name:
+                return False
+            if train_method == 'xattn-strict' and ('out' in name or 'to_q' in name):
+                 return False
+        else:
+            raise NotImplementedError(f"train_method: {train_method} is not implemented.")
+        
+        # Additional specific filters from the old logic
+        if train_method == 'noxattn-hspace' and 'mid_block' not in name:
+            return False
+        if train_method == 'noxattn-hspace-last' and ('mid_block' not in name or '.1' not in name or 'conv2' not in name):
+            return False
+            
+        return True
 
     def set_lora_scales(self, scales: torch.Tensor):
         """

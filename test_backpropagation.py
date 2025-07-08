@@ -7,8 +7,6 @@ import yaml
 import datetime
 from typing import Dict, Any, Tuple
 
-# Add the parent directory of trainscripts to sys.path for imports
-sys.path.append(str(Path(__file__).parent))
 
 # Minimal necessary components from batch_config_util and batch_model_util
 class AttrDict(dict):
@@ -36,7 +34,8 @@ from diffusers import DDPMScheduler, UNet2DConditionModel, AutoencoderKL, Stable
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, EulerAncestralDiscreteScheduler, SchedulerMixin
 from trainscripts.imagesliders.batch_train_util import nocfg_predict_noise_xl as batched_predict_noise_xl # Renamed for clarity
-from trainscripts.imagesliders import batch_lora as lora # Import batch_lora
+from trainscripts.imagesliders import batch_lora_deux as batch_lora
+from trainscripts.imagesliders import lora as regular_lora # Import original lora
 
 # NEW: scale_n_tuple_loss function
 def scale_n_tuple_loss(
@@ -141,14 +140,6 @@ def envsetup(config):
     vae, unet, tokenizers, text_encoders = load_models(config, device, weight_dtype)
     noise_scheduler = create_noise_scheduler(config.train.noise_scheduler)
     
-    # Initialize LoRA network
-    network = lora.BatchedLoRANetwork(
-        unet=unet,
-        rank=config.network.rank,
-        alpha=config.network.alpha,
-        train_method=config.network.training_method,
-    ).to(device, dtype=weight_dtype)
-
     environment = {
         "unet": unet,
         "vae": vae,
@@ -159,7 +150,6 @@ def envsetup(config):
         "weight_dtype": weight_dtype,
         "config": config,
         "optimizer": get_optimizer(config.train.optimizer),
-        "network": network, # Add network to environment
     }
     return environment
 
@@ -207,8 +197,49 @@ def test_backpropagation():
     noise_scheduler = environment["noise_scheduler"]
     device = environment["device"]
     weight_dtype = environment["weight_dtype"]
-    network = environment["network"] # Get network from environment
     
+    # --- VRAM BENCHMARKING ---
+    print("\n--- Starting VRAM Benchmark for Regular LoRA ---")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"VRAM (before regular LoRA): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+
+    # Create a regular LoRA network
+    regular_lora_network = regular_lora.LoRANetwork(
+        unet,
+        rank=4,
+        train_method='noxattn'
+    ).to(device, dtype=weight_dtype)
+
+    if torch.cuda.is_available():
+        print(f"VRAM (after regular LoRA): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+
+    # Calculate state dict size
+    state_dict = regular_lora_network.state_dict()
+    total_size = 0
+    for param in state_dict.values():
+        total_size += param.nelement() * param.element_size()
+    print(f"Regular LoRA state_dict size: {total_size / (1024**2):.2f} MB")
+
+    # Move state dict to CPU and check VRAM again
+    state_dict_cpu = {k: v.to('cpu') for k, v in state_dict.items()}
+    del regular_lora_network
+    del state_dict
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        print(f"VRAM (after moving regular LoRA to CPU): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+    print("--- Finished VRAM Benchmark for Regular LoRA ---\n")
+
+    
+    # Now, create the batched LoRA network
+    # Initialize LoRA network
+    network = batch_lora.BatchedLoRANetworkDeux(
+        unet=unet,
+        rank=config.network.rank,
+        alpha=config.network.alpha,
+        train_method=config.network.training_method,
+    ).to(device, dtype=weight_dtype)
+
     # Extract seed from the captured directory name
     capture_dir_name = "train_step_377077264765000" # Example captured directory
     seed_str = capture_dir_name.split('_')[-1]

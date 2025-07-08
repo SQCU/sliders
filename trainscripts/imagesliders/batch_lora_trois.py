@@ -71,7 +71,33 @@ def init_ortho_proj(rank, weight):
     return nn.Parameter(ortho_q_init)
 
 
-class LoRAModule(nn.Module):
+class LoRAInjectedLayer(nn.Module):
+    """
+    A container that holds an original layer and its corresponding LoRA layer.
+    This replaces the original layer in the model hierarchy and is torch.compile-friendly.
+    """
+    def __init__(self, org_module: nn.Module, lora_module: 'BatchedLoRAModuleTrois'):
+        super().__init__()
+        self.org_module = org_module
+        self.lora_module = lora_module
+
+    def forward(self, x):
+        # Get the original output by calling the original module directly
+        original_output = self.org_module(x)
+        
+        # Calculate the lora update
+        lora_output = self.lora_module.lora_up(self.lora_module.lora_down(x))
+
+        # Get the multiplier and prepare it for broadcasting
+        multiplier = self.lora_module.current_multiplier.to(x.device, dtype=x.dtype)
+        while len(multiplier.shape) < len(lora_output.shape):
+            multiplier = multiplier.unsqueeze(-1)
+            
+        # Apply the scaled LoRA update
+        return original_output + lora_output * multiplier * self.lora_module.scale
+
+
+class BatchedLoRAModuleTrois(nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
     """
