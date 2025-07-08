@@ -34,7 +34,7 @@ from diffusers import DDPMScheduler, UNet2DConditionModel, AutoencoderKL, Stable
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, EulerAncestralDiscreteScheduler, SchedulerMixin
 from trainscripts.imagesliders.batch_train_util import nocfg_predict_noise_xl as batched_predict_noise_xl # Renamed for clarity
-from trainscripts.imagesliders import batch_lora_deux as batch_lora
+from trainscripts.imagesliders import batch_lora_trois as batch_lora
 from trainscripts.imagesliders import lora as regular_lora # Import original lora
 
 # NEW: scale_n_tuple_loss function
@@ -233,7 +233,7 @@ def test_backpropagation():
     
     # Now, create the batched LoRA network
     # Initialize LoRA network
-    network = batch_lora.BatchedLoRANetworkDeux(
+    network = batch_lora.BatchedLoRANetworkTrois(
         unet=unet,
         rank=config.network.rank,
         alpha=config.network.alpha,
