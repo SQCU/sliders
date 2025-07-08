@@ -19,27 +19,21 @@ The first step is to capture the exact inputs to the `train_step` function at th
 *   Modify the `training_loop` to serialize and save the `environment` and `batch` dictionaries to disk when the memory usage exceeds a certain threshold.
 *   The saved data should be in a format that is easy to load and inspect, such as a combination of `.pt` files for tensors and `.json` for other data.
 
-### 2.2. Phase 2: Creating the Basic Integration Test
+### 2.2. Phase 2: Creating the Basic Integration Test (Completed)
 
-Once we have captured the problematic state, we will create a basic integration test that loads the captured data and verifies that it can be loaded correctly. This test will not execute any of the training logic, but it will serve as the foundation for our subsequent tests.
-
-**Action Items:**
-
-*   Create a new test file, `test_memory_leak.py`.
-*   Write a test that loads the captured `environment` and `batch` data.
-*   Assert that the loaded data has the correct types and shapes.
+We have successfully created `test_memory_leak.py` and verified that it can load all the captured tensors from a `train_step` state dump. This confirms our ability to replay the exact inputs to the problematic sections of the code.
 
 ### 2.3. Phase 3: Incrementally Adding Complexity
 
-With the basic integration test in place, we will start adding more of the training logic to the test. We will add one piece of functionality at a time and monitor the memory usage after each step. The goal is to identify the specific operation that causes the memory to grow uncontrollably.
+With the basic integration test in place, we will now start adding more of the training logic to the test. We will add one piece of functionality at a time and monitor the memory usage after each step. The goal is to identify the specific operation that causes the memory to grow uncontrollably.
 
 **Action Items:**
 
 *   Create a series of tests, each of which adds one more piece of the `train_step` logic:
-    1.  `test_data_transfer()`: Loads the data and moves it to the GPU.
-    2.  `test_noise_and_timestep_generation()`: Adds the noise and timestep generation.
-    3.  `test_cfg_batch_preparation()`: Adds the CFG batch preparation.
-    4.  `test_lora_scale_setting()`: Adds the LoRA scale setting.
+    1.  `test_data_transfer()`: **COMPLETED.** We have successfully loaded the initial batch and transferred its components to the GPU.
+    2.  `test_noise_and_timestep_generation()`: **COMPLETED.** We have successfully simulated noise and timestep generation, and verified VRAM behavior and statistical properties of the generated noise.
+    3.  `test_cfg_batch_preparation()`: **COMPLETED.** We have successfully simulated CFG batch preparation, verified VRAM behavior, and confirmed output consistency.
+    4.  `test_lora_scale_setting()`: **COMPLETED.** We have successfully simulated LoRA scale setting, verified VRAM behavior, and confirmed output consistency.
     5.  `test_unet_forward_pass()`: Adds the UNet forward pass.
     6.  `test_loss_calculation()`: Adds the loss calculation.
     7.  `test_backpropagation()`: Adds the backpropagation.
