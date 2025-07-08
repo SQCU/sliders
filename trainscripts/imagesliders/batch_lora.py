@@ -27,7 +27,8 @@ class BatchedLoRAModule(nn.Module):
         super().__init__()
         self.lora_name = lora_name
         self.lora_dim = lora_dim
-        print(f"DEBUG: Initializing BatchedLoRAModule: {lora_name}")
+        #log flashbang
+        #print(f"DEBUG: Initializing BatchedLoRAModule: {lora_name}")
 
         if "Linear" in org_module.__class__.__name__:
             in_dim = org_module.in_features
