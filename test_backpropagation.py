@@ -6,9 +6,9 @@ import argparse
 import yaml
 import datetime
 from typing import Dict, Any, Tuple
+import functools
 
 
-# Minimal necessary components from batch_config_util and batch_model_util
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super(AttrDict, self).__init__(*args, **kwargs)
@@ -16,6 +16,29 @@ class AttrDict(dict):
         for key, value in self.items():
             if isinstance(value, dict):
                 self[key] = AttrDict(value)
+
+def log_step(message):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            print(f"STEP: {message}")
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def log_vram(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            initial_vram = torch.cuda.memory_allocated() / (1024**3)
+            result = func(*args, **kwargs)
+            final_vram = torch.cuda.memory_allocated() / (1024**3)
+            print(f"VRAM before {func.__name__}: {initial_vram:.2f} GB, after: {final_vram:.2f} GB")
+            return result
+        else:
+            return func(*args, **kwargs)
+    return wrapper
 
 def load_config_from_yaml(filepath):
     with open(filepath, 'r') as f:
@@ -35,7 +58,6 @@ from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokeniz
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, EulerAncestralDiscreteScheduler, SchedulerMixin
 from trainscripts.imagesliders.batch_train_util import nocfg_predict_noise_xl as batched_predict_noise_xl # Renamed for clarity
 from trainscripts.imagesliders import batch_lora
-from trainscripts.imagesliders import lora as regular_lora # Import original lora
 
 # NEW: scale_n_tuple_loss function
 def scale_n_tuple_loss(
@@ -64,7 +86,8 @@ def scale_n_tuple_loss(
     # Average the summed group losses
     return torch.stack(summed_group_losses).mean()
 
-
+@log_step("Loading models...")
+@log_vram
 def load_models(config, device, weight_dtype):
     print(f"Loading models from {config.pretrained_model.name_or_path} to device: {device} with dtype: {weight_dtype}")
 
@@ -101,6 +124,7 @@ def load_models(config, device, weight_dtype):
 
     return vae, unet, tokenizers, text_encoders
 
+@log_step("Creating noise scheduler...")
 def create_noise_scheduler(scheduler_name: str) -> SchedulerMixin:
     name = scheduler_name.lower().replace(" ", "_")
     if name == "ddim":
@@ -144,6 +168,8 @@ def create_noise_scheduler(scheduler_name: str) -> SchedulerMixin:
 def get_optimizer(name: str):
     return None
 
+@log_step("Setting up environment...")
+@log_vram
 def envsetup(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = parse_precision(config.train.precision)
@@ -181,26 +207,95 @@ def setup_logging(runname="test_backpropagation"):
 
     return log_filename, original_stdout, original_stderr, log_file
 
-def test_backpropagation():
-    # This test specifically tracks VRAM usage during backpropagation with LoRA.
-
-    # Simulate command-line arguments for config_io
+@log_step("Loading and preparing config...")
+def load_and_prepare_config():
     original_argv = sys.argv
     sys.argv = ['test_script.py', '--batchtrainconfig', 'trainscripts/imagesliders/data/batch_config.yaml']
-    
-    # Load main config
     main_config = AttrDict(load_config_from_yaml(sys.argv[2]))
-    
-    # Load and merge model config
     model_config_path = main_config.model_config.refpath
     model_config = AttrDict(load_config_from_yaml(model_config_path))
-    
-    # Merge model_config into main_config (mimicking original script's behavior)
     main_config.update(model_config)
     config = main_config
+    sys.argv = original_argv
+    return config
 
-    sys.argv = original_argv # Restore original argv
+def get_seed_from_capture_dir(capture_dir_name: str) -> int:
+    return int(capture_dir_name.split('_')[-1])
 
+@log_step("Initializing LoRA network...")
+@log_vram
+def initialize_lora_network(unet, config, device, weight_dtype):
+    return batch_lora.BatchedLoRANetwork(
+        unet=unet,
+        rank=config.network.rank,
+        alpha=config.network.alpha,
+        train_method=config.network.training_method,
+    ).to(device, dtype=weight_dtype)
+
+@log_step("Loading initial data...")
+@log_vram
+def load_initial_data(capture_dir, device, weight_dtype):
+    data = AttrDict()
+    data.text_embeddings_cfg = torch.load(capture_dir / "03_text_embeddings_cfg.pt").to(device, dtype=weight_dtype)
+    data.pooled_embeds_cfg = torch.load(capture_dir / "04_pooled_embeds_cfg.pt").to(device, dtype=weight_dtype)
+    data.add_time_ids_cfg = torch.load(capture_dir / "05_add_time_ids_cfg.pt").to(device, dtype=torch.float32)
+
+    initial_batch = torch.load(capture_dir / "00_initial_batch.pt")
+    data.latents = initial_batch["latents"].to(device, dtype=weight_dtype)
+    data.group_indices = initial_batch["pair_indices"].to(device)
+    data.scales = initial_batch["scales"].to(device, dtype=weight_dtype)
+    data.guidance_scale = initial_batch["guidance_scale"]
+    return data
+
+@log_step("Generating noise and preparing CFG...")
+@log_vram
+def generate_noise_and_prepare_cfg(noise_scheduler, config, device, seed, latents):
+    with torch.no_grad():
+        noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
+        generator = torch.Generator(device=device).manual_seed(seed)
+        
+        timesteps_to = torch.randint(
+            1, config.train.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
+        ).long()
+
+        target_noise = torch.randn(latents.shape, device=latents.device, generator=generator)
+        noisy_latents = noise_scheduler.add_noise(latents, target_noise, timesteps_to)
+
+        latents_cfg = torch.cat([noisy_latents] * 2, dim=0)
+        unet_timesteps_cfg = torch.cat([timesteps_to] * 2, dim=0)
+    return AttrDict(target_noise=target_noise, latents_cfg=latents_cfg, unet_timesteps_cfg=unet_timesteps_cfg)
+
+@log_step("Performing UNet forward pass with LoRA...")
+@log_vram
+def perform_forward_pass(unet, noise_scheduler, unet_timesteps_cfg, latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, guidance_scale):
+    predicted_noise_raw = batched_predict_noise_xl(
+        unet,
+        noise_scheduler,
+        unet_timesteps_cfg,
+        latents_cfg,
+        text_embeddings_cfg,
+        pooled_embeds_cfg,
+        add_time_ids_cfg,
+        guidance_scale=guidance_scale,
+    )
+    predicted_noise_uncond, predicted_noise_text = predicted_noise_raw.chunk(2)
+    predicted_noise = (predicted_noise_uncond + guidance_scale * (
+        predicted_noise_text - predicted_noise_uncond
+    )).to(unet.device)
+    return predicted_noise
+
+@log_step("Calculating loss...")
+@log_vram
+def calculate_loss(predicted_noise, target_noise, group_indices):
+    return scale_n_tuple_loss(predicted_noise, target_noise, group_indices)
+
+@log_step("Performing backpropagation...")
+@log_vram
+def perform_backpropagation(loss):
+    loss.backward()
+
+def test_backpropagation():
+    config = load_and_prepare_config()
     environment = envsetup(config)
 
     unet = environment["unet"]
@@ -208,153 +303,37 @@ def test_backpropagation():
     device = environment["device"]
     weight_dtype = environment["weight_dtype"]
     
-    # --- VRAM BENCHMARKING ---
-    print("\n--- Starting VRAM Benchmark for Regular LoRA ---")
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print(f"VRAM (before regular LoRA): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-
-    # Create a regular LoRA network
-    regular_lora_network = regular_lora.LoRANetwork(
-        unet,
-        rank=4,
-        train_method='noxattn'
-    ).to(device, dtype=weight_dtype)
-
-    if torch.cuda.is_available():
-        print(f"VRAM (after regular LoRA): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-
-    # Calculate state dict size
-    state_dict = regular_lora_network.state_dict()
-    total_size = 0
-    for param in state_dict.values():
-        total_size += param.nelement() * param.element_size()
-    print(f"Regular LoRA state_dict size: {total_size / (1024**2):.2f} MB")
-
-    # Move state dict to CPU and check VRAM again
-    state_dict_cpu = {k: v.to('cpu') for k, v in state_dict.items()}
-    del regular_lora_network
-    del state_dict
-    torch.cuda.empty_cache()
-    if torch.cuda.is_available():
-        print(f"VRAM (after moving regular LoRA to CPU): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-    print("--- Finished VRAM Benchmark for Regular LoRA ---\n")
-
-    
-    # Now, create the batched LoRA network
-    # Initialize LoRA network
-    network = batch_lora.BatchedLoRANetwork(
-        unet=unet,
-        rank=config.network.rank,
-        alpha=config.network.alpha,
-        train_method=config.network.training_method,
-    ).to(device, dtype=weight_dtype)
-
-    # Extract seed from the captured directory name
-    capture_dir_name = "train_step_377077264765000" # Example captured directory
-    seed_str = capture_dir_name.split('_')[-1]
-    seed = int(seed_str)
-
+    capture_dir_name = "train_step_377077264765000"
+    seed = get_seed_from_capture_dir(capture_dir_name)
     capture_dir = Path(f"F:/dox/ai/gemmy/sliders/state_capture/{capture_dir_name}")
 
-    # Clear CUDA cache and log initial memory
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print(f"VRAM (initial): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
+    network = initialize_lora_network(unet, config, device, weight_dtype)
 
-    # Load captured inputs for UNet forward pass
-    # We will re-generate noisy_latents and noise, but use captured text embeddings etc.
-    text_embeddings_cfg = torch.load(capture_dir / "03_text_embeddings_cfg.pt").to(device, dtype=weight_dtype)
-    pooled_embeds_cfg = torch.load(capture_dir / "04_pooled_embeds_cfg.pt").to(device, dtype=weight_dtype)
-    add_time_ids_cfg = torch.load(capture_dir / "05_add_time_ids_cfg.pt").to(device, dtype=torch.float32) # Keep float32
-    # unet_timesteps_cfg will be generated based on timesteps_to
+    data = load_initial_data(capture_dir, device, weight_dtype)
 
-    # Get guidance_scale from the initial batch (assuming it's consistent)
-    initial_batch = torch.load(capture_dir / "00_initial_batch.pt")
-    latents = initial_batch["latents"].to(device, dtype=weight_dtype) # Original noiseless latents
-    group_indices = initial_batch["pair_indices"].to(device) # Using pair_indices as group_indices for now
-    scales = initial_batch["scales"].to(device, dtype=weight_dtype) # Get scales for LoRA
-    guidance_scale = initial_batch["guidance_scale"]
+    print(f"Shape of latents: {data.latents.shape}, group_indices: {data.group_indices.shape}, scales: {data.scales.shape}")
+    assert data.latents.shape[0] == data.group_indices.shape[0], f"Batch size mismatch: latents.shape[0]={data.latents.shape[0]}, group_indices.shape[0]={data.group_indices.shape[0]}"
+    assert data.latents.shape[0] == data.scales.shape[0], f"Batch size mismatch: latents.shape[0]={data.latents.shape[0]}, scales.shape[0]={data.scales.shape[0]}"
 
-    # --- Batch validation logic ---
-    print(f"Shape of latents from initial_batch: {latents.shape}")
-    print(f"Shape of group_indices (pair_indices) from initial_batch: {group_indices.shape}")
-    print(f"Shape of scales from initial_batch: {scales.shape}")
-    # Assert that the batch dimensions are consistent
-    assert latents.shape[0] == group_indices.shape[0], \
-        f"Batch size mismatch: latents.shape[0]={latents.shape[0]}, group_indices.shape[0]={group_indices.shape[0]}"
-    assert latents.shape[0] == scales.shape[0], \
-        f"Batch size mismatch: latents.shape[0]={latents.shape[0]}, scales.shape[0]={scales.shape[0]}"
+    noise_data = generate_noise_and_prepare_cfg(noise_scheduler, config, device, seed, data.latents)
 
-    if torch.cuda.is_available():
-        print(f"VRAM (after loading initial data): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-
-    # --- Replicate TIMESTEP LOGIC from train_step ---
-    with torch.no_grad():
-        noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
-        generator = torch.Generator(device=device).manual_seed(seed)
-        
-        # Generate a random timestep for each item in the batch
-        timesteps_to = torch.randint(
-            1, config.train.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
-        ).long()
-
-        # Generate noise (this will be our target_noise)
-        target_noise = torch.randn(latents.shape, device=latents.device, generator=generator)
-        
-        # Add noise to latents to get noisy_latents (input to UNet)
-        noisy_latents = noise_scheduler.add_noise(latents, target_noise, timesteps_to)
-
-        # Prepare CFG-ready latents and timesteps for UNet
-        latents_cfg = torch.cat([noisy_latents, noisy_latents], dim=0)
-        unet_timesteps_cfg = torch.cat([timesteps_to, timesteps_to], dim=0)
-
-    if torch.cuda.is_available():
-        print(f"VRAM (after noise generation and CFG prep): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-
-    # --- Set LoRA scales and perform UNet forward pass ---
-    # Prepare batched_scales_cfg for LoRA network
-    batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
+    batched_scales_cfg = torch.cat([data.scales] * 2, dim=0).unsqueeze(-1)
     network.set_lora_scales(batched_scales_cfg)
 
-    with network: # Activates LoRA modules
-        predicted_noise_raw = batched_predict_noise_xl(
+    with network:
+        predicted_noise = perform_forward_pass(
             unet,
             noise_scheduler,
-            unet_timesteps_cfg,
-            latents_cfg,
-            text_embeddings_cfg,
-            pooled_embeds_cfg,
-            add_time_ids_cfg,
-            guidance_scale=guidance_scale,
+            noise_data.unet_timesteps_cfg,
+            noise_data.latents_cfg,
+            data.text_embeddings_cfg,
+            data.pooled_embeds_cfg,
+            data.add_time_ids_cfg,
+            data.guidance_scale
         )
-        # Apply CFG logic explicitly to get N_eff sized predicted_noise
-        predicted_noise_uncond, predicted_noise_text = predicted_noise_raw.chunk(2)
-        predicted_noise = (predicted_noise_uncond + guidance_scale * (
-            predicted_noise_text - predicted_noise_uncond
-        )).to(device)
+        loss = calculate_loss(predicted_noise, noise_data.target_noise, data.group_indices)
+        perform_backpropagation(loss)
 
-        if torch.cuda.is_available():
-            print(f"VRAM (after UNet forward pass with LoRA): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-
-        # --- Perform loss calculation ---
-        # ALERT: MUST BE IN THE CONTEXT MANAGER 'with network' FOR GRADIENT CHECKPOINTING OF LORA SCALES
-        loss = scale_n_tuple_loss(predicted_noise, target_noise, group_indices)
-
-        if torch.cuda.is_available():
-            print(f"VRAM (after loss calculation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-
-        # --- Perform backpropagation ---
-        print("Performing backpropagation...")
-        if torch.cuda.is_available():
-            print(f"VRAM (before backpropagation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-        
-        loss.backward()
-
-        if torch.cuda.is_available():
-            print(f"VRAM (after backpropagation): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
-
-    # --- Assertions ---
     assert isinstance(loss, torch.Tensor), "Loss should be a torch.Tensor"
     assert loss.ndim == 0, "Loss should be a scalar tensor"
     assert loss.device.type == device.type, f"Loss device type mismatch: expected {device.type}, got {loss.device.type}"
