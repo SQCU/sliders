@@ -398,6 +398,11 @@ def train_step(environment: dict, batch: dict, seed: int):
     Performs a single training step. The function is simplified to accept
     the environment dictionary, a single batch of data, and a seed for reproducibility.
     """
+    # --- State Capture ---
+    # Create a directory to save the captured state
+    capture_dir = Path(f"F:/dox/ai/gemmy/sliders/state_capture/train_step_{seed}")
+    capture_dir.mkdir(parents=True, exist_ok=True)
+
     # Unpack necessary components from the environment
     unet = environment["unet"]
     noise_scheduler = environment["noise_scheduler"]
@@ -423,6 +428,9 @@ def train_step(environment: dict, batch: dict, seed: int):
     batch['add_time_ids'] = batch['add_time_ids'].to(device, dtype=torch.float32) # Remember to keep this float32!
     # Retrieve guidance_scale from batch
 
+    # --- Capture initial batch ---
+    torch.save(batch, capture_dir / "00_initial_batch.pt")
+
     print(f"Shape of initial latents (batch['latents']): {latents.shape}")
 
     # Prepare for training step
@@ -441,6 +449,9 @@ def train_step(environment: dict, batch: dict, seed: int):
         # Add noise to latents using the generated timesteps
         noise = torch.randn(latents.shape, device=latents.device, generator=generator)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps_to)
+
+        # --- Capture noisy latents ---
+        torch.save(noisy_latents, capture_dir / "01_noisy_latents.pt")
     
     # --- END TIMESTEP LOGIC ---
 
@@ -452,6 +463,14 @@ def train_step(environment: dict, batch: dict, seed: int):
             noise_scheduler,
             weight_dtype,
         )
+
+        # --- Capture UNet inputs ---
+        torch.save(latents_cfg, capture_dir / "02_latents_cfg.pt")
+        torch.save(text_embeddings_cfg, capture_dir / "03_text_embeddings_cfg.pt")
+        torch.save(pooled_embeds_cfg, capture_dir / "04_pooled_embeds_cfg.pt")
+        torch.save(add_time_ids_cfg, capture_dir / "05_add_time_ids_cfg.pt")
+        torch.save(unet_timesteps_cfg, capture_dir / "06_unet_timesteps_cfg.pt")
+
 
     # Set LoRA scales, which must match the doubled cfg axis.
     #batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
@@ -537,6 +556,7 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
+
     # Prepare cached batches (image latents and text embeddings)
     with torch.no_grad():
         static_batches = prepare_cached_batches(config, environment)
@@ -562,6 +582,7 @@ def main():
     print("compiling unet for very fast hayai")
     unet2 = torch.compile(unet, mode="reduce-overhead", fullgraph=True)
     environment['unet'] = unet2
+
 
     # Create adapter network
     network = lora.BatchedLoRANetwork(
@@ -601,7 +622,7 @@ def main():
 
 
 if __name__ == "__main__":
-    runname = "batched_training_loop"
+    runname = "batched_training_loop_simula"
     log_file_path, orig_stdout, orig_stderr = setup_logging(runname=runname)
     try:
         print(f"--- Starting Batched Training Loop ---", file=orig_stdout)
