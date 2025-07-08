@@ -35,6 +35,7 @@ def parse_precision(precision: str) -> torch.dtype:
 from diffusers import DDPMScheduler, UNet2DConditionModel, AutoencoderKL, StableDiffusionXLPipeline
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from diffusers import DDIMScheduler, LMSDiscreteScheduler, EulerAncestralDiscreteScheduler, SchedulerMixin
+from trainscripts.imagesliders.batch_train_util import nocfg_predict_noise_xl
 
 # Re-implement load_models and create_noise_scheduler to load actual models
 def load_models(config, device, weight_dtype):
@@ -267,9 +268,11 @@ def test_unet_forward_pass():
         print(f"VRAM (after UNet forward pass): {torch.cuda.memory_allocated() / (1024**2):.2f} MB")
 
     # Assertions for output shape and type (we don't have a captured predicted_noise)
-    print(f"Predicted noise shape: {predicted_noise.shape}")
+    
+    print(f"Predicted noise raw shape: {predicted_noise_raw.shape}")
+    print(f"Predicted noise cfg shape: {predicted_noise.shape}")
     print(f"Latents CFG shape: {latents_cfg.shape}")
-    assert predicted_noise.shape == latents_cfg.shape
+    assert predicted_noise_raw.shape == latents_cfg.shape
     assert predicted_noise.dtype == weight_dtype
     assert predicted_noise.device == device
 
