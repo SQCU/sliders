@@ -141,7 +141,7 @@ class LoRAModule(nn.Module):
         )
 
 
-class LoRANetwork(nn.Module):
+class BatchedLoRANetworkTrois(nn.Module):
     def __init__(
         self,
         unet: UNet2DConditionModel,
