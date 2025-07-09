@@ -17,15 +17,16 @@ network:
   alpha: 16.0
   training_method: "noxattn"
 train:
-  precision: "bfloat16"
-  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
-  iterations: 2
-  lr: 0.00048
-  optimizer: "Adam8bit"
-  lr_scheduler: "constant"  #or "constant" or "cosine"
-  max_denoising_steps: 50
   seed: 42  #default training seed init
+  lr: 0.00048
+  lr_scheduler: "constant"  #or "constant" or "cosine"
+  precision: "bfloat16"
+  optimizer: "Adam8bit"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  max_denoising_steps: 50
   resolution: [512, 512]  #read from here for some reason
+  iterations: 2
+  gradient_accumulation_steps: 2
   batch_size: 4 #now must be assigned here
   bounds_test_vae_batch_size: true
   vae_encoding_batch_size: 20

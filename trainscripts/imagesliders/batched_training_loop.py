@@ -85,12 +85,10 @@ def prepare_cfg_batch(
     return latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg
 
 
-def train_step(environment: dict, batch: dict):
+def train_step(environment: dict, batch: dict, global_step: int = 0):
     """
-    Performs a single training step. The function is simplified to accept
-    the environment dictionary, a single batch of data, and a seed for reproducibility.
+    Performs a single training step with optional gradient accumulation and gradient noise estimation.
     """
-    # Unpack necessary components from the environment
     unet = environment["unet"]
     noise_scheduler = environment["noise_scheduler"]
     network = environment["network"]
@@ -99,47 +97,42 @@ def train_step(environment: dict, batch: dict):
     config = environment["config"]
     device = environment["device"]
     weight_dtype = environment["weight_dtype"]
+    generator = environment["generator"]
 
-    generator = environment["generator"] # Retrieve the generator from environment
+    # Move micro-batch data to gpu
+    # grad accum step 1. Announce start of accumulation cycle
+    gradient_noise_estimator.pre_accumulate_step(global_step)
 
-    # Move batch data to gpu
-    batch = rectify_batch_fn(batch, device, weight_dtype)
+    # For now, we'll use the full 'batch' as a micro-batch, and scale loss.
+    # If actual micro-batching is needed, this part will require adjustment.
+    current_micro_batch = rectify_batch_fn(batch, device, weight_dtype)
 
-    latents = batch["latents"]
-    scales = batch["scales"]
-    pair_indices = batch["pair_indices"]
-    is_low_cases = batch["is_low_cases"]
-    guidance_scale = batch["guidance_scale"]
-    cfg_text_embeddings = batch['cfg_text_embeddings']
-    cfg_pooled_embeds = batch['cfg_pooled_embeds']
-    add_time_ids = batch['add_time_ids']
+    latents = current_micro_batch["latents"]
+    scales = current_micro_batch["scales"]
+    pair_indices = current_micro_batch["pair_indices"]
+    is_low_cases = current_micro_batch["is_low_cases"]
+    guidance_scale = current_micro_batch["guidance_scale"]
+    cfg_text_embeddings = current_micro_batch['cfg_text_embeddings']
+    cfg_pooled_embeds = current_micro_batch['cfg_pooled_embeds']
+    add_time_ids = current_micro_batch['add_time_ids']
+    gradient_noise_estimator = environment["gradient_noise_estimator"]
 
-    # Split CFG-ready embeddings into unconditional and conditional parts
     uncond_text_embeddings, cond_text_embeddings = cfg_text_embeddings.chunk(2)
     uncond_pooled_embeds, cond_pooled_embeds = cfg_pooled_embeds.chunk(2)
-
-    print(f"Shape of initial latents (batch['latents']): {latents.shape}")
-
-    # Prepare for training step
-    optimizer.zero_grad()
 
     # --- TIMESTEP LOGIC ---
     with torch.no_grad():
         noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
-        generator = environment["generator"]
         
-        # Generate a random timestep for each item in the batch
         timesteps_to = torch.randint(
             1, config.train.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
         ).long()
 
-        # Add noise to latents using the generated timesteps
         noise = torch.randn(latents.shape, device=latents.device, generator=generator)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps_to)
     
     # --- END TIMESTEP LOGIC ---
 
-    # Form CFG microbatch
     latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg = prepare_cfg_batch(
         noisy_latents,
         timesteps_to,
@@ -152,19 +145,10 @@ def train_step(environment: dict, batch: dict):
         add_time_ids,
     )
 
-    # Set LoRA scales, which must match the doubled cfg axis.
-    #hopefully a [batchdim,1] tensor has shape (16,1) -> broadcasts to variably shaped unet layers?
     batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
     network.set_lora_scales(batched_scales_cfg)
 
     with network:
-        print(f"Shape of unet_timesteps_cfg: {unet_timesteps_cfg.shape}")
-        print(f"Shape of noisy_latents_cfg: {latents_cfg.shape}")
-        print(f"Shape of text_embeddings_cfg: {text_embeddings_cfg.shape}")
-        print(f"Shape of pooled_embeds_cfg: {pooled_embeds_cfg.shape}")
-        print(f"Shape of add_time_ids_cfg: {add_time_ids_cfg.shape}")
-        print(f"Shape of guidance_scale: {guidance_scale}")
-        
         predicted_noise = batch_train_util.nocfg_predict_noise_xl(
             unet,
             noise_scheduler,
@@ -175,38 +159,71 @@ def train_step(environment: dict, batch: dict):
             add_time_ids_cfg,
         )
 
-    predicted_noise_uncond, predicted_noise_text = predicted_noise.chunk(2)
-    predicted_noise_cfg_reduced = (predicted_noise_uncond + guidance_scale * (
-        predicted_noise_text - predicted_noise_uncond
-    )).to(device)
+        predicted_noise_uncond, predicted_noise_text = predicted_noise.chunk(2)
+        predicted_noise_cfg_reduced = (predicted_noise_uncond + guidance_scale * (
+            predicted_noise_text - predicted_noise_uncond
+        )).to(device)
 
-    print(f"Shape of predicted_noise_cfg_reduced: {predicted_noise_cfg_reduced.shape}")
-    print(f"Shape of noise: {noise.shape}")
-    print(f"Configured batch size: {config.train.batch_size}")
+        if not is_profiling_step:
+            # Calculate loss for this micro-batch
+            loss = calculate_paired_loss(predicted_noise_cfg_reduced, noise, pair_indices, is_low_cases)
+        else:
+            loss = calculate_paired_loss(predicted_noise_cfg_reduced, noise, pair_indices, is_low_cases)
+            loss.backward()
+            gradient_noise_estimator.post_micro_backward_step()
+            # If profiling, update estimator after each micro-backward
 
-    # Calculate loss using the new paired loss function
-    loss = calculate_paired_loss(predicted_noise_cfg_reduced, noise, pair_indices, is_low_cases)
-
-    # Backpropagation
-    loss.backward()
-    optimizer.step()
-    lr_scheduler.step()
-
-    return loss.item()
+    return total_loss
 
 
-def training_loop(environment: dict, static_batches: list):
+def training_loop(environment: dict, static_batches: list, gradient_noise_estimator: GradientNoiseEstimator = None):
     """
     Main training loop that iterates over a static list of pre-generated batches.
     """
     print(f"Starting training loop.")
-    
+    global_step = 0 # Initialize global step here
     for i in range(environment["config"].train.iterations):
+        gradient_noise_estimator = environment["gradient_noise_estimator"]
         batch = static_batches[i % len(static_batches)]
-        loss = train_step(environment, batch)
+        # Get gradient accumulation steps from config, default to 1
+        gradient_accumulation_steps = config.train.get("gradient_accumulation_steps", 1)
+        if gradient_noise_estimator is not None:
+            gradient_noise_estimator.pre_accumulate_step(global_step)
+        # Determine if this is a profiling step
+        is_profiling_step = gradient_noise_estimator is not None and gradient_noise_estimator.is_profiling
 
-        if i % 10 == 0:
+        # Zero gradients at the start of the accumulation cycle, unless profiling is active
+        # In profiling mode, zero_grad is handled per micro-batch by the estimator
+        if not is_profiling_step:
+            optimizer.zero_grad()
+        total_loss = 0.0
+        # Iterate over micro-batches for gradient accumulation
+        for i in range(gradient_accumulation_steps):
+            loss = train_step(environment, batch, gradient_noise_estimator, global_step)
+            if not is_profiling_step:   #messily, we must sum accumulate nonprofiling loss outside of train_step.
+                total_loss += loss
+        # After accumulation loop
+        if not is_profiling_step:
+            #scaling to get mean from of sum-reduced non-profiling loss
+            loss = loss/gradient_accumulation_steps
+            loss.backward()
+        else:
+            gradient_noise_estimator.post_accumulate_step(gradient_accumulation_steps)
+        # Optimizer step and scheduler step
+        #both profiling step and non profiling step have correct .grad attribute here
+        optimizer.step()
+        lr_scheduler.step()
+        # Zero gradients after optimizer step, unless profiling was active (handled by estimator)
+        if not is_profiling_step:
+            optimizer.zero_grad()
+
+        # Print estimated gradient noise scale if enabled
+        if gradient_noise_estimator is not None and gradient_noise_estimator.ema_b_est is not None:
+            print(f"Estimated Gradient Noise Scale (B_crit): {gradient_noise_estimator.ema_b_est:.4f}")
+
+        if i % 1 == 0:
             print(f"Iteration {i+1}/{environment['config'].train.iterations}, Loss: {loss}")
+        global_step += 1 # Increment global step after each training step
     
     return environment
 
@@ -323,7 +340,7 @@ def main():
     environment['lr_scheduler'] = lr_scheduler
 
     # Run the training loop with the static batches
-    environment = training_loop(environment, static_batches)
+    environment = training_loop(environment, static_batches, gradient_noise_estimator)
 
     # Save the final model
     graceful_shutdown(environment)

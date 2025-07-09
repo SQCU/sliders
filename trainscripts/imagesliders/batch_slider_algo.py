@@ -2,87 +2,110 @@ import torch
 from typing import List, Dict, Tuple, Any
 from collections import deque
 
-class GradientNoiseScaleEstimator:
-    def __init__(self, beta: float = 0.999):
-        self.beta = beta
-        self.exp_avg_sq_grad_norm_global = 0.0  # Exponentially weighted average of squared global gradient norm (|G_B_big|^2)
-        self.exp_avg_sq_grad_norm_local = 0.0   # Exponentially weighted average of squared local gradient norm (|G_B_small|^2)
-        self.t = 0  # Timestep counter
+class GradientNoiseEstimator:
+    """
+    Implements gradient noise scale estimation for serial gradient accumulation.
+    
+    This class performs a periodic, memory-intensive profiling step to estimate
+    the optimal batch size, as described in 'An Empirical Model of Large-Batch Training'.
+    """
+    def __init__(self, model, micro_batch_size, profile_freq=100, ema_alpha=0.05):
+        self.model = model
+        self.micro_batch_size = micro_batch_size
+        self.profile_freq = profile_freq
+        self.ema_alpha = ema_alpha
+        
+        self.is_profiling = False
+        self._step_count = 0
+        
+        # We use an EMA for a more stable estimate over time
+        self.ema_b_est = None
 
-    def update(self, model: torch.nn.Module):
-        self.t += 1
+        # Buffers for the profiling step
+        self._grad_sum_buffer = None
+        self._micro_norm_sq_values = []
 
-        # Calculate global gradient norm (L2 norm of all gradients)
-        global_grad_norm_sq = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                global_grad_norm_sq += p.grad.data.norm(2).item()**2
+    def _get_full_grad_norm_sq(self, use_buffer=False):
+        """Calculates the squared L2 norm of the full gradient."""
+        norm_sq = torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
+        params_source = self._grad_sum_buffer if use_buffer else [p for p in self.model.parameters() if p.grad is not None]
         
-        # Calculate local gradient norm (average of squared L2 norms of individual parameter gradients)
-        # This is a heuristic approximation for B_small=1 in a single-device context.
-        local_grad_norm_sq_sum = 0.0
-        num_params_with_grad = 0
-        for p in model.parameters():
-            if p.grad is not None:
-                local_grad_norm_sq_sum += p.grad.data.norm(2).item()**2
-                num_params_with_grad += 1
-        
-        local_grad_norm_sq = local_grad_norm_sq_sum / num_params_with_grad if num_params_with_grad > 0 else 0.0
+        for p in params_source:
+            grad = p if use_buffer else p.grad
+            if grad is not None:
+                norm_sq += torch.sum(grad.pow(2))
+        return norm_sq
 
-        # Update exponentially weighted moving averages
-        self.exp_avg_sq_grad_norm_global = self.beta * self.exp_avg_sq_grad_norm_global + (1 - self.beta) * global_grad_norm_sq
-        self.exp_avg_sq_grad_norm_local = self.beta * self.exp_avg_sq_grad_norm_local + (1 - self.beta) * local_grad_norm_sq
+    def pre_accumulate_step(self, global_step):
+        """Call this before starting a gradient accumulation loop."""
+        self._step_count = global_step
+        self.is_profiling = (self._step_count % self.profile_freq == 0)
+        
+        if self.is_profiling:
+            print(f"--- [Step {self._step_count}] Starting gradient noise profiling ---")
+            # Allocate buffer only when needed
+            self._grad_sum_buffer = [torch.zeros_like(p.data) for p in self.model.parameters()]
+            self._micro_norm_sq_values = []
 
-    def get_noise_scale(self, B_big: int, B_small: int = 1) -> float:
-        # Bias correction for moving averages
-        bias_correction = 1 - self.beta**self.t
-        
-        # Estimated |G|^2 (true gradient norm squared)
-        # From paper: |G|^2 = (B_big * |G_B_big|^2 - B_small * |G_B_small|^2) / (B_big - B_small)
-        # Using corrected moving averages as estimates for |G_B_big|^2 and |G_B_small|^2
-        
-        # Note: The paper's formula for |G|^2 and tr(Sigma) assumes |G_B_small|^2 is from a batch of size B_small.
-        # Our local_grad_norm_sq is an average per parameter, not per sample.
-        # This is a pragmatic adaptation for a single-device setup.
-        
-        # For the purpose of this estimation, we'll use the global_grad_norm_sq as |G_B_big|^2
-        # and the local_grad_norm_sq as |G_B_small|^2 (assuming B_small=1 for per-parameter average)
-        
-        # We need to be careful with the interpretation of |G_B_small|^2 here.
-        # The paper's formula for S and |G|^2 is based on the expectation E[|G_est|^2] = |G|^2 + tr(Sigma)/B.
-        # If we assume our `local_grad_norm_sq` is a proxy for E[|G_est|^2] for B=1, and `global_grad_norm_sq` for B=B_big,
-        # then we can use the formulas from Appendix A.1.
+    def post_micro_backward_step(self):
+        """Call this after each micro-batch's backward() call."""
+        if self.is_profiling:
+            # 1. Calculate and store the squared norm of the micro-batch gradient
+            micro_norm_sq = self._get_full_grad_norm_sq(use_buffer=False)
+            self._micro_norm_sq_values.append(micro_norm_sq.item())
+            
+            # 2. Manually accumulate the gradient into our buffer
+            with torch.no_grad():
+                for p, p_sum in zip(self.model.parameters(), self._grad_sum_buffer):
+                    if p.grad is not None:
+                        p_sum.add_(p.grad)
+            
+            # 3. CRITICAL: Zero out the model's grad so the next backward() call is clean
+            self.model.zero_grad()
 
-        # Use the raw (uncorrected) values for the calculation as per the paper's formula for S and |G|^2
-        # The bias correction is applied to the individual estimates before they are used in the ratio.
-        
-        # Estimated |G|^2 (true gradient norm squared)
-        # This is the |G|^2 from the paper's formula, not the raw squared norm.
-        # It's derived from the two batch sizes.
-        
-        # We need to use the *current* estimates of E[|G_est|^2] for B_big and B_small.
-        # Let's use the bias-corrected exponential averages.
-        
-        # Corrected estimates for E[|G_est|^2]
-        corrected_global_grad_norm_sq = self.exp_avg_sq_grad_norm_global / bias_correction
-        corrected_local_grad_norm_sq = self.exp_avg_sq_grad_norm_local / bias_correction
 
-        if B_big == B_small: # Avoid division by zero
-            return 0.0
+    def post_accumulate_step(self, accumulation_steps):
+        """Call this after the full accumulation loop, before optimizer.step()."""
+        if self.is_profiling:
+            # --- Finalize Profiling ---
+            
+            # 1. Load the accumulated gradient from our buffer back into the model
+            with torch.no_grad():
+                for p, p_sum in zip(self.model.parameters(), self._grad_sum_buffer):
+                    p.grad = p_sum
+            
+            # 2. Calculate the statistics
+            # We have the sum of gradients, so G_macro = (1/N) * sum(g_micro)
+            # ||G_macro||^2 = (1/N^2) * ||sum(g_micro)||^2
+            macro_norm_sq = self._get_full_grad_norm_sq(use_buffer=False) / (accumulation_steps ** 2)
+            
+            # E[||g_micro||^2]
+            if self._micro_norm_sq_values:
+                mean_micro_norm_sq = sum(self._micro_norm_sq_values) / len(self._micro_norm_sq_values)
+            else:
+                mean_micro_norm_sq = 0.0
 
-        # Estimated |G|^2 (true gradient norm squared)
-        # |G|^2 = (B_big * E[|G_B_big|^2] - B_small * E[|G_B_small|^2]) / (B_big - B_small)
-        estimated_G_sq = (B_big * corrected_global_grad_norm_sq - B_small * corrected_local_grad_norm_sq) / (B_big - B_small)
-        
-        # Estimated tr(Sigma)
-        # tr(Sigma) = (1/B_small - 1/B_big)^-1 * (E[|G_B_small|^2] - E[|G_B_big|^2])
-        estimated_tr_Sigma = (1 / (1/B_small - 1/B_big)) * (corrected_local_grad_norm_sq - corrected_global_grad_norm_sq)
+            if macro_norm_sq > 1e-8: # Avoid division by zero
+                b_est = self.micro_batch_size * (mean_micro_norm_sq / macro_norm_sq.item() - 1)
 
-        if estimated_G_sq <= 0: # Avoid division by zero or negative noise scale
-            return 0.0
+                # Update EMA of the estimate
+                if self.ema_b_est is None:
+                    self.ema_b_est = b_est
+                else:
+                    self.ema_b_est = self.ema_alpha * b_est + (1 - self.ema_alpha) * self.ema_b_est
+                
+                print(f"--- [Step {self._step_count}] Profiling Results ---")
+                print(f"    Mean micro-grad norm^2: {mean_micro_norm_sq:.4f}")
+                print(f"    Macro-grad norm^2:      {macro_norm_sq.item():.4f}")
+                print(f"    Noise/Signal Ratio:     {(mean_micro_norm_sq / macro_norm_sq.item()):.4f}")
+                print(f"    Instant B_est:          {b_est:.2f}")
+                print(f"    EMA B_est (B_crit):     {self.ema_b_est:.2f}")
 
-        noise_scale = estimated_tr_Sigma / estimated_G_sq
-        return noise_scale if noise_scale > 0 else 0.0 # Ensure non-negative noise scale
+            # Clean up memory
+            self._grad_sum_buffer = None
+            self._micro_norm_sq_values = []
+            self.is_profiling = False
+
 
 def _cfg_duplicate(tensor: torch.Tensor) -> torch.Tensor:
     """Duplicates a tensor along the batch dimension for CFG."""
