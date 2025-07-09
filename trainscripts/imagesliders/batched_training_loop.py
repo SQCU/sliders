@@ -15,7 +15,7 @@ from pathlib import Path
 import time
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Union, Literal, List, Dict, Any
-from .batch_slider_algo import calculate_paired_loss, GradientNoiseEstimator, GradientNoiseScaleEstimator
+from .batch_slider_algo import calculate_paired_loss, GradientNoiseEstimator
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
 from .batch_config_util import (
@@ -85,19 +85,18 @@ def prepare_cfg_batch(
     return latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg
 
 
-def train_step(environment: dict, batch: dict, global_step: int = 0):
+def train_step(environment: dict, batch: dict, global_step: int = 0, is_profiling_step: int = 0):
     """
     Performs a single training step with optional gradient accumulation and gradient noise estimation.
     """
     unet = environment["unet"]
     noise_scheduler = environment["noise_scheduler"]
     network = environment["network"]
-    optimizer = environment["optimizer"]
-    lr_scheduler = environment["lr_scheduler"]
     config = environment["config"]
     device = environment["device"]
     weight_dtype = environment["weight_dtype"]
     generator = environment["generator"]
+    gradient_noise_estimator = environment["gradient_noise_estimator"]
 
     # Move micro-batch data to gpu
     # grad accum step 1. Announce start of accumulation cycle
@@ -173,20 +172,22 @@ def train_step(environment: dict, batch: dict, global_step: int = 0):
             gradient_noise_estimator.post_micro_backward_step()
             # If profiling, update estimator after each micro-backward
 
-    return total_loss
+    return loss
 
 
-def training_loop(environment: dict, static_batches: list, gradient_noise_estimator: GradientNoiseEstimator = None):
+def training_loop(environment: dict, static_batches: list,):
     """
     Main training loop that iterates over a static list of pre-generated batches.
     """
     print(f"Starting training loop.")
     global_step = 0 # Initialize global step here
+    optimizer = environment["optimizer"]
+    lr_scheduler = environment["lr_scheduler"]
     for i in range(environment["config"].train.iterations):
         gradient_noise_estimator = environment["gradient_noise_estimator"]
         batch = static_batches[i % len(static_batches)]
         # Get gradient accumulation steps from config, default to 1
-        gradient_accumulation_steps = config.train.get("gradient_accumulation_steps", 1)
+        gradient_accumulation_steps = environment["config"].train.get("gradient_accumulation_steps", 1)
         if gradient_noise_estimator is not None:
             gradient_noise_estimator.pre_accumulate_step(global_step)
         # Determine if this is a profiling step
@@ -199,7 +200,7 @@ def training_loop(environment: dict, static_batches: list, gradient_noise_estima
         total_loss = 0.0
         # Iterate over micro-batches for gradient accumulation
         for i in range(gradient_accumulation_steps):
-            loss = train_step(environment, batch, gradient_noise_estimator, global_step)
+            loss = train_step(environment, batch, global_step, is_profiling_step)
             if not is_profiling_step:   #messily, we must sum accumulate nonprofiling loss outside of train_step.
                 total_loss += loss
         # After accumulation loop

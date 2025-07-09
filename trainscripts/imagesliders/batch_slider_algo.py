@@ -175,8 +175,6 @@ def calculate_paired_loss(
     target_noise: torch.Tensor,
     pair_indices: torch.Tensor,
     is_low_cases: torch.Tensor,
-    model: torch.nn.Module = None, # Added for gradient noise estimation
-    noise_estimator: GradientNoiseScaleEstimator = None, # Added for gradient noise estimation
 ) -> torch.Tensor:
     """
     Calculates the training loss, summing losses for paired items before averaging.

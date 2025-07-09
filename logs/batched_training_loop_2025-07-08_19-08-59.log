@@ -1,0 +1,88 @@
+Logging output to logs\batched_training_loop_2025-07-08_19-08-59.log
+Loading batch config from: F:/dox/ai/gemmy/sliders/trainscripts/imagesliders/data/batch_config.yaml
+Loading models from F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors to device: cuda with dtype: torch.bfloat16
+Fetching 17 files:   0%|                                                                                                                | 0/17 [00:00<?, ?it/s]Fetching 17 files: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████| 17/17 [00:00<00:00, 2852126.72it/s]
+Loading pipeline components...:   0%|                                                                                                    | 0/7 [00:00<?, ?it/s]Loading pipeline components...:  29%|██████████████████████████▎                                                                 | 2/7 [00:00<00:00, 12.70it/s]Loading pipeline components...:  57%|████████████████████████████████████████████████████▌                                       | 4/7 [00:00<00:00,  4.25it/s]Loading pipeline components...:  86%|██████████████████████████████████████████████████████████████████████████████▊             | 6/7 [00:03<00:00,  1.56it/s]Loading pipeline components...: 100%|████████████████████████████████████████████████████████████████████████████████████████████| 7/7 [00:03<00:00,  2.23it/s]
+UNet time_embedding_dim: None
+Enabling gradient checkpointing for UNet.
+Configured Batch Size: 4
+Configured Iterations: 2
+Expected Total Samples (Batch Size * Iterations): 8
+Building pseudo-randomized training schedule...
+Using random seed: 42
+Collecting all possible training data combinations...
+Created data pool with 2 unique image filenames across scales.
+Built schedule with 2 batches of size 4.
+Found 3 unique images and 1 unique prompts to process for unified cache.
+Caching image latents:   0%|                                                                                                             | 0/3 [00:00<?, ?it/s]F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\embedding_cache_util.py:129: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  loaded_data = torch.load(latent_path, map_location='cpu')
+[image] Forcing re-encoding for datasets\bracket\0\A.png due to invalidate_latent_cache flag.
+Caching image latents:  33%|█████████████████████████████████▋                                                                   | 1/3 [00:01<00:02,  1.06s/it][image] Forcing re-encoding for datasets\bracket\1\A.png due to invalidate_latent_cache flag.
+Caching image latents:  67%|███████████████████████████████████████████████████████████████████▎                                 | 2/3 [00:02<00:01,  1.05s/it][image] Forcing re-encoding for datasets\bracket\2\A.png due to invalidate_latent_cache flag.
+Caching image latents: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:03<00:00,  1.03s/it]Caching image latents: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 3/3 [00:03<00:00,  1.04s/it]
+Caching text embeddings:   0%|                                                                                                           | 0/1 [00:00<?, ?it/s]Caching text embeddings: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████| 1/1 [00:00<00:00,  2.10it/s]Caching text embeddings: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████| 1/1 [00:00<00:00,  2.10it/s]
+Unified embedding cache built.
+Pre-generating and caching all batches from schedule...
+Caching batches:   0%|                                                                                                                   | 0/2 [00:00<?, ?it/s]Caching batches: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:00<00:00, 20.45it/s]
+Cached 2 batches.
+skipped compile because something dubious was happening in debug.
+WARNING: lora_unet_conv_in dim (rank) is changed to: 4
+WARNING: lora_unet_conv_out dim (rank) is changed to: 4
+DEBUG: Total BatchedLoRAModule creations: 512
+DEBUG: Total module replacements: 512
+Starting training loop.
+--- [Step 0] Starting gradient noise profiling ---
+--- [Step 0] Starting gradient noise profiling ---
+Shape of add_text_embeddings (pooled_embeds_cfg) before UNet: torch.Size([8, 1280])
+Shape of add_time_ids (add_time_ids_cfg) before UNet: torch.Size([8, 6])
+Shape of timestep before UNet: torch.Size([8])
+--- [Step 0] Starting gradient noise profiling ---
+Shape of add_text_embeddings (pooled_embeds_cfg) before UNet: torch.Size([8, 1280])
+Shape of add_time_ids (add_time_ids_cfg) before UNet: torch.Size([8, 6])
+Shape of timestep before UNet: torch.Size([8])
+--- [Step 0] Profiling Results ---
+    Mean micro-grad norm^2: 14.2466
+    Macro-grad norm^2:      3.5616
+    Noise/Signal Ratio:     4.0000
+    Instant B_est:          12.00
+    EMA B_est (B_crit):     12.00
+Estimated Gradient Noise Scale (B_crit): 12.0000
+Iteration 2/2, Loss: 3.984375
+Shape of add_text_embeddings (pooled_embeds_cfg) before UNet: torch.Size([8, 1280])
+Shape of add_time_ids (add_time_ids_cfg) before UNet: torch.Size([8, 6])
+Shape of timestep before UNet: torch.Size([8])
+Shape of add_text_embeddings (pooled_embeds_cfg) before UNet: torch.Size([8, 1280])
+Shape of add_time_ids (add_time_ids_cfg) before UNet: torch.Size([8, 6])
+Shape of timestep before UNet: torch.Size([8])
+--- EXCEPTION OCCURRED ---
+Traceback (most recent call last):
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 359, in <module>
+    main()
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 346, in main
+    environment = training_loop(environment, static_batches)
+  File "F:\dox\ai\gemmy\sliders\trainscripts\imagesliders\batched_training_loop.py", line 210, in training_loop
+    loss.backward()
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\_tensor.py", line 581, in backward
+    torch.autograd.backward(
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\autograd\__init__.py", line 347, in backward
+    _engine_run_backward(
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\autograd\graph.py", line 825, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\utils\checkpoint.py", line 1129, in unpack_hook
+    frame.check_recomputed_tensors_match(gid)
+  File "F:\dox\ai\gemmy\sliders\.venv\lib\site-packages\torch\utils\checkpoint.py", line 903, in check_recomputed_tensors_match
+    raise CheckpointError(
+torch.utils.checkpoint.CheckpointError: torch.utils.checkpoint: Recomputed values for the following tensors have different metadata than during the forward pass.
+tensor at position 11:
+saved metadata: {'shape': torch.Size([8, 1, 1, 1]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([1, 1, 1, 1]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+tensor at position 18:
+saved metadata: {'shape': torch.Size([8, 1]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([1, 1]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+tensor at position 30:
+saved metadata: {'shape': torch.Size([8, 1, 1, 1]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([1, 1, 1, 1]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+tensor at position 37:
+saved metadata: {'shape': torch.Size([8, 1, 1, 1]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+recomputed metadata: {'shape': torch.Size([1, 1, 1, 1]), 'dtype': torch.bfloat16, 'device': device(type='cuda', index=0)}
+
