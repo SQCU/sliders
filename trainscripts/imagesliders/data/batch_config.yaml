@@ -18,24 +18,24 @@ network:
   training_method: "noxattn"
 train:
   seed: 42  #default training seed init
-  lr: 0.00048
+  lr: 0.00096
   lr_scheduler: "constant"  #or "constant" or "cosine"
   precision: "bfloat16"
   optimizer: "Adam8bit"
   noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
   max_denoising_steps: 50
   resolution: [512, 512]  #read from here for some reason
-  iterations: 32
-  gradient_accumulation_steps: 2
+  iterations: 640
+  gradient_accumulation_steps: 4
   batch_size: 4 #now must be assigned here
   bounds_test_vae_batch_size: true
   vae_encoding_batch_size: 20
-  invalidate_latent_cache: true
+  invalidate_latent_cache: false
   estimate_gradient_noise_scale: true
   gns_profile_freq: 4
-  gns_ema_alpha: 0.05
+  gns_ema_alpha: 0.02
 save:
-  name: "molKM_IL_imageslider" #unused? need to write name as --name "string"
+  name: "molKM_IL_imageslider_a" #used!
   path: "./models"
   per_steps: 20
   precision: "bfloat16"

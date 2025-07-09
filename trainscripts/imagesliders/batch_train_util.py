@@ -146,9 +146,6 @@ def nocfg_predict_noise_xl(
         "text_embeds": add_text_embeddings,
         "time_ids": add_time_ids.to(torch.float32),
     }
-    print(f"Shape of add_text_embeddings (pooled_embeds_cfg) before UNet: {add_text_embeddings.shape}")
-    print(f"Shape of add_time_ids (add_time_ids_cfg) before UNet: {add_time_ids.shape}")
-    print(f"Shape of timestep before UNet: {timestep.shape}")
 
     noise_pred = unet(
         latent_model_input.to(unet.dtype),
