@@ -85,7 +85,7 @@ def prepare_cfg_batch(
     return latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg
 
 
-def train_step(environment: dict, batch: dict, global_step: int = 0, is_profiling_step: int = 0):
+def train_step(environment: dict, batch: dict):
     """
     Performs a single training step with optional gradient accumulation and gradient noise estimation.
     """
@@ -98,13 +98,8 @@ def train_step(environment: dict, batch: dict, global_step: int = 0, is_profilin
     generator = environment["generator"]
     gradient_noise_estimator = environment["gradient_noise_estimator"]
 
-    # Move micro-batch data to gpu
-    # grad accum step 1. Announce start of accumulation cycle
-    gradient_noise_estimator.pre_accumulate_step(global_step)
-
+    current_micro_batch = batch
     # For now, we'll use the full 'batch' as a micro-batch, and scale loss.
-    # If actual micro-batching is needed, this part will require adjustment.
-    current_micro_batch = rectify_batch_fn(batch, device, weight_dtype)
 
     latents = current_micro_batch["latents"]
     scales = current_micro_batch["scales"]
@@ -147,30 +142,23 @@ def train_step(environment: dict, batch: dict, global_step: int = 0, is_profilin
     batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
     network.set_lora_scales(batched_scales_cfg)
 
-    with network:
-        predicted_noise = batch_train_util.nocfg_predict_noise_xl(
-            unet,
-            noise_scheduler,
-            unet_timesteps_cfg,
-            latents_cfg,
-            text_embeddings_cfg,
-            pooled_embeds_cfg,
-            add_time_ids_cfg,
-        )
+    #used to have with network here... have to move it to wrap around the backwards to avoid a gradient checkpointing error...
+    predicted_noise = batch_train_util.nocfg_predict_noise_xl(
+        unet,
+        noise_scheduler,
+        unet_timesteps_cfg,
+        latents_cfg,
+        text_embeddings_cfg,
+        pooled_embeds_cfg,
+        add_time_ids_cfg,
+    )
 
-        predicted_noise_uncond, predicted_noise_text = predicted_noise.chunk(2)
-        predicted_noise_cfg_reduced = (predicted_noise_uncond + guidance_scale * (
-            predicted_noise_text - predicted_noise_uncond
-        )).to(device)
+    predicted_noise_uncond, predicted_noise_text = predicted_noise.chunk(2)
+    predicted_noise_cfg_reduced = (predicted_noise_uncond + guidance_scale * (
+        predicted_noise_text - predicted_noise_uncond
+    )).to(device)
 
-        if not is_profiling_step:
-            # Calculate loss for this micro-batch
-            loss = calculate_paired_loss(predicted_noise_cfg_reduced, noise, pair_indices, is_low_cases)
-        else:
-            loss = calculate_paired_loss(predicted_noise_cfg_reduced, noise, pair_indices, is_low_cases)
-            loss.backward()
-            gradient_noise_estimator.post_micro_backward_step()
-            # If profiling, update estimator after each micro-backward
+    loss = calculate_paired_loss(predicted_noise_cfg_reduced, noise, pair_indices, is_low_cases)
 
     return loss
 
@@ -183,48 +171,72 @@ def training_loop(environment: dict, static_batches: list,):
     global_step = 0 # Initialize global step here
     optimizer = environment["optimizer"]
     lr_scheduler = environment["lr_scheduler"]
-    for i in range(environment["config"].train.iterations):
-        gradient_noise_estimator = environment["gradient_noise_estimator"]
-        batch = static_batches[i % len(static_batches)]
-        # Get gradient accumulation steps from config, default to 1
-        gradient_accumulation_steps = environment["config"].train.get("gradient_accumulation_steps", 1)
+    network = environment["network"]
+    device = environment["device"]
+    weight_dtype = environment["weight_dtype"]
+    config = environment["config"]
+    gradient_noise_estimator = environment.get("gradient_noise_estimator")
+    gradient_accumulation_steps = config.train.get("gradient_accumulation_steps", 1)
+
+    progress_bar = tqdm(range(config.train.iterations), desc="training its")
+
+    for i in progress_bar:   
+        # Determine if this is a profiling step    
         if gradient_noise_estimator is not None:
             gradient_noise_estimator.pre_accumulate_step(global_step)
-        # Determine if this is a profiling step
-        is_profiling_step = gradient_noise_estimator is not None and gradient_noise_estimator.is_profiling
-
-        # Zero gradients at the start of the accumulation cycle, unless profiling is active
-        # In profiling mode, zero_grad is handled per micro-batch by the estimator
-        if not is_profiling_step:
-            optimizer.zero_grad()
-        total_loss = 0.0
-        # Iterate over micro-batches for gradient accumulation
-        for i in range(gradient_accumulation_steps):
-            loss = train_step(environment, batch, global_step, is_profiling_step)
-            if not is_profiling_step:   #messily, we must sum accumulate nonprofiling loss outside of train_step.
-                total_loss += loss
-        # After accumulation loop
-        if not is_profiling_step:
-            #scaling to get mean from of sum-reduced non-profiling loss
-            loss = loss/gradient_accumulation_steps
-            loss.backward()
+            is_profiling_step = gradient_noise_estimator is not None and gradient_noise_estimator.is_profiling
         else:
-            gradient_noise_estimator.post_accumulate_step(gradient_accumulation_steps)
-        # Optimizer step and scheduler step
-        #both profiling step and non profiling step have correct .grad attribute here
-        optimizer.step()
-        lr_scheduler.step()
-        # Zero gradients after optimizer step, unless profiling was active (handled by estimator)
-        if not is_profiling_step:
-            optimizer.zero_grad()
+            is_profiling_step = False
 
-        # Print estimated gradient noise scale if enabled
-        if gradient_noise_estimator is not None and gradient_noise_estimator.ema_b_est is not None:
-            print(f"Estimated Gradient Noise Scale (B_crit): {gradient_noise_estimator.ema_b_est:.4f}")
+        total_loss = 0.0
+        #need to wrap the backprop w/ 'with network' or we fail to checkpoint scales metadata.
+        with network:
+            if is_profiling_step:
+                # Iterate over micro-batches for gradient accumulation
+                for _ in range(gradient_accumulation_steps):
+                    micro_batch = static_batches[i % len(static_batches)] 
+                    micro_batch = rectify_batch_fn(micro_batch, device, weight_dtype)
+                    loss = train_step(environment, micro_batch)
+                    #immediate backprop to get microgradient
+                    loss.backward()
+                    #tell estimator to capture and accumulate microgradient data
+                    gradient_noise_estimator.post_micro_backward_step()
+                    total_loss += loss.item()
+            else:
+                #NON-GRADIENTSTATS ACCUMULATION CONTROL FLOW
+                optimizer.zero_grad()
+                for _ in range(gradient_accumulation_steps):
+                    micro_batch = static_batches[i % len(static_batches)] 
+                    micro_batch = rectify_batch_fn(micro_batch, device, weight_dtype)
+                    loss = train_step(environment, micro_batch)
+                    # Scale loss for accumulation
+                    loss = loss / gradient_accumulation_steps
 
-        if i % 1 == 0:
-            print(f"Iteration {i+1}/{environment['config'].train.iterations}, Loss: {loss}")
-        global_step += 1 # Increment global step after each training step
+                    # accumulate gradients
+                    loss.backward()
+                    total_loss += loss.item() * gradient_accumulation_steps
+
+            #AFTER ACCUMULATION SEQUENCE
+            #scaling to get mean from of sum-reduced non-profiling loss
+            if is_profiling_step:
+                gradient_noise_estimator.post_accumulate_step(gradient_accumulation_steps)
+                #scale for logging
+                avg_loss = total_loss/gradient_accumulation_steps
+            else: 
+                #already scaled
+                avg_loss = total_loss
+                
+            # Optimizer step and scheduler step
+            #both profiling step and non profiling step have correct .grad attribute here
+            optimizer.step()
+            lr_scheduler.step()
+
+            progress_bar.set_postfix({"Loss": f"{avg_loss:.4f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+            # Print estimated gradient noise scale if enabled
+            if gradient_noise_estimator is not None and gradient_noise_estimator.ema_b_est is not None:
+                # Print on the same line as tqdm progress bar
+                progress_bar.set_postfix_str(f"Loss: {avg_loss:.4f}, LR: {lr_scheduler.get_last_lr()[0]:.2e}, B_crit: {gradient_noise_estimator.ema_b_est:.2f}")
+            global_step += 1 # Increment global step after each training step
     
     return environment
 

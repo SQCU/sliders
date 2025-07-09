@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import math
 from typing import Optional, List, Type, Set, Literal, Union
+import os
+from safetensors.torch import save_file
 
 # Define constants similar to lora.py if needed for module identification
 UNET_TARGET_REPLACE_MODULE_TRANSFORMER = ["Attention"]
