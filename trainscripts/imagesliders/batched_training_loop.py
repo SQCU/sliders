@@ -179,7 +179,7 @@ def training_loop(environment: dict, static_batches: list,):
     gradient_accumulation_steps = config.train.get("gradient_accumulation_steps", 1)
 
     progress_bar = tqdm(range(config.train.iterations), desc="training its")
-
+    losses = []
     for i in progress_bar:   
         # Determine if this is a profiling step    
         if gradient_noise_estimator is not None:
@@ -220,22 +220,19 @@ def training_loop(environment: dict, static_batches: list,):
             #scaling to get mean from of sum-reduced non-profiling loss
             if is_profiling_step:
                 gradient_noise_estimator.post_accumulate_step(gradient_accumulation_steps)
-                #scale for logging
-                avg_loss = total_loss/gradient_accumulation_steps
-            else: 
-                #already scaled
-                avg_loss = total_loss
-                
+            #scale for logging
+            avg_loss = total_loss/gradient_accumulation_steps
+            losses.append(avg_loss)
             # Optimizer step and scheduler step
             #both profiling step and non profiling step have correct .grad attribute here
             optimizer.step()
             lr_scheduler.step()
 
-            progress_bar.set_postfix({"Loss": f"{avg_loss:.4f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+            progress_bar.set_postfix({"Loss;avg": f"{avg_loss:.3f};{sum(losses)/len(losses):.3f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
             # Print estimated gradient noise scale if enabled
             if gradient_noise_estimator is not None and gradient_noise_estimator.ema_b_est is not None:
                 # Print on the same line as tqdm progress bar
-                progress_bar.set_postfix_str(f"Loss: {avg_loss:.4f}, LR: {lr_scheduler.get_last_lr()[0]:.2e}, B_crit: {gradient_noise_estimator.ema_b_est:.2f}")
+                progress_bar.set_postfix_str({"Loss;avg": f"{avg_loss:.3f};{sum(losses)/len(losses):.3f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}", "B_crit": "{gradient_noise_estimator.ema_b_est:.2f}"})
             global_step += 1 # Increment global step after each training step
     
     return environment
@@ -348,7 +345,7 @@ def main():
     lr_scheduler = get_scheduler(
         name=config.train.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=0,
+        num_warmup_steps=config.train.get("lr_warmup_steps", 10),
         num_training_steps=config.train.iterations,
     )
     environment['optimizer']=optimizer#yes this switcharoo is necessary

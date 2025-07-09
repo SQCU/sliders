@@ -13,12 +13,13 @@ pretrained_model:
   v_pred: false # true if model uses v-prediction
 network:
   type: "c3lier" # or "c3lier" or "lierla"
-  rank: 16
-  alpha: 16.0
+  rank: 32
+  alpha: 32
   training_method: "noxattn"
 train:
   seed: 42  #default training seed init
   lr: 0.00096
+  lr_warmup_steps: 32
   lr_scheduler: "constant"  #or "constant" or "cosine"
   precision: "bfloat16"
   optimizer: "Adam8bit"
