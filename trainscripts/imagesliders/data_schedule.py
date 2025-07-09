@@ -189,7 +189,9 @@ def prepare_cached_batches(config, environment):
 
         for item_idx, item in enumerate(batch_items):
             # Unpack the cached data
-            latents_by_resolution_dict, original_image_size = image_latents_cache[item.image_path]
+            cached_data = image_latents_cache[item.image_path]
+            latents_by_resolution_dict = cached_data["latents"]
+            original_image_size = cached_data["original_image_size"]
 
             latent = latents_by_resolution_dict[target_resolution]
             latents.append(latent)

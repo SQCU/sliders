@@ -55,7 +55,7 @@ def process_and_cache_item(
 
 # --- Helper functions for Images ---
 
-def _image_encoder_fn(image_path: str, environment: Dict[str, Any], config: Any) -> Tuple[Dict[Tuple[int, int], torch.Tensor], Tuple[int, int]]:
+def _image_encoder_fn(image_path: str, environment: Dict[str, Any], config: Any) -> Dict[str, Any]:
     vae = environment['vae']
     device = environment['device']
     weight_dtype = environment['weight_dtype']
@@ -74,7 +74,7 @@ def _image_encoder_fn(image_path: str, environment: Dict[str, Any], config: Any)
     # Store the latent keyed by its resolution
     latents_by_resolution = {target_resolution: new_latent_gpu.cpu()}
     
-    return latents_by_resolution, original_image_size
+    return {"latents": latents_by_resolution, "original_image_size": original_image_size}
 
 def _image_cache_key_fn(image_path: str) -> str:
     return image_path
@@ -82,13 +82,18 @@ def _image_cache_key_fn(image_path: str) -> str:
 def _image_invalidation_check_fn(image_path: str, existing_data: Dict[str, Any], environment: Dict[str, Any], config: Any) -> bool:
     target_resolution = tuple(config.train.get("resolution", (512, 512)))
     
-    if not existing_data or target_resolution not in existing_data["latents"]:
+    if not existing_data or "latents" not in existing_data or target_resolution not in existing_data["latents"]:
         print(f"Latent for {image_path} at resolution {target_resolution} not found in cache. Re-encoding.")
         return False
 
-    # Re-encode the image for the current target resolution to compare
-    new_latents_by_resolution, _ = _image_encoder_fn(image_path, environment, config)
+    # --- THE FIX IS HERE ---
+    # Call the encoder function and treat its return as a dictionary
+    newly_encoded_data = _image_encoder_fn(image_path, environment, config)
+    new_latents_by_resolution = newly_encoded_data["latents"]
+    # Now you can correctly access the latent by its resolution key
     new_latent = new_latents_by_resolution[target_resolution]
+    # --- END OF FIX ---
+
     existing_latent = existing_data["latents"][target_resolution]
 
     are_close = torch.allclose(existing_latent, new_latent, atol=1e-4, rtol=1e-3)
@@ -97,13 +102,15 @@ def _image_invalidation_check_fn(image_path: str, existing_data: Dict[str, Any],
         print(f"Latent mismatch for {image_path} at resolution {target_resolution}. Mean absolute difference: {diff.item()}. Re-encoding.")
     return are_close
 
-def _image_save_fn(image_path: str, encoded_data: Tuple[Dict[Tuple[int, int], torch.Tensor], Tuple[int, int]], environment: Dict[str, Any], config: Any) -> None:
-    output_dir = Path(config.dataset.folder_main) / "latents"
-    os.makedirs(output_dir, exist_ok=True)
-    latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
-    latent_path = os.path.join(output_dir, latent_filename)
+def _image_save_fn(image_path: str, encoded_data: Dict[str, Any], environment: Dict[str, Any], config: Any) -> None:
+    main_folder = Path(config.dataset.folder_main)
+    relative_image_path = Path(image_path).relative_to(main_folder)
+    latent_path = main_folder / "latents" / relative_image_path.with_suffix(".pt")
 
-    latents_by_resolution, original_image_size = encoded_data
+    os.makedirs(latent_path.parent, exist_ok=True)
+
+    latents_by_resolution = encoded_data["latents"]
+    original_image_size = encoded_data["original_image_size"]
 
     # Load existing data if any, to merge new resolution latents
     existing_data = _image_load_fn(image_path, environment, config)
@@ -120,10 +127,12 @@ def _image_save_fn(image_path: str, encoded_data: Tuple[Dict[Tuple[int, int], to
     }
     torch.save(data_to_save, latent_path)
 
+
 def _image_load_fn(image_path: str, environment: Dict[str, Any], config: Any) -> Union[Dict[str, Any], None]:
-    output_dir = Path(config.dataset.folder_main) / "latents"
-    latent_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pt"
-    latent_path = os.path.join(output_dir, latent_filename)
+    main_folder = Path(config.dataset.folder_main)
+    relative_image_path = Path(image_path).relative_to(main_folder)
+    latent_path = main_folder / "latents" / relative_image_path.with_suffix(".pt")
+
     if os.path.exists(latent_path):
         try:
             loaded_data = torch.load(latent_path, map_location='cpu')

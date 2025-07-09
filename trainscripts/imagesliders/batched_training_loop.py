@@ -43,6 +43,48 @@ UNET_PROJECTION_CLASS_EMBEDDING_INPUT_DIM = 2816
 SDXL_TEXT_ENCODER_TYPE = Union[CLIPTextModel, CLIPTextModelWithProjection]
 DIFFUSERS_CACHE_DIR = None # if you want to change the cache dir, change this
 
+# --- BEGIN TORCH.COMPILE MONKEY-PATCH ---
+# This fixes a race condition in torch.compile's caching on Windows.
+# The default `Path.rename` fails if the destination file exists, which can
+# happen in multi-threaded/multi-process scenarios. `os.replace` is the
+# correct atomic "overwrite" operation.
+
+
+import torch._inductor.codecache as codecache
+import os
+import threading
+from pathlib import Path
+from typing import Union
+
+# Copy the original function's signature and body
+def fixed_write_atomic(
+    path_: str,
+    content: Union[str, bytes],
+    make_dirs: bool = False,
+    encode_utf_8: bool = False,
+) -> None:
+    path = Path(path_)
+    if make_dirs:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Use a unique temporary file to avoid conflicts
+    # NOTE: The original implementation's temp file naming is also a source
+    # of race conditions. A more robust temp file could be used, but
+    # fixing the rename is the most critical part.
+    tmp_path = path.parent / f".{os.getpid()}.{threading.get_ident()}.tmp"
+    
+    write_mode = "w" if isinstance(content, str) else "wb"
+    with tmp_path.open(write_mode, encoding="utf-8" if encode_utf_8 else None) as f:
+        f.write(content)
+        
+    # THE FIX: Use os.replace for an atomic overwrite on all platforms
+    os.replace(tmp_path, path)
+
+# Overwrite the function in the loaded module
+codecache.write_atomic = fixed_write_atomic
+print("--- Applied monkey-patch to torch._inductor.codecache.write_atomic for Windows compatibility ---")
+# --- END MONKEY-PATCH ---
+
 def rectify_batch_fn(batch: dict, device: torch.device, weight_dtype: torch.dtype) -> dict:
     """
     Moves batch data to the appropriate device and dtype.
