@@ -26,7 +26,7 @@ train:
   noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
   max_denoising_steps: 50
   resolution: [512, 512]  #read from here for some reason
-  iterations: 640
+  iterations: 2
   gradient_accumulation_steps: 4
   batch_size: 4 #now must be assigned here
   bounds_test_vae_batch_size: true
@@ -36,7 +36,7 @@ train:
   gns_profile_freq: 4
   gns_ema_alpha: 0.02
 save:
-  name: "molKM_IL_imageslider_a" #used!
+  name: "molKM_IL_imageslider_b" #used!
   path: "./models"
   per_steps: 20
   precision: "bfloat16"

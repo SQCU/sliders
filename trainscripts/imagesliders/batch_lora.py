@@ -232,7 +232,7 @@ class BatchedLoRANetwork(nn.Module):
             #lora_module.current_multiplier = scales.to(lora_module.lora_down.weight.device)
             #what is this curious and inexplicable gemini 2.5 code saying to do?
             #the reference lora.py does the same thing i just wrote below btw.
-            lora_module.current_multiplier = scales.detach()
+            lora_module.current_multiplier = scales
 
     def __enter__(self):
         """
@@ -264,6 +264,7 @@ class BatchedLoRANetwork(nn.Module):
         """
         Saves the state dictionary of the LoRA network.
         """
+        """
         state_dict = self.state_dict()
         if dtype is not None:
             for key in list(state_dict.keys()):
@@ -276,3 +277,21 @@ class BatchedLoRANetwork(nn.Module):
             save_file(state_dict, file, metadata)
         else:
             torch.save(state_dict, file)
+        """
+        #naive saving will preserve every single module in the unet with an adapter attached!
+        #this is a bit better.
+        state_to_save = {}
+        
+        # Iterate through the network and find all LoRA modules
+        for name, module in self.named_modules():
+            # We are looking for the trainable LoRA part inside the injected layer
+            if isinstance(module, LoRAInjectedLayer):
+                # Get the state dict of ONLY the lora_module
+                lora_state_dict = module.lora_module.state_dict()
+                for k, v in lora_state_dict.items():
+                    # Prepend the parent module's name to create the correct key
+                    full_key = f"{name}.lora_module.{k}"
+                    state_to_save[full_key] = v.to("cpu", dtype=torch.float32)
+
+        from safetensors.torch import save_file
+        save_file(state_to_save, file_path)
