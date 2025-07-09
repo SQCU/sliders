@@ -260,7 +260,7 @@ class BatchedLoRANetwork(nn.Module):
             all_params.extend(lora_module.parameters())
         return [{"params": all_params}]
 
-    def save_weights(self, file: str, dtype: Optional[torch.dtype] = None, metadata: Optional[dict] = None):
+    def save_weights(self, file: str, dtype: Optional[torch.dtype] = torch.bfloat16, metadata: Optional[dict] = None):
         """
         Saves the state dictionary of the LoRA network.
         """
@@ -280,18 +280,22 @@ class BatchedLoRANetwork(nn.Module):
         """
         #naive saving will preserve every single module in the unet with an adapter attached!
         #this is a bit better.
+        state_dict = self.state_dict()
         state_to_save = {}
-        
-        # Iterate through the network and find all LoRA modules
-        for name, module in self.named_modules():
-            # We are looking for the trainable LoRA part inside the injected layer
-            if isinstance(module, LoRAInjectedLayer):
-                # Get the state dict of ONLY the lora_module
-                lora_state_dict = module.lora_module.state_dict()
-                for k, v in lora_state_dict.items():
-                    # Prepend the parent module's name to create the correct key
-                    full_key = f"{name}.lora_module.{k}"
-                    state_to_save[full_key] = v.to("cpu", dtype=torch.float32)
 
-        from safetensors.torch import save_file
-        save_file(state_to_save, file_path)
+        # Iterate through the full state dictionary and keep only the LoRA parameters.
+        # The LoRA parameters are identifiable by the names 'lora_up' and 'lora_down'.
+        for key, value in state_dict.items():
+            if "lora_down" in key or "lora_up" in key:
+                # Also ensure we are not accidentally saving optimizer states or something else
+                if "lora_down" in key or "lora_up" in key:
+                    state_to_save[key] = value.to(device=torch.device("cpu"), dtype=dtype)
+
+        if not state_to_save:
+            print("WARNING: No LoRA parameters found to save. The saved file will be empty.")
+            # This can happen if the network was not initialized correctly.
+
+        if os.path.splitext(file)[1] == ".safetensors":
+            save_file(state_to_save, file, metadata)
+        else:
+            torch.save(state_to_save, file)

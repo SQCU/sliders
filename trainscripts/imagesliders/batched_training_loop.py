@@ -247,7 +247,8 @@ def graceful_shutdown(environment: dict):
     save_path = environment["config"].save.path
     os.makedirs(save_path, exist_ok=True)
     model_name = f"{environment['config'].save.name}.safetensors"
-    network.save_weights(os.path.join(save_path, model_name))
+    save_dtype = environment["save_dtype"]
+    network.save_weights(os.path.join(save_path, model_name), dtype=save_dtype)
     print(f"Model saved to {os.path.join(save_path, model_name)}")
 
 
@@ -302,12 +303,23 @@ def main():
         torch.cuda.empty_cache()
         #WOOO COMPILE TIME!!!
         #if config.other.torch_compile:
-        hardcode_allow_compile = False
-        if hardcode_allow_compile:
+        #hardcode_allow_compile = False
+        #if hardcode_allow_compile:
+        if config.other.get("torch_compile", False):
             print("compiling unet for very fast hayai")
+            torch._inductor.config.coordinate_descent_tuning = True
+            torch._inductor.config.triton.unique_kernel_names = True
+            torch._inductor.config.fx_graph_cache = True 
+            torch._functorch.config.enable_autograd_cache = True
+
+            if config.other.get("use_pytorch_SDPA", False):
+                from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp
+                enable_cudnn_sdp(True)
+                enable_flash_sdp(True)
+
             unet2 = torch.compile(unet2, mode="reduce-overhead", fullgraph=True)
         else:
-            print("skipped compile because something dubious was happening in debug.")
+            print("skipped compile because....")
         environment['unet'] = unet2
 
     # Create adapter network

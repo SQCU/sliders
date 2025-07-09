@@ -123,6 +123,7 @@ def envsetup(config):
     enable_flash_sdp(True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = parse_precision(config.train.precision)
+    save_dtype = parse_precision(config.save.precision)
     
     # Load UNet to the specified device (GPU if available)
     vae, unet, tokenizers, text_encoders = load_models(config, device, weight_dtype)
@@ -147,6 +148,7 @@ def envsetup(config):
         "text_encoders": text_encoders,
         "device": device,
         "weight_dtype": weight_dtype,
+        "save_dtype": save_dtype,
         "config": config,
         "optimizer": optimizer,
         "generator": torch.Generator(device=device).manual_seed(config.train.seed),
