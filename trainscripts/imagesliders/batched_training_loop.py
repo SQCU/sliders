@@ -300,15 +300,6 @@ def main():
             print("skipped compile because something dubious was happening in debug.")
         environment['unet'] = unet2
 
-    # Initialize gradient noise scale estimator
-    gradient_noise_estimator = None
-    if hasattr(config.train, "estimate_gradient_noise_scale") and config.train.estimate_gradient_noise_scale:
-        # micro_batch_size for GNS is the actual batch size processed by UNet in one go
-        micro_batch_size = config.train.batch_size
-        profile_freq = config.train.get("gns_profile_freq", 100) # Default to 100 steps
-        ema_alpha = config.train.get("gns_ema_alpha", 0.05) # Default EMA alpha
-        gradient_noise_estimator = GradientNoiseEstimator(network, micro_batch_size, profile_freq, ema_alpha)
-
     # Create adapter network
     network = lora.BatchedLoRANetwork(
         unet=environment['unet'],
@@ -316,6 +307,17 @@ def main():
         alpha=config.network.alpha,
         train_method=config.network.training_method,
     ).to(environment['device'], dtype=environment['weight_dtype'])
+
+        # Initialize gradient noise scale estimator
+    gradient_noise_estimator = None
+    if hasattr(config.train, "estimate_gradient_noise_scale") and config.train.estimate_gradient_noise_scale:
+        with torch.no_grad():
+            # micro_batch_size for GNS is the actual batch size processed by UNet in one go
+            micro_batch_size = config.train.batch_size
+            profile_freq = config.train.get("gns_profile_freq", 10) # Default to 100 steps
+            ema_alpha = config.train.get("gns_ema_alpha", 0.05) # Default EMA alpha
+            gradient_noise_estimator = GradientNoiseEstimator(network, micro_batch_size, profile_freq, ema_alpha)
+    environment["gradient_noise_estimator"] = gradient_noise_estimator
 
     #slurp optimizer args from config
     optimizer_kwargs = {}
@@ -340,7 +342,7 @@ def main():
     environment['lr_scheduler'] = lr_scheduler
 
     # Run the training loop with the static batches
-    environment = training_loop(environment, static_batches, gradient_noise_estimator)
+    environment = training_loop(environment, static_batches)
 
     # Save the final model
     graceful_shutdown(environment)

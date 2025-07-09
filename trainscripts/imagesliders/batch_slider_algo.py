@@ -9,7 +9,7 @@ class GradientNoiseEstimator:
     This class performs a periodic, memory-intensive profiling step to estimate
     the optimal batch size, as described in 'An Empirical Model of Large-Batch Training'.
     """
-    def __init__(self, model, micro_batch_size, profile_freq=100, ema_alpha=0.05):
+    def __init__(self, model, micro_batch_size, profile_freq=10, ema_alpha=0.05):
         self.model = model
         self.micro_batch_size = micro_batch_size
         self.profile_freq = profile_freq

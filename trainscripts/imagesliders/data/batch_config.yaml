@@ -31,6 +31,9 @@ train:
   bounds_test_vae_batch_size: true
   vae_encoding_batch_size: 20
   invalidate_latent_cache: true
+  estimate_gradient_noise_scale: true
+  gns_profile_freq: 3
+  gns_ema_alpha: 0.05
 save:
   name: "molKM_IL_imageslider" #unused? need to write name as --name "string"
   path: "./models"
