@@ -1,0 +1,31 @@
+\babel@toc {english}{}
+\contentsline {section}{\numberline {1}Introduction}{2}{section.1}
+\contentsline {section}{\numberline {2}Theory and Predictions for the Gradient Noise Scale}{4}{section.2}
+\contentsline {subsection}{\numberline {2.1}Intuitive Picture}{4}{subsection.2.1}
+\contentsline {subsection}{\numberline {2.2}Gradients, Batches, and the Gradient Noise Scale}{5}{subsection.2.2}
+\contentsline {subsection}{\numberline {2.3}Predictions for Data/Time Efficiency Tradeoffs}{7}{subsection.2.3}
+\contentsline {subsection}{\numberline {2.4}Assumptions and Caveats}{8}{subsection.2.4}
+\contentsline {subsection}{\numberline {2.5}Expected Patterns in the Noise Scale}{8}{subsection.2.5}
+\contentsline {subsection}{\numberline {2.6}Summary}{9}{subsection.2.6}
+\contentsline {section}{\numberline {3}Experiments}{9}{section.3}
+\contentsline {subsection}{\numberline {3.1}Quantities Measured}{10}{subsection.3.1}
+\contentsline {subsection}{\numberline {3.2}Results}{11}{subsection.3.2}
+\contentsline {section}{\numberline {4}Related Work}{14}{section.4}
+\contentsline {section}{\numberline {5}Discussion}{15}{section.5}
+\contentsline {section}{\numberline {A}Methods}{17}{appendix.A}
+\contentsline {subsection}{\numberline {A.1}Unbiased Estimate of the Simple Noise Scale with No Overhead}{17}{subsection.A.1}
+\contentsline {subsection}{\numberline {A.2}Systematic Searches Over Batch Sizes}{17}{subsection.A.2}
+\contentsline {subsection}{\numberline {A.3}Pareto Front Measurements}{18}{subsection.A.3}
+\contentsline {subsection}{\numberline {A.4}Details of Learning Tasks }{18}{subsection.A.4}
+\contentsline {subsubsection}{\numberline {A.4.1}Classification}{18}{subsubsection.A.4.1}
+\contentsline {subsubsection}{\numberline {A.4.2}Reinforcement Learning}{19}{subsubsection.A.4.2}
+\contentsline {subsubsection}{\numberline {A.4.3}Generative and Language Modeling}{19}{subsubsection.A.4.3}
+\contentsline {section}{\numberline {B}Results for All Tasks}{19}{appendix.B}
+\contentsline {section}{\numberline {C}Temperature and the Noise Scale}{25}{appendix.C}
+\contentsline {section}{\numberline {D}Dynamically Varying the Batch Size}{26}{appendix.D}
+\contentsline {subsection}{\numberline {D.1}Theory}{27}{subsection.D.1}
+\contentsline {subsection}{\numberline {D.2}An SVHN Case Study}{28}{subsection.D.2}
+\contentsline {section}{\numberline {E}Comments on Optimization}{29}{appendix.E}
+\contentsline {subsection}{\numberline {E.1}Deterministic Training Performs Poorly}{29}{subsection.E.1}
+\contentsline {subsection}{\numberline {E.2}Motivations for Learning Rate Scaling Rules}{30}{subsection.E.2}
+\contentsline {subsection}{\numberline {E.3}Preliminary Tests of Generalization}{30}{subsection.E.3}

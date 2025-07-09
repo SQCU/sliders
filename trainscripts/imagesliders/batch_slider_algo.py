@@ -3,43 +3,86 @@ from typing import List, Dict, Tuple, Any
 from collections import deque
 
 class GradientNoiseScaleEstimator:
-    def __init__(self, window_size: int = 100):
-        self.window_size = window_size
-        self.gradient_norms_squared = deque(maxlen=window_size)
-        self.gradient_norms = deque(maxlen=window_size)
+    def __init__(self, beta: float = 0.999):
+        self.beta = beta
+        self.exp_avg_sq_grad_norm_global = 0.0  # Exponentially weighted average of squared global gradient norm (|G_B_big|^2)
+        self.exp_avg_sq_grad_norm_local = 0.0   # Exponentially weighted average of squared local gradient norm (|G_B_small|^2)
+        self.t = 0  # Timestep counter
 
     def update(self, model: torch.nn.Module):
-        # Calculate the squared L2 norm of the gradients for all parameters
-        total_grad_norm_squared = 0.0
-        total_grad_norm = 0.0
+        self.t += 1
+
+        # Calculate global gradient norm (L2 norm of all gradients)
+        global_grad_norm_sq = 0.0
         for p in model.parameters():
             if p.grad is not None:
-                grad_norm_squared = p.grad.data.norm(2).item()**2
-                total_grad_norm_squared += grad_norm_squared
-                total_grad_norm += p.grad.data.norm(2).item()
+                global_grad_norm_sq += p.grad.data.norm(2).item()**2
+        
+        # Calculate local gradient norm (average of squared L2 norms of individual parameter gradients)
+        # This is a heuristic approximation for B_small=1 in a single-device context.
+        local_grad_norm_sq_sum = 0.0
+        num_params_with_grad = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                local_grad_norm_sq_sum += p.grad.data.norm(2).item()**2
+                num_params_with_grad += 1
+        
+        local_grad_norm_sq = local_grad_norm_sq_sum / num_params_with_grad if num_params_with_grad > 0 else 0.0
 
-        self.gradient_norms_squared.append(total_grad_norm_squared)
-        self.gradient_norms.append(total_grad_norm)
+        # Update exponentially weighted moving averages
+        self.exp_avg_sq_grad_norm_global = self.beta * self.exp_avg_sq_grad_norm_global + (1 - self.beta) * global_grad_norm_sq
+        self.exp_avg_sq_grad_norm_local = self.beta * self.exp_avg_sq_grad_norm_local + (1 - self.beta) * local_grad_norm_sq
 
-    def get_noise_scale(self) -> float:
-        if len(self.gradient_norms_squared) < 2:
-            return 0.0  # Not enough data to estimate variance
+    def get_noise_scale(self, B_big: int, B_small: int = 1) -> float:
+        # Bias correction for moving averages
+        bias_correction = 1 - self.beta**self.t
+        
+        # Estimated |G|^2 (true gradient norm squared)
+        # From paper: |G|^2 = (B_big * |G_B_big|^2 - B_small * |G_B_small|^2) / (B_big - B_small)
+        # Using corrected moving averages as estimates for |G_B_big|^2 and |G_B_small|^2
+        
+        # Note: The paper's formula for |G|^2 and tr(Sigma) assumes |G_B_small|^2 is from a batch of size B_small.
+        # Our local_grad_norm_sq is an average per parameter, not per sample.
+        # This is a pragmatic adaptation for a single-device setup.
+        
+        # For the purpose of this estimation, we'll use the global_grad_norm_sq as |G_B_big|^2
+        # and the local_grad_norm_sq as |G_B_small|^2 (assuming B_small=1 for per-parameter average)
+        
+        # We need to be careful with the interpretation of |G_B_small|^2 here.
+        # The paper's formula for S and |G|^2 is based on the expectation E[|G_est|^2] = |G|^2 + tr(Sigma)/B.
+        # If we assume our `local_grad_norm_sq` is a proxy for E[|G_est|^2] for B=1, and `global_grad_norm_sq` for B=B_big,
+        # then we can use the formulas from Appendix A.1.
 
-        # Estimate tr(Sigma) using variance of gradient norms squared
-        # This is a simplification and not the exact method from the paper's Appendix A.1
-        # which requires gradients from different batch sizes.
-        # Here, we're using the variance of the full batch gradient norms as a proxy for noise.
-        tr_sigma_estimate = torch.tensor(list(self.gradient_norms_squared)).var().item()
+        # Use the raw (uncorrected) values for the calculation as per the paper's formula for S and |G|^2
+        # The bias correction is applied to the individual estimates before they are used in the ratio.
+        
+        # Estimated |G|^2 (true gradient norm squared)
+        # This is the |G|^2 from the paper's formula, not the raw squared norm.
+        # It's derived from the two batch sizes.
+        
+        # We need to use the *current* estimates of E[|G_est|^2] for B_big and B_small.
+        # Let's use the bias-corrected exponential averages.
+        
+        # Corrected estimates for E[|G_est|^2]
+        corrected_global_grad_norm_sq = self.exp_avg_sq_grad_norm_global / bias_correction
+        corrected_local_grad_norm_sq = self.exp_avg_sq_grad_norm_local / bias_correction
 
-        # Estimate |G|^2 using mean of gradient norms squared
-        g_squared_estimate = torch.tensor(list(self.gradient_norms)).mean().item()**2
-
-        if g_squared_estimate == 0:
+        if B_big == B_small: # Avoid division by zero
             return 0.0
 
-        # B_simple = tr(Sigma) / |G|^2
-        noise_scale = tr_sigma_estimate / g_squared_estimate
-        return noise_scale
+        # Estimated |G|^2 (true gradient norm squared)
+        # |G|^2 = (B_big * E[|G_B_big|^2] - B_small * E[|G_B_small|^2]) / (B_big - B_small)
+        estimated_G_sq = (B_big * corrected_global_grad_norm_sq - B_small * corrected_local_grad_norm_sq) / (B_big - B_small)
+        
+        # Estimated tr(Sigma)
+        # tr(Sigma) = (1/B_small - 1/B_big)^-1 * (E[|G_B_small|^2] - E[|G_B_big|^2])
+        estimated_tr_Sigma = (1 / (1/B_small - 1/B_big)) * (corrected_local_grad_norm_sq - corrected_global_grad_norm_sq)
+
+        if estimated_G_sq <= 0: # Avoid division by zero or negative noise scale
+            return 0.0
+
+        noise_scale = estimated_tr_Sigma / estimated_G_sq
+        return noise_scale if noise_scale > 0 else 0.0 # Ensure non-negative noise scale
 
 def _cfg_duplicate(tensor: torch.Tensor) -> torch.Tensor:
     """Duplicates a tensor along the batch dimension for CFG."""

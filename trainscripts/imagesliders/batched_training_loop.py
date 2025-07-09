@@ -15,7 +15,7 @@ from pathlib import Path
 import time
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Union, Literal, List, Dict, Any
-from .batch_slider_algo import calculate_paired_loss
+from .batch_slider_algo import calculate_paired_loss, GradientNoiseScaleEstimator
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
 from .batch_config_util import (
@@ -282,6 +282,11 @@ def main():
         else:
             print("skipped compile because something dubious was happening in debug.")
         environment['unet'] = unet2
+
+    # Initialize gradient noise scale estimator
+    gradient_noise_estimator = None
+    if hasattr(config.train, "estimate_gradient_noise_scale") and config.train.estimate_gradient_noise_scale:
+        gradient_noise_estimator = GradientNoiseScaleEstimator(beta=0.999) # Default beta
 
     # Create adapter network
     network = lora.BatchedLoRANetwork(
