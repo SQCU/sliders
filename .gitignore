@@ -7,3 +7,4 @@ trainscripts/imagesliders/__pycache__/**
 #do we want all of these in our git history? no probably.
 #suspended for now bc gemini-cli changed behavior
 #logs/*.log
+refs/**
