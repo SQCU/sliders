@@ -189,16 +189,6 @@ def calculate_paired_loss(
     # This is analogous to averaging policy optimization losses over multiple rollouts
     # or averaging GPT losses over many context-continuation pairs in a batch.
     final_loss = summed_pair_losses.mean()
-
-    # Update gradient noise estimator if provided
-    if noise_estimator is not None and model is not None:
-        # Perform backward pass to get gradients before updating estimator
-        # This is done here because the estimator needs access to computed gradients
-        final_loss.backward(retain_graph=True) # Retain graph for subsequent backward if needed
-        noise_estimator.update(model)
-        # Zero out gradients after update to prevent accumulation if not handled elsewhere
-        model.zero_grad()
-
     return final_loss
 
 

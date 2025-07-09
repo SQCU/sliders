@@ -15,7 +15,7 @@ from pathlib import Path
 import time
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Union, Literal, List, Dict, Any
-from .batch_slider_algo import calculate_paired_loss, GradientNoiseScaleEstimator
+from .batch_slider_algo import calculate_paired_loss, GradientNoiseEstimator, GradientNoiseScaleEstimator
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
 from .batch_config_util import (
@@ -286,7 +286,11 @@ def main():
     # Initialize gradient noise scale estimator
     gradient_noise_estimator = None
     if hasattr(config.train, "estimate_gradient_noise_scale") and config.train.estimate_gradient_noise_scale:
-        gradient_noise_estimator = GradientNoiseScaleEstimator(beta=0.999) # Default beta
+        # micro_batch_size for GNS is the actual batch size processed by UNet in one go
+        micro_batch_size = config.train.batch_size
+        profile_freq = config.train.get("gns_profile_freq", 100) # Default to 100 steps
+        ema_alpha = config.train.get("gns_ema_alpha", 0.05) # Default EMA alpha
+        gradient_noise_estimator = GradientNoiseEstimator(network, micro_batch_size, profile_freq, ema_alpha)
 
     # Create adapter network
     network = lora.BatchedLoRANetwork(
