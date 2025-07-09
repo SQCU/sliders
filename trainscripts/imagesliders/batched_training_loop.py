@@ -153,7 +153,6 @@ def train_step(environment: dict, batch: dict):
     )
 
     # Set LoRA scales, which must match the doubled cfg axis.
-    #batched_scales = scales.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     #hopefully a [batchdim,1] tensor has shape (16,1) -> broadcasts to variably shaped unet layers?
     batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
     network.set_lora_scales(batched_scales_cfg)
@@ -164,8 +163,9 @@ def train_step(environment: dict, batch: dict):
         print(f"Shape of text_embeddings_cfg: {text_embeddings_cfg.shape}")
         print(f"Shape of pooled_embeds_cfg: {pooled_embeds_cfg.shape}")
         print(f"Shape of add_time_ids_cfg: {add_time_ids_cfg.shape}")
+        print(f"Shape of guidance_scale: {guidance_scale}")
         
-        predicted_noise = batch_train_util.batched_predict_noise_xl(
+        predicted_noise = batch_train_util.nocfg_predict_noise_xl(
             unet,
             noise_scheduler,
             unet_timesteps_cfg,
@@ -173,7 +173,6 @@ def train_step(environment: dict, batch: dict):
             text_embeddings_cfg,
             pooled_embeds_cfg,
             add_time_ids_cfg,
-            guidance_scale=guidance_scale,
         )
 
     predicted_noise_uncond, predicted_noise_text = predicted_noise.chunk(2)
@@ -233,6 +232,14 @@ def main():
     with torch.no_grad():
         config = config_io()
         environment = config_envsetup(config) # Use the envsetup from batch_config_util
+
+        # Log batch size, iteration count, and their product early
+        batch_size = config.train.batch_size
+        iterations = config.train.iterations
+        expected_total_samples = batch_size * iterations
+        print(f"Configured Batch Size: {batch_size}", file=sys.stderr)
+        print(f"Configured Iterations: {iterations}", file=sys.stderr)
+        print(f"Expected Total Samples (Batch Size * Iterations): {expected_total_samples}", file=sys.stderr)
 
         # NOTE: The following VRAM management logic (moving UNet, VAE, Text Encoders to/from CPU)
         # is intentionally kept as-is, despite its apparent complexity and manual nature,

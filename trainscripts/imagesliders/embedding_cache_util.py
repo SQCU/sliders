@@ -72,7 +72,7 @@ def _image_encoder_fn(image_path: str, environment: Dict[str, Any], config: Any)
     new_latent_gpu = encode_images_to_latents([resized_image], vae, device, weight_dtype)[0]
     
     # Store the latent keyed by its resolution
-    latents_by_resolution = {target_resolution: new_latent_gpu.cpu().squeeze(0)}
+    latents_by_resolution = {target_resolution: new_latent_gpu.cpu()}
     
     return latents_by_resolution, original_image_size
 

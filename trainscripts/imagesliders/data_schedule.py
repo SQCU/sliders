@@ -125,12 +125,21 @@ class TrainingSchedule:
                     is_low_case=True # This is the 'low' or 'neutral' case
                 )
                 batch_items.append(item_low)
+            # The pair_index groups items that form a 'scale-tuple', which is the smallest
+            # semantically valid unit for our training objective. Losses for items
+            # within the same pair_index will be summed before further reduction.
             
             # Shuffle the batch items to mix high and low cases within the batch
             rng.shuffle(batch_items)
             self.schedule.append(batch_items)
             
         print(f"Built schedule with {len(self.schedule)} batches of size {batch_size}.")
+        
+        # Verify total sampled items
+        actual_total_sampled_items = len(self.schedule) * batch_size
+        expected_total_sampled_items_naive = total_training_steps * batch_size
+        if actual_total_sampled_items < expected_total_sampled_items_naive:
+            print(f"WARNING: Dataset sampled fewer items ({actual_total_sampled_items}) than the naive product of iterations * batch_size ({expected_total_sampled_items_naive}). This might indicate an issue with data availability or scheduling logic.")
 
     def __len__(self):
         return len(self.schedule)

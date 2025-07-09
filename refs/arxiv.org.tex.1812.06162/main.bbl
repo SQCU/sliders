@@ -1,0 +1,372 @@
+\newcommand{\etalchar}[1]{$^{#1}$}
+\begin{thebibliography}{MBM{\etalchar{+}}16}
+\expandafter\ifx\csname url\endcsname\relax
+  \def\url#1{\texttt{#1}}\fi
+\expandafter\ifx\csname doi\endcsname\relax
+  \def\doi#1{\burlalt{doi:#1}{http://dx.doi.org/#1}}\fi
+\expandafter\ifx\csname urlprefix\endcsname\relax\def\urlprefix{URL }\fi
+\expandafter\ifx\csname href\endcsname\relax
+  \def\href#1#2{#2}\fi
+\expandafter\ifx\csname burlalt\endcsname\relax
+  \def\burlalt#1#2{\href{#2}{#1}}\fi
+
+\bibitem[AAG{\etalchar{+}}18]{1801.02852}
+Igor Adamski, Robert Adamski, Tomasz Grel, Adam J{\k e}drych, Kamil Kaczmarek,
+  and Henryk Michalewski.
+\newblock Distributed deep reinforcement learning: Learn how to play atari
+  games in 21 minutes, 2018,
+  \burlalt{1801.02852}{http://arxiv.org/abs/1801.02852}.
+
+\bibitem[AH18]{AI_And_Compute}
+Dario Amodei and Danny Hernandez.
+\newblock {AI and Compute}, May 2018.
+\newblock \urlprefix\url{https://blog.openai.com/ai-and-compute/}.
+
+\bibitem[ASF17]{1711.04325}
+Takuya Akiba, Shuji Suzuki, and Keisuke Fukuda.
+\newblock Extremely large minibatch sgd: Training resnet-50 on imagenet in 15
+  minutes, 2017, \burlalt{1711.04325}{http://arxiv.org/abs/1711.04325}.
+
+\bibitem[BCD{\etalchar{+}}18]{OpenAI_Five}
+Greg Brockman, Brooke Chan, Przemyslaw Debiak, Christy Dennison, David Farhi,
+  Rafal J\'ozefowicz, Jakub Pachocki, Michael Petrov, Henrique Pond\'e,
+  Jonathan Raiman, Szymon Sidor, Jie Tang, Filip Wolski, and Susan Zhang.
+\newblock {OpenAI Five}, Jun 2018.
+\newblock \urlprefix\url{https://blog.openai.com/openai-five/}.
+
+\bibitem[BCN16]{1606.04838}
+L{\'e}on Bottou, Frank~E. Curtis, and Jorge Nocedal.
+\newblock Optimization methods for large-scale machine learning, 2016,
+  \burlalt{1606.04838}{http://arxiv.org/abs/1606.04838}.
+
+\bibitem[BCNW12]{Byrd2012}
+Richard~H. Byrd, Gillian~M. Chin, Jorge Nocedal, and Yuchen Wu.
+\newblock Sample size selection in optimization methods for machine learning.
+\newblock {\em Mathematical Programming}, 134(1):127--155, Aug 2012.
+\newblock \doi{10.1007/s10107-012-0572-5}.
+
+\bibitem[BCP{\etalchar{+}}16]{1606.01540}
+Greg Brockman, Vicki Cheung, Ludwig Pettersson, Jonas Schneider, John Schulman,
+  Jie Tang, and Wojciech Zaremba.
+\newblock {OpenAI Gym}, 2016,
+  \burlalt{1606.01540}{http://arxiv.org/abs/1606.01540}.
+
+\bibitem[BDS18]{1809.11096}
+Andrew Brock, Jeff Donahue, and Karen Simonyan.
+\newblock Large scale gan training for high fidelity natural image synthesis,
+  2018, \burlalt{1809.11096}{http://arxiv.org/abs/1809.11096}.
+
+\bibitem[BGM17]{ba2016distributed}
+Jimmy Ba, Roger Grosse, and James Martens.
+\newblock Distributed second-order optimization using kronecker-factored
+  approximations, 2017.
+\newblock \urlprefix\url{https://openreview.net/forum?id=SkkTMpjex}.
+
+\bibitem[BNVB12]{DBLP:journals/corr/abs-1207-4708}
+Marc~G. Bellemare, Yavar Naddaf, Joel Veness, and Michael Bowling.
+\newblock The arcade learning environment: An evaluation platform for general
+  agents.
+\newblock {\em CoRR}, 2012,
+  \burlalt{1207.4708}{http://arxiv.org/abs/1207.4708}.
+
+\bibitem[BRH16]{1612.05086}
+Lukas Balles, Javier Romero, and Philipp Hennig.
+\newblock Coupling adaptive batch sizes with learning rates, 2016,
+  \burlalt{1612.05086}{http://arxiv.org/abs/1612.05086}.
+
+\bibitem[CDH{\etalchar{+}}16]{1606.03657}
+Xi~Chen, Yan Duan, Rein Houthooft, John Schulman, Ilya Sutskever, and Pieter
+  Abbeel.
+\newblock Infogan: Interpretable representation learning by information
+  maximizing generative adversarial nets, 2016,
+  \burlalt{1606.03657}{http://arxiv.org/abs/1606.03657}.
+
+\bibitem[CMS{\etalchar{+}}13]{1312.3005}
+Ciprian Chelba, Tomas Mikolov, Mike Schuster, Qi~Ge, Thorsten Brants, Phillipp
+  Koehn, and Tony Robinson.
+\newblock One billion word benchmark for measuring progress in statistical
+  language modeling, 2013, \burlalt{1312.3005}{http://arxiv.org/abs/1312.3005}.
+
+\bibitem[CWZ{\etalchar{+}}18]{1806.03791}
+Lingjiao Chen, Hongyi Wang, Jinman Zhao, Dimitris Papailiopoulos, and Paraschos
+  Koutris.
+\newblock The effect of network width on the performance of large-batch
+  training, 2018, \burlalt{1806.03791}{http://arxiv.org/abs/1806.03791}.
+
+\bibitem[DDS{\etalchar{+}}09]{imagenet_cvpr09}
+J.~Deng, W.~Dong, R.~Socher, L.-J. Li, K.~Li, and L.~Fei-Fei.
+\newblock {ImageNet: A Large-Scale Hierarchical Image Database}.
+\newblock In {\em CVPR09}, 2009.
+\newblock \urlprefix\url{http://www.image-net.org/papers/imagenet_cvpr09.pdf}.
+
+\bibitem[DHK{\etalchar{+}}17]{baselines}
+Prafulla Dhariwal, Christopher Hesse, Oleg Klimov, Alex Nichol, Matthias
+  Plappert, Alec Radford, John Schulman, Szymon Sidor, Yuhuai Wu, and Peter
+  Zhokhov.
+\newblock Openai baselines.
+\newblock \url{https://github.com/openai/baselines}, 2017.
+
+\bibitem[DNG17]{1712.02029}
+Aditya Devarakonda, Maxim Naumov, and Michael Garland.
+\newblock Adabatch: Adaptive batch sizes for training deep neural networks,
+  2017, \burlalt{1712.02029}{http://arxiv.org/abs/1712.02029}.
+
+\bibitem[DYJG16]{1610.05792}
+Soham De, Abhay Yadav, David Jacobs, and Tom Goldstein.
+\newblock Big batch sgd: Automated inference using adaptive batch sizes, 2016,
+  \burlalt{1610.05792}{http://arxiv.org/abs/1610.05792}.
+
+\bibitem[GARD18]{unpublished-grd}
+Guy Gur-Ari, Daniel~A. Roberts, and Ethan Dyer.
+\newblock Gradient descent happens in a tiny subspace.
+\newblock 2018,
+  \burlalt{arXiv:1812.04754}{http://arxiv.org/abs/arXiv:1812.04754}.
+
+\bibitem[GDG{\etalchar{+}}17]{1706.02677}
+Priya Goyal, Piotr Doll{\'a}r, Ross Girshick, Pieter Noordhuis, Lukasz
+  Wesolowski, Aapo Kyrola, Andrew Tulloch, Yangqing Jia, and Kaiming He.
+\newblock Accurate, large minibatch sgd: Training imagenet in 1 hour, 2017,
+  \burlalt{1706.02677}{http://arxiv.org/abs/1706.02677}.
+
+\bibitem[Goh17]{goh2017why}
+Gabriel Goh.
+\newblock Why momentum really works.
+\newblock {\em Distill}, 2017.
+\newblock \doi{10.23915/distill.00006}.
+
+\bibitem[Goo]{TF_Official_Resnet}
+Google.
+\newblock Tensorflow official models.
+\newblock
+  \urlprefix\url{https://github.com/tensorflow/models/tree/master/official/resnet}.
+
+\bibitem[GVS14]{1412.6544}
+Ian~J. Goodfellow, Oriol Vinyals, and Andrew~M. Saxe.
+\newblock Qualitatively characterizing neural network optimization problems,
+  2014, \burlalt{1412.6544}{http://arxiv.org/abs/1412.6544}.
+
+\bibitem[GVY{\etalchar{+}}18]{1811.12941}
+Noah Golmant, Nikita Vemuri, Zhewei Yao, Vladimir Feinberg, Amir Gholami, Kai
+  Rothauge, Michael~W. Mahoney, and Joseph Gonzalez.
+\newblock On the computational inefficiency of large batch sizes for stochastic
+  gradient descent, 2018,
+  \burlalt{1811.12941}{http://arxiv.org/abs/1811.12941}.
+
+\bibitem[HHS17]{1705.08741}
+Elad Hoffer, Itay Hubara, and Daniel Soudry.
+\newblock Train longer, generalize better: closing the generalization gap in
+  large batch training of neural networks.
+\newblock 2017, \burlalt{1705.08741}{http://arxiv.org/abs/1705.08741}.
+
+\bibitem[HMG07]{NIPS2006_3079}
+Ralf Herbrich, Tom Minka, and Thore Graepel.
+\newblock Trueskill\texttrademark : A bayesian skill rating system.
+\newblock In B.~Sch\"{o}lkopf, J.~C. Platt, and T.~Hoffman, editors, {\em
+  Advances in Neural Information Processing Systems 19}, pages 569--576. MIT
+  Press, 2007.
+\newblock
+  \urlprefix\url{http://papers.nips.cc/paper/3079-trueskilltm-a-bayesian-skill-rating-system.pdf}.
+
+\bibitem[HNA{\etalchar{+}}17]{1712.00409}
+Joel Hestness, Sharan Narang, Newsha Ardalani, Gregory Diamos, Heewoo Jun,
+  Hassan Kianinejad, Md. Mostofa~Ali Patwary, Yang Yang, and Yanqi Zhou.
+\newblock Deep learning scaling is predictable, empirically, 2017,
+  \burlalt{1712.00409}{http://arxiv.org/abs/1712.00409}.
+
+\bibitem[HQB{\etalchar{+}}18]{1803.00933}
+Dan Horgan, John Quan, David Budden, Gabriel Barth-Maron, Matteo Hessel, Hado
+  van Hasselt, and David Silver.
+\newblock Distributed prioritized experience replay, 2018,
+  \burlalt{1803.00933}{http://arxiv.org/abs/1803.00933}.
+
+\bibitem[HS97]{Hochreiter:1997:LSM:1246443.1246450}
+Sepp Hochreiter and J\"{u}rgen Schmidhuber.
+\newblock Long short-term memory.
+\newblock {\em Neural Comput.}, 9(8):1735--1780, November 1997.
+\newblock \doi{10.1162/neco.1997.9.8.1735}.
+
+\bibitem[HZRS15]{DBLP:journals/corr/HeZRS15}
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+\newblock Deep residual learning for image recognition.
+\newblock {\em CoRR}, 2015,
+  \burlalt{1512.03385}{http://arxiv.org/abs/1512.03385}.
+
+\bibitem[IES{\etalchar{+}}18]{1811.02553}
+Andrew Ilyas, Logan Engstrom, Shibani Santurkar, Dimitris Tsipras, Firdaus
+  Janoos, Larry Rudolph, and Aleksander Madry.
+\newblock Are deep policy gradient algorithms truly policy gradient
+  algorithms?, 2018, \burlalt{1811.02553}{http://arxiv.org/abs/1811.02553}.
+
+\bibitem[JSH{\etalchar{+}}18]{1807.11205}
+Xianyan Jia, Shutao Song, Wei He, Yangzihao Wang, Haidong Rong, Feihu Zhou,
+  Liqiang Xie, Zhenyu Guo, Yuanzhou Yang, Liwei Yu, Tiegang Chen, Guangxiao Hu,
+  Shaohuai Shi, and Xiaowen Chu.
+\newblock Highly scalable deep learning training system with mixed-precision:
+  Training imagenet in four minutes, 2018,
+  \burlalt{1807.11205}{http://arxiv.org/abs/1807.11205}.
+
+\bibitem[KB14]{kingma2014adam}
+Diederik~P. Kingma and Jimmy Ba.
+\newblock Adam: A method for stochastic optimization, 2014,
+  \burlalt{1412.6980}{http://arxiv.org/abs/1412.6980}.
+
+\bibitem[KMN{\etalchar{+}}16]{1609.04836}
+Nitish~Shirish Keskar, Dheevatsa Mudigere, Jorge Nocedal, Mikhail Smelyanskiy,
+  and Ping Tak~Peter Tang.
+\newblock On large-batch training for deep learning: Generalization gap and
+  sharp minima, 2016, \burlalt{1609.04836}{http://arxiv.org/abs/1609.04836}.
+
+\bibitem[Kri09]{Krizhevsky2009LearningML}
+Alex Krizhevsky.
+\newblock Learning multiple layers of features from tiny images.
+\newblock 2009.
+\newblock
+  \urlprefix\url{https://www.cs.toronto.edu/~kriz/learning-features-2009-TR.pdf}.
+
+\bibitem[KW13]{1312.6114}
+Diederik~P Kingma and Max Welling.
+\newblock Auto-encoding variational bayes, 2013,
+  \burlalt{arXiv:1312.6114}{http://arxiv.org/abs/arXiv:1312.6114}.
+
+\bibitem[LC10]{lecun-mnisthandwrittendigit-2010}
+Yann LeCun and Corinna Cortes.
+\newblock {MNIST} handwritten digit database.
+\newblock 2010.
+\newblock \urlprefix\url{http://yann.lecun.com/exdb/mnist/}.
+
+\bibitem[LFLY18]{1804.08838}
+Chunyuan Li, Heerad Farkhoor, Rosanne Liu, and Jason Yosinski.
+\newblock Measuring the intrinsic dimension of objective landscapes, 2018,
+  \burlalt{1804.08838}{http://arxiv.org/abs/1804.08838}.
+
+\bibitem[MBB17]{1712.06559}
+Siyuan Ma, Raef Bassily, and Mikhail Belkin.
+\newblock The power of interpolation: Understanding the effectiveness of sgd in
+  modern over-parametrized learning, 2017,
+  \burlalt{1712.06559}{http://arxiv.org/abs/1712.06559}.
+
+\bibitem[MBM{\etalchar{+}}16]{DBLP:journals/corr/MnihBMGLHSK16}
+Volodymyr Mnih, Adri{\`{a}}~Puigdom{\`{e}}nech Badia, Mehdi Mirza, Alex Graves,
+  Timothy~P. Lillicrap, Tim Harley, David Silver, and Koray Kavukcuoglu.
+\newblock Asynchronous methods for deep reinforcement learning.
+\newblock {\em CoRR}, 2016,
+  \burlalt{1602.01783}{http://arxiv.org/abs/1602.01783}.
+
+\bibitem[MHB17]{1704.04289}
+Stephan Mandt, Matthew~D. Hoffman, and David~M. Blei.
+\newblock Stochastic gradient descent as approximate bayesian inference.
+\newblock 2017, \burlalt{1704.04289}{http://arxiv.org/abs/1704.04289}.
+
+\bibitem[NIS]{NIST_noise}
+Selecting sample sizes.
+\newblock
+  \urlprefix\url{https://www.itl.nist.gov/div898/handbook/ppc/section3/ppc333.htm}.
+
+\bibitem[NVL{\etalchar{+}}15]{1511.06807}
+Arvind Neelakantan, Luke Vilnis, Quoc~V. Le, Ilya Sutskever, Lukasz Kaiser,
+  Karol Kurach, and James Martens.
+\newblock Adding gradient noise improves learning for very deep networks, 2015,
+  \burlalt{1511.06807}{http://arxiv.org/abs/1511.06807}.
+
+\bibitem[NWC{\etalchar{+}}11]{Netzer2011ReadingDI}
+Yuval Netzer, Tao Wang, Adam Coates, Alessandro Bissacco, Bo~Wu, and Andrew~Y.
+  Ng.
+\newblock Reading digits in natural images with unsupervised feature learning.
+\newblock 2011.
+\newblock
+  \urlprefix\url{http://ufldl.stanford.edu/housenumbers/nips2011_housenumbers.pdf}.
+
+\bibitem[OEGA18]{1806.00187}
+Myle Ott, Sergey Edunov, David Grangier, and Michael Auli.
+\newblock Scaling neural machine translation, 2018,
+  \burlalt{1806.00187}{http://arxiv.org/abs/1806.00187}.
+
+\bibitem[Ope17]{OpenAI_1v1}
+OpenAI.
+\newblock {More on Dota 2}, Aug 2017.
+\newblock \urlprefix\url{https://blog.openai.com/more-on-dota-2/}.
+
+\bibitem[PKYC18]{1808.01371}
+Raul Puri, Robert Kirby, Nikolai Yakovenko, and Bryan Catanzaro.
+\newblock Large scale language modeling: Converging on 40gb of text in four
+  hours, 2018, \burlalt{1808.01371}{http://arxiv.org/abs/1808.01371}.
+
+\bibitem[SA18]{1803.02811}
+Adam Stooke and Pieter Abbeel.
+\newblock Accelerated methods for deep reinforcement learning, 2018,
+  \burlalt{1803.02811}{http://arxiv.org/abs/1803.02811}.
+
+\bibitem[SHB15]{DBLP:journals/corr/SennrichHB15}
+Rico Sennrich, Barry Haddow, and Alexandra Birch.
+\newblock Neural machine translation of rare words with subword units.
+\newblock {\em CoRR}, 2015,
+  \burlalt{1508.07909}{http://arxiv.org/abs/1508.07909}.
+
+\bibitem[SKYL17]{1711.00489}
+Samuel~L. Smith, Pieter-Jan Kindermans, Chris Ying, and Quoc~V. Le.
+\newblock Don't decay the learning rate, increase the batch size, 2017,
+  \burlalt{1711.00489}{http://arxiv.org/abs/1711.00489}.
+
+\bibitem[SL17]{1710.06451}
+Samuel~L. Smith and Quoc~V. Le.
+\newblock A bayesian perspective on generalization and stochastic gradient
+  descent, 2017, \burlalt{1710.06451}{http://arxiv.org/abs/1710.06451}.
+
+\bibitem[SLA{\etalchar{+}}18]{1811.03600}
+Christopher~J. Shallue, Jaehoon Lee, Joe Antognini, Jascha Sohl-Dickstein, Roy
+  Frostig, and George~E. Dahl.
+\newblock Measuring the effects of data parallelism on neural network training,
+  2018, \burlalt{arXiv:1811.03600}{http://arxiv.org/abs/arXiv:1811.03600}.
+
+\bibitem[SMDH13]{pmlr-v28-sutskever13}
+Ilya Sutskever, James Martens, George Dahl, and Geoffrey Hinton.
+\newblock On the importance of initialization and momentum in deep learning.
+\newblock In {\em Proceedings of the 30th International Conference on Machine
+  Learning}, volume~28, pages 1139--1147, 17--19 Jun 2013.
+\newblock \urlprefix\url{http://proceedings.mlr.press/v28/sutskever13.html}.
+
+\bibitem[SWD{\etalchar{+}}17]{DBLP:journals/corr/SchulmanWDRK17}
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov.
+\newblock Proximal policy optimization algorithms.
+\newblock {\em CoRR}, 2017,
+  \burlalt{1707.06347}{http://arxiv.org/abs/1707.06347}.
+
+\bibitem[SZL13]{conf/icml/SchaulZL13}
+Tom Schaul, Sixin Zhang, and Yann LeCun.
+\newblock No more pesky learning rates.
+\newblock In {\em ICML (3)}, volume~28 of {\em JMLR Workshop and Conference
+  Proceedings}, pages 343--351. JMLR.org, 2013.
+\newblock \urlprefix\url{http://jmlr.org/proceedings/papers/v28/schaul13.html}.
+
+\bibitem[SZT17]{1703.00810}
+Ravid Shwartz-Ziv and Naftali Tishby.
+\newblock Opening the black box of deep neural networks via information, 2017,
+  \burlalt{1703.00810}{http://arxiv.org/abs/1703.00810}.
+
+\bibitem[Wik]{Wiki_noise}
+Sample size determination.
+\newblock
+  \urlprefix\url{https://en.wikipedia.org/wiki/Sample_size_determination\#Estimation_of_a_mean}.
+
+\bibitem[WRLG18]{1803.02021}
+Yuhuai Wu, Mengye Ren, Renjie Liao, and Roger Grosse.
+\newblock Understanding short-horizon bias in stochastic meta-optimization,
+  2018, \burlalt{1803.02021}{http://arxiv.org/abs/1803.02021}.
+
+\bibitem[YGG17]{1708.03888}
+Yang You, Igor Gitman, and Boris Ginsburg.
+\newblock Large batch training of convolutional networks, 2017,
+  \burlalt{1708.03888}{http://arxiv.org/abs/1708.03888}.
+
+\bibitem[YPL{\etalchar{+}}17]{1706.05699}
+Dong Yin, Ashwin Pananjady, Max Lam, Dimitris Papailiopoulos, Kannan
+  Ramchandran, and Peter Bartlett.
+\newblock Gradient diversity: a key ingredient for scalable distributed
+  learning, 2017, \burlalt{1706.05699}{http://arxiv.org/abs/1706.05699}.
+
+\bibitem[YZH{\etalchar{+}}17]{1709.05011}
+Yang You, Zhao Zhang, Cho-Jui Hsieh, James Demmel, and Kurt Keutzer.
+\newblock Imagenet training in minutes, 2017,
+  \burlalt{1709.05011}{http://arxiv.org/abs/1709.05011}.
+
+\end{thebibliography}

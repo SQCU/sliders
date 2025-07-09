@@ -1,5 +1,45 @@
 import torch
 from typing import List, Dict, Tuple, Any
+from collections import deque
+
+class GradientNoiseScaleEstimator:
+    def __init__(self, window_size: int = 100):
+        self.window_size = window_size
+        self.gradient_norms_squared = deque(maxlen=window_size)
+        self.gradient_norms = deque(maxlen=window_size)
+
+    def update(self, model: torch.nn.Module):
+        # Calculate the squared L2 norm of the gradients for all parameters
+        total_grad_norm_squared = 0.0
+        total_grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                grad_norm_squared = p.grad.data.norm(2).item()**2
+                total_grad_norm_squared += grad_norm_squared
+                total_grad_norm += p.grad.data.norm(2).item()
+
+        self.gradient_norms_squared.append(total_grad_norm_squared)
+        self.gradient_norms.append(total_grad_norm)
+
+    def get_noise_scale(self) -> float:
+        if len(self.gradient_norms_squared) < 2:
+            return 0.0  # Not enough data to estimate variance
+
+        # Estimate tr(Sigma) using variance of gradient norms squared
+        # This is a simplification and not the exact method from the paper's Appendix A.1
+        # which requires gradients from different batch sizes.
+        # Here, we're using the variance of the full batch gradient norms as a proxy for noise.
+        tr_sigma_estimate = torch.tensor(list(self.gradient_norms_squared)).var().item()
+
+        # Estimate |G|^2 using mean of gradient norms squared
+        g_squared_estimate = torch.tensor(list(self.gradient_norms)).mean().item()**2
+
+        if g_squared_estimate == 0:
+            return 0.0
+
+        # B_simple = tr(Sigma) / |G|^2
+        noise_scale = tr_sigma_estimate / g_squared_estimate
+        return noise_scale
 
 def _cfg_duplicate(tensor: torch.Tensor) -> torch.Tensor:
     """Duplicates a tensor along the batch dimension for CFG."""
@@ -69,6 +109,8 @@ def calculate_paired_loss(
     target_noise: torch.Tensor,
     pair_indices: torch.Tensor,
     is_low_cases: torch.Tensor,
+    model: torch.nn.Module = None, # Added for gradient noise estimation
+    noise_estimator: GradientNoiseScaleEstimator = None, # Added for gradient noise estimation
 ) -> torch.Tensor:
     """
     Calculates the training loss, summing losses for paired items before averaging.
@@ -78,40 +120,43 @@ def calculate_paired_loss(
         target_noise (torch.Tensor): Ground truth noise, duplicated for CFG.
         pair_indices (torch.Tensor): Indices of the paired items.
         is_low_cases (torch.Tensor): Boolean tensor indicating if an item is a low case.
+        model (torch.nn.Module): The model whose gradients will be used for noise estimation.
+        noise_estimator (GradientNoiseScaleEstimator): An instance of the noise estimator.
 
     Returns:
         torch.Tensor: The final scalar loss for the batch.
     """
-    # Calculate MSE loss per-element, then reduce to a per-item scalar
-    loss_per_item_cfg = (predicted_noise - target_noise).pow(2).mean(dim=[1, 2, 3])
-    
-    # Average the loss from the unconditional and conditional forward passes
-    uncond_loss, cond_loss = loss_per_item_cfg.chunk(2)
-    loss_per_item = (uncond_loss + cond_loss) / 2.0  # Shape: (N_eff,)
-    
-    # Separate losses for low and high cases
-    low_case_losses = loss_per_item[is_low_cases]
-    high_case_losses = loss_per_item[~is_low_cases]
+    # Calculate MSE loss per-element, then reduce to a per-item scalar.
+    # This is the generative error for each individual training data sample.
+    loss_per_sample = (predicted_noise - target_noise).pow(2).mean(dim=[1, 2, 3])
 
-    # Assuming low and high cases are perfectly interleaved for pairing
-    num_pairs = min(len(low_case_losses), len(high_case_losses))
-    
-    if num_pairs == 0:
-        return loss_per_item.mean() if loss_per_item.numel() > 0 else torch.tensor(0.0)
+    # The 'scale-tuple' (or pair, for now) is the smallest semantically valid unit of training.
+    # We sum the generative errors for all samples within the same 'scale-tuple'.
+    # This corresponds to the joint minimization of the generative error across related samples.
+    unique_pair_indices = torch.unique(pair_indices)
+    summed_pair_losses = torch.zeros(len(unique_pair_indices), device=predicted_noise.device, dtype=predicted_noise.dtype)
 
-    # Sum the losses for each pair
-    summed_pair_losses = low_case_losses[:num_pairs] + high_case_losses[:num_pairs]
-    
-    # Get losses for any leftover items (if any)
-    unpaired_losses = torch.cat([
-        low_case_losses[num_pairs:],
-        high_case_losses[num_pairs:]
-    ])
-    
-    # Combine the pair-wise summed losses and the individual unpaired losses
-    all_losses_to_average = torch.cat([summed_pair_losses, unpaired_losses])
-    
-    return all_losses_to_average.mean()
+    for i, p_idx in enumerate(unique_pair_indices):
+        # Select losses corresponding to the current pair index
+        current_pair_losses = loss_per_sample[pair_indices == p_idx]
+        # Sum them up to get the loss for this 'scale-tuple'
+        summed_pair_losses[i] = current_pair_losses.sum()
+
+    # Finally, mean reduce the summed 'scale-tuple' losses to get the batch loss.
+    # This is analogous to averaging policy optimization losses over multiple rollouts
+    # or averaging GPT losses over many context-continuation pairs in a batch.
+    final_loss = summed_pair_losses.mean()
+
+    # Update gradient noise estimator if provided
+    if noise_estimator is not None and model is not None:
+        # Perform backward pass to get gradients before updating estimator
+        # This is done here because the estimator needs access to computed gradients
+        final_loss.backward(retain_graph=True) # Retain graph for subsequent backward if needed
+        noise_estimator.update(model)
+        # Zero out gradients after update to prevent accumulation if not handled elsewhere
+        model.zero_grad()
+
+    return final_loss
 
 
 # from trainscripts/imagesliders/batch_loss_functions.py
