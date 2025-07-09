@@ -25,14 +25,14 @@ train:
   noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
   max_denoising_steps: 50
   resolution: [512, 512]  #read from here for some reason
-  iterations: 2
+  iterations: 32
   gradient_accumulation_steps: 2
   batch_size: 4 #now must be assigned here
   bounds_test_vae_batch_size: true
   vae_encoding_batch_size: 20
   invalidate_latent_cache: true
   estimate_gradient_noise_scale: true
-  gns_profile_freq: 3
+  gns_profile_freq: 4
   gns_ema_alpha: 0.05
 save:
   name: "molKM_IL_imageslider" #unused? need to write name as --name "string"

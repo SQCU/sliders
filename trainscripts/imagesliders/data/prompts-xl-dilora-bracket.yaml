@@ -1,8 +1,8 @@
 ####################################################################################################### IMAGE SLIDER
 - target: "simple background " # only used in textsliders, read that loss function closely
   positive: "bracketed, simple background chalk drawing cartoon sketch" # 'high prompt'
-  unconditional: "simple background chalk drawing cartoon sketch" # invariant prompt
-  neutral: "simple background" # 'low prompt'
+  unconditional: "simple background" # invariant prompt
+  neutral: "simple background chalk drawing cartoon sketch" # 'low prompt'
   action: "enhance" # erase or enhance, only meaningful in textsliders
   guidance_scale: 2
   resolution: 512
