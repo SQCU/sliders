@@ -396,7 +396,7 @@ def main():
             micro_batch_size = config.train.batch_size
             profile_freq = config.train.get("gns_profile_freq", 10) # Default to 100 steps
             ema_alpha_fast = config.train.get("gns_ema_fast", 0.1) # Default EMA alpha
-            ema_alpha_slow = config.train.get("gns_ema_fast", 0.01) # Default EMA alpha
+            ema_alpha_slow = config.train.get("gns_ema_slow", 0.01) # Default EMA alpha
             gradient_noise_estimator = GradientNoiseEstimator(network, micro_batch_size, profile_freq, ema_alpha_fast, ema_alpha_slow)
     environment["gradient_noise_estimator"] = gradient_noise_estimator
 

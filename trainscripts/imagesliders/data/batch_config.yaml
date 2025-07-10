@@ -18,23 +18,26 @@ network:
   training_method: "noxattn"
 train:
   seed: 42  #default training seed init
-  lr: 0.00096
+  lr: 0.00016
   lr_warmup_steps: 32
   lr_scheduler: "constant"  #or "constant" or "cosine"
   precision: "bfloat16"
   optimizer: "Adam8bit"
   noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
   max_denoising_steps: 50
-  resolution: [512, 512]  #read from here for some reason
-  iterations: 2
+  resolution: [592, 592]  #read from here for some reason
+  iterations: 400
   gradient_accumulation_steps: 4
-  batch_size: 4 #now must be assigned here
+  batch_size: 2 #now must be assigned here
   bounds_test_vae_batch_size: true
   vae_encoding_batch_size: 20
   invalidate_latent_cache: false
   estimate_gradient_noise_scale: true
-  gns_profile_freq: 4
-  gns_ema_alpha: 0.02
+  gns_profile_freq: 2
+  gns_ema_fast: 0.1
+  gns_ema_slow: 0.01
+  max_grad_norm: 1.0 # Add this! A value > 0 enables it. 1.0 is a common default.
+  #however gradient noise statistics suggest that might be too high?
 save:
   name: "molKM_IL_imageslider_b" #used!
   path: "./models"
