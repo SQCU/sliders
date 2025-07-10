@@ -1,6 +1,7 @@
 import torch
 from typing import List, Dict, Tuple, Any
 from collections import deque
+import math
 
 class GradientNoiseEstimator:
     """
@@ -9,21 +10,38 @@ class GradientNoiseEstimator:
     This class performs a periodic, memory-intensive profiling step to estimate
     the optimal batch size, as described in 'An Empirical Model of Large-Batch Training'.
     """
-    def __init__(self, model, micro_batch_size, profile_freq=10, ema_alpha=0.05):
+    def __init__(self, 
+                 model, 
+                 micro_batch_size, 
+                 profile_freq=10, 
+                 zoomy_alpha=0.1,
+                 ponderous_alpha=0.01,
+                 # update_cooldown is now removed from args
+                 change_threshold=0.1
+                ):
         self.model = model
         self.micro_batch_size = micro_batch_size
         self.profile_freq = profile_freq
-        self.ema_alpha = ema_alpha
-        
+       
         self.is_profiling = False
         self._step_count = 0
         
-        # We use an EMA for a more stable estimate over time
-        self.ema_b_est = None
+        # --- NEW: Dual EMA state ---
+        self.zoomy_alpha = zoomy_alpha
+        self.ponderous_alpha = ponderous_alpha
+        self.ema_zoomy_b_crit = None
+        self.ema_ponderous_b_crit = None
+        self.instant_b_crit = None
 
         # Buffers for the profiling step
         self._grad_sum_buffer = None
         self._micro_norm_sq_values = []
+
+        # --- NEW: Control logic state ---
+
+        self.update_cooldown = math.ceil(1.0 / max(self.zoomy_alpha, self.ponderous_alpha))
+        self.change_threshold = change_threshold
+        self._profile_steps_since_last_update = 0
 
     def _get_full_grad_norm_sq(self, use_buffer=False):
         """Calculates the squared L2 norm of the full gradient."""
@@ -86,25 +104,76 @@ class GradientNoiseEstimator:
                 mean_micro_norm_sq = 0.0
 
             if macro_norm_sq > 1e-8: # Avoid division by zero
-                b_est = self.micro_batch_size * (mean_micro_norm_sq / macro_norm_sq.item() - 1)
+                b_crit = self.micro_batch_size * (mean_micro_norm_sq / macro_norm_sq.item() - 1)
+                self.instant_b_crit = max(0, b_crit) # Clamp at 0
 
-                # Update EMA of the estimate
-                if self.ema_b_est is None:
-                    self.ema_b_est = b_est
+                    # --- NEW: Update dual EMAs ---
+                if self.ema_zoomy_b_crit is None:
+                    self.ema_zoomy_b_crit = self.instant_b_crit
+                    self.ema_ponderous_b_crit = self.instant_b_crit
                 else:
-                    self.ema_b_est = self.ema_alpha * b_est + (1 - self.ema_alpha) * self.ema_b_est
-                
+                    self.ema_zoomy_b_crit = self.zoomy_alpha * self.instant_b_crit + (1 - self.zoomy_alpha) * self.ema_zoomy_b_crit
+                    self.ema_ponderous_b_crit = self.ponderous_alpha * self.instant_b_crit + (1 - self.ponderous_alpha) * self.ema_ponderous_b_crit
+
                 print(f"--- [Step {self._step_count}] Profiling Results ---")
                 print(f"    Mean micro-grad norm^2: {mean_micro_norm_sq:.4f}")
                 print(f"    Macro-grad norm^2:      {macro_norm_sq.item():.4f}")
                 print(f"    Noise/Signal Ratio:     {(mean_micro_norm_sq / macro_norm_sq.item()):.4f}")
-                print(f"    Instant B_est:          {b_est:.2f}")
-                print(f"    EMA B_est (B_crit):     {self.ema_b_est:.2f}")
+                print(f"    Instant B_crit: {self.instant_b_crit:.2f}")
+                print(f"    Zoomy EMA B_crit (α={self.zoomy_alpha}): {self.ema_zoomy_b_crit:.2f}")
+                print(f"    Ponderous EMA B_crit (α={self.ponderous_alpha}): {self.ema_ponderous_b_crit:.2f}")
 
             # Clean up memory
             self._grad_sum_buffer = None
             self._micro_norm_sq_values = []
             self.is_profiling = False
+
+    def propose_new_accumulation_steps(self, current_steps: int, min_steps: int, max_steps: int) -> int:
+        """
+        Proposes a new number of accumulation steps based on EMA trends.
+        Call this *after* post_accumulate_step during a profiling step.
+        """
+        self._profile_steps_since_last_update += 1
+        if self.ema_ponderous_b_crit is None or self._profile_steps_since_last_update < self.update_cooldown:
+            return current_steps
+
+        current_effective_batch_size = self.micro_batch_size * current_steps
+        
+        # Trend confirmation from both EMAs
+        suggests_increase = self.ema_zoomy_b_crit > current_effective_batch_size and \
+                            self.ema_ponderous_b_crit > current_effective_batch_size
+        
+        suggests_decrease = self.ema_zoomy_b_crit < current_effective_batch_size and \
+                            self.ema_ponderous_b_crit < current_effective_batch_size
+
+        # Use the stable (ponderous) EMA to determine the target
+        # Add micro_batch_size to avoid division by zero or tiny values
+        target_steps = math.ceil(self.ema_ponderous_b_crit / self.micro_batch_size)
+        
+        # Hysteresis: Only act if the proposed change is significant
+        if abs(target_steps - current_steps) / (current_steps + 1e-6) < self.change_threshold:
+             return current_steps
+
+        new_steps = current_steps
+        if suggests_increase:
+            print(f"📈 [Dynamic Accumulation] Trend suggests INCREASE. Current Eff. Batch: {current_effective_batch_size:.1f}, Ponderous B_crit: {self.ema_ponderous_b_crit:.1f}")
+            new_steps = target_steps
+        elif suggests_decrease:
+            print(f"📉 [Dynamic Accumulation] Trend suggests DECREASE. Current Eff. Batch: {current_effective_batch_size:.1f}, Ponderous B_crit: {self.ema_ponderous_b_crit:.1f}")
+            new_steps = target_steps
+        else:
+            # Trends disagree, hold steady
+            return current_steps
+
+        # Clamp and finalize
+        new_steps = max(min_steps, min(max_steps, new_steps))
+
+        if new_steps != current_steps:
+            print(f"✅ [Dynamic Accumulation] Proposing change from {current_steps} to {new_steps} steps.")
+            self._profile_steps_since_last_update = 0 # Reset cooldown
+            return new_steps
+        
+        return current_steps
 
 
 def _cfg_duplicate(tensor: torch.Tensor) -> torch.Tensor:

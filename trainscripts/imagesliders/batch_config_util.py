@@ -125,15 +125,14 @@ def envsetup(config):
     weight_dtype = parse_precision(config.train.precision)
     save_dtype = parse_precision(config.save.precision)
     
-    # Load UNet to the specified device (GPU if available)
+    # Load models from checkpoint
     vae, unet, tokenizers, text_encoders = load_models(config, device, weight_dtype)
-    unet.requires_grad_(False).eval()
-
-    # Load VAE and Text Encoders to CPU initially
-    vae = vae.to(torch.device("cpu"))
+    #exile unet to cpu we aren't using it yet
+    unet.requires_grad_(False).eval().to(torch.device("cpu"))
+    
+    # nograd vae and text encoders
     vae.requires_grad_(False).eval()
     for i in range(len(text_encoders)):
-        text_encoders[i] = text_encoders[i].to(torch.device("cpu"))
         text_encoders[i].requires_grad_(False).eval()
 
     optimizer_name = config.train.optimizer.lower()

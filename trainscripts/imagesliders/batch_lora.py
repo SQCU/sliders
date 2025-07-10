@@ -5,6 +5,7 @@ from typing import Optional, List, Type, Set, Literal, Union
 import os
 from safetensors.torch import save_file
 
+
 # Define constants similar to lora.py if needed for module identification
 UNET_TARGET_REPLACE_MODULE_TRANSFORMER = ["Attention"]
 UNET_TARGET_REPLACE_MODULE_CONV = ["ResnetBlock2D", "Downsample2D", "Upsample2D"]
@@ -24,13 +25,11 @@ class BatchedLoRAModule(nn.Module):
         lora_name: str,
         org_module: nn.Module,
         lora_dim: int = 4,
-        alpha: float = 1.0, # Alpha is now a float
+        alpha: float = 1.0,
     ):
         super().__init__()
         self.lora_name = lora_name
         self.lora_dim = lora_dim
-        #log flashbang
-        #print(f"DEBUG: Initializing BatchedLoRAModule: {lora_name}")
 
         if "Linear" in org_module.__class__.__name__:
             in_dim = org_module.in_features
@@ -52,15 +51,17 @@ class BatchedLoRAModule(nn.Module):
         else:
             raise NotImplementedError(f"LoRA not implemented for module type: {org_module.__class__.__name__}")
 
-        self.scale = alpha / self.lora_dim
+        # Store alpha as a buffer so it's saved in the state_dict.
+        self.register_buffer("alpha", torch.tensor(alpha))
+        
+        # Calculate scale using the stored alpha buffer.
+        self.scale = self.alpha.item() / self.lora_dim
+        
         # The multiplier will be set by the network and used by LoRAInjectedLayer
-        self.register_buffer("current_multiplier", torch.tensor(0.0))
+        self.register_buffer("multiplier", torch.tensor(0.0))
 
         nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_up.weight)
-
-
-        self.org_module = org_module  # Keep reference to original module for forward pass
 
 class LoRAInjectedLayer(nn.Module):
     """
@@ -73,22 +74,24 @@ class LoRAInjectedLayer(nn.Module):
         self.lora_module = lora_module
 
     def forward(self, x):
-        # Get the original output by calling the original module directly
         original_output = self.org_module(x)
-        
-        # Calculate the lora update
         lora_output = self.lora_module.lora_up(self.lora_module.lora_down(x))
+        multiplier = self.lora_module.multiplier
+        batch_size = multiplier.shape[0] if multiplier.ndim > 0 else 1
+        
+        if not isinstance(multiplier, torch.Tensor):
+            multiplier = torch.tensor(multiplier, device=x.device)
 
-        # Get the multiplier and prepare it for broadcasting
-        multiplier = self.lora_module.current_multiplier.to(x.device, dtype=x.dtype)
-        while len(multiplier.shape) < len(lora_output.shape):
-            multiplier = multiplier.unsqueeze(-1)
+        if multiplier.ndim == 0 or (multiplier.ndim == 1 and multiplier.shape[0] == 1):
+            reshaped_multiplier = multiplier.to(x.device, dtype=x.dtype)
+        else:
+            reshaped_multiplier = multiplier.view(
+                batch_size, *([1] * (len(lora_output.shape) - 1))
+            ).to(x.device, dtype=x.dtype)
             
-        # Apply the scaled LoRA update
-        return original_output + lora_output * multiplier * self.lora_module.scale
+        return original_output + lora_output * reshaped_multiplier * self.lora_module.scale
 
-
-    
+# --- MODIFIED CLASS ---
 class BatchedLoRANetwork(nn.Module):
     """
     Manages a collection of BatchedLoRAModule instances for a UNet.
@@ -96,51 +99,32 @@ class BatchedLoRANetwork(nn.Module):
     """
     def __init__(
         self,
-        unet: nn.Module, # Can be UNet2DConditionModel or any nn.Module with Linear/Conv2d layers
+        unet: nn.Module,
         rank: int = 4,
         alpha: float = 1.0,
         train_method: Literal["full", "noxattn", "innoxattn", "selfattn", "xattn", "xattn-strict", "noxattn-hspace", "noxattn-hspace-last"] = "full",
         target_replace: List[str] = DEFAULT_TARGET_REPLACE,
     ) -> None:
-        """
-        Initializes the BatchedLoRANetwork.
-
-        Args:
-            unet (nn.Module): The UNet model to apply LoRA to.
-            rank (int): The default rank for LoRA modules.
-            alpha (float): The default alpha value for LoRA modules.
-            train_method (Literal): Specifies which parts of the UNet to apply LoRA to.
-            target_replace (List[str]): List of module names to target for LoRA application.
-        """
         super().__init__()
         self.lora_dim = rank
         self.alpha = alpha
         self.train_method = train_method
         self.target_replace = target_replace
-        self.unet_loras: nn.ModuleList[BatchedLoRAModule] = nn.ModuleList()
-        self.module_creation_count = 0 # DEBUG
-        self.module_replacement_count = 0 # DEBUG
+        self.unet_loras: nn.ModuleDict = nn.ModuleDict()
+        self.module_creation_count = 0
+        self.module_replacement_count = 0
 
-        # Create BatchedLoRAModule instances and apply them to the UNet
         self._create_and_apply_modules(unet)
-        print(f"DEBUG: Total BatchedLoRAModule creations: {self.module_creation_count}") # DEBUG
-        print(f"DEBUG: Total module replacements: {self.module_replacement_count}") # DEBUG
+        print(f"DEBUG: Total BatchedLoRAModule creations: {self.module_creation_count}")
+        print(f"DEBUG: Total module replacements: {self.module_replacement_count}")
 
-        # Ensure no duplicate lora names
-        lora_names = set()
-        for lora_module in self.unet_loras:
-            assert lora_module.lora_name not in lora_names, f"Duplicate LoRA name: {lora_module.lora_name}"
-            lora_names.add(lora_module.lora_name)
+        lora_names = set(self.unet_loras.keys())
+        assert len(lora_names) == len(self.unet_loras), "Duplicate LoRA names found."
         
         del unet
         torch.cuda.empty_cache()
 
     def _create_and_apply_modules(self, root_module: nn.Module):
-        """
-        Finds and replaces target modules with LoRA-injected versions.
-        This implementation iterates through all modules and replaces them based on a single, precise filtering function,
-        preventing the memory issues from excessive module creation.
-        """
         modules_to_replace = []
         for name, module in root_module.named_modules():
             if self._is_target_module(name, module):
@@ -154,11 +138,14 @@ class BatchedLoRANetwork(nn.Module):
             
             child_name = path_parts[-1]
             
-            lora_name = f"{LORA_PREFIX_UNET}_{name.replace('.', '_')}"
+            # <<< FIX 1: Create the exact key prefix required by the standard.
+            # Example: 'lora_unet_down_blocks_1_attentions_0_transformer_blocks_0_attn1_to_q'
+            lora_name_key = f"{LORA_PREFIX_UNET}_{name.replace('.', '_')}"
+            
             lora_module = BatchedLoRAModule(
-                lora_name, module, self.lora_dim, self.alpha
+                lora_name_key, module, self.lora_dim, self.alpha
             )
-            self.unet_loras.append(lora_module)
+            self.unet_loras[lora_name_key] = lora_module
             self.module_creation_count += 1
 
             injected_layer = LoRAInjectedLayer(module, lora_module)
@@ -166,136 +153,77 @@ class BatchedLoRANetwork(nn.Module):
             self.module_replacement_count += 1
 
     def _is_target_module(self, name: str, module: nn.Module) -> bool:
-        """
-        Determines if a specific module should be replaced with a LoRA version based on its type and name.
-        """
         if module.__class__.__name__ not in ["Linear", "Conv2d", "LoRACompatibleLinear", "LoRACompatibleConv"]:
             return False
-
-        # Name-based filtering logic adapted from the original lora.py
-        if "time_embed" in name:
-            return False
-
+        if "time_embed" in name: return False
         train_method = self.train_method
         if train_method == "full":
-            # In 'full' mode, we check if the module is part of a container specified in target_replace
-            is_in_target = False
-            for target_name in self.target_replace:
-                if target_name in name:
-                    is_in_target = True
-                    break
-            if not is_in_target:
-                return False
-        elif train_method == "noxattn" or train_method == "noxattn-hspace" or train_method == "noxattn-hspace-last":
-            if "attn2" in name:
-                return False
-        elif train_method == "innoxattn":
-            if "attn2" in name:
-                return False
+            is_in_target = any(target in name for target in self.target_replace)
+            if not is_in_target: return False
+        elif train_method in ["noxattn", "noxattn-hspace", "noxattn-hspace-last", "innoxattn"]:
+            if "attn2" in name: return False
         elif train_method == "selfattn":
-            if "attn1" not in name:
-                return False
+            if "attn1" not in name: return False
         elif train_method in ["xattn", "xattn-strict", "xattn-up", "xattn-down", "xattn-mid"]:
-            if "attn2" not in name: # Note: diffusers uses attn2 for cross-attention
-                return False
-            if train_method == 'xattn-up' and 'up_block' not in name:
-                return False
-            if train_method == 'xattn-down' and 'down_block' not in name:
-                return False
-            if train_method == 'xattn-mid' and 'mid_block' not in name:
-                return False
-            if train_method == 'xattn-strict' and ('out' in name or 'to_q' in name):
-                 return False
-        else:
-            raise NotImplementedError(f"train_method: {train_method} is not implemented.")
-        
-        # Additional specific filters from the old logic
-        if train_method == 'noxattn-hspace' and 'mid_block' not in name:
-            return False
-        if train_method == 'noxattn-hspace-last' and ('mid_block' not in name or '.1' not in name or 'conv2' not in name):
-            return False
-            
+            if "attn2" not in name: return False
+            if train_method == 'xattn-up' and 'up_block' not in name: return False
+            if train_method == 'xattn-down' and 'down_block' not in name: return False
+            if train_method == 'xattn-mid' and 'mid_block' not in name: return False
+            if train_method == 'xattn-strict' and ('out' in name or 'to_q' in name): return False
+        else: raise NotImplementedError(f"train_method: {train_method} is not implemented.")
+        if train_method == 'noxattn-hspace' and 'mid_block' not in name: return False
+        if train_method == 'noxattn-hspace-last' and ('mid_block' not in name or '.1' not in name or 'conv2' not in name): return False
         return True
 
     def set_lora_scales(self, scales: torch.Tensor):
-        """
-        Sets the LoRA multipliers for all managed LoRA modules based on a batch of scales.
-        The `scales` tensor is expected to have a shape that can broadcast with the
-        batch dimension of the input tensors to the LoRA modules.
-        For example, if the input to LoRA modules is (B, C, H, W), `scales` should be (B, 1, 1, 1).
-
-        Args:
-            scales (torch.Tensor): A tensor of LoRA scales, one for each item in the batch.
-        """
-
-        for lora_module in self.unet_loras:
-            #lora_module.current_multiplier = scales.to(lora_module.lora_down.weight.device)
-            #what is this curious and inexplicable gemini 2.5 code saying to do?
-            #the reference lora.py does the same thing i just wrote below btw.
-            lora_module.current_multiplier = scales
+        for lora_module in self.unet_loras.values():
+            lora_module.multiplier = scales
 
     def __enter__(self):
-        """
-        Context manager entry: Activates the LoRA modules by setting their multipliers.
-        The actual scales are set via `set_lora_scales` before entering the context.
-        """
-        # Multipliers are already set by set_lora_scales before __enter__ is called.
-        # This context manager primarily ensures that the multipliers are reset on exit.
         pass
 
     def __exit__(self, exc_type, exc_value, tb):
-        """
-        Context manager exit: Deactivates the LoRA modules by setting their multipliers to zero.
-        """
-        # Reset multipliers to zero to effectively disable LoRA
-        for lora_module in self.unet_loras:
-            lora_module.current_multiplier = torch.tensor(0.0)
+        for lora_module in self.unet_loras.values():
+            lora_module.multiplier = torch.tensor(0.0)
 
     def prepare_optimizer_params(self, lr=None):
-        """
-        Prepares parameters for the optimizer.
-        """
-        all_params = []
-        for lora_module in self.unet_loras:
-            all_params.extend(lora_module.parameters())
-        return [{"params": all_params}]
+        params_to_optimize = []
+        for lora_module in self.unet_loras.values():
+            params_to_optimize.extend(lora_module.parameters())
+        return [{"params": params_to_optimize}]
 
     def save_weights(self, file: str, dtype: Optional[torch.dtype] = torch.bfloat16, metadata: Optional[dict] = None):
         """
-        Saves the state dictionary of the LoRA network.
+        Saves the state dictionary with keys matching the standard LoRA format.
+        This version translates the internal, "dirty" keys to "clean" standard keys on the fly.
         """
-        """
-        state_dict = self.state_dict()
-        if dtype is not None:
-            for key in list(state_dict.keys()):
-                v = state_dict[key]
-                state_dict[key] = v.detach().clone().to("cpu").to(dtype)
-
-        # This part needs to be adapted based on how you want to save.
-        # For now, a simple torch.save
-        if os.path.splitext(file)[1] == ".safetensors":
-            save_file(state_dict, file, metadata)
-        else:
-            torch.save(state_dict, file)
-        """
-        #naive saving will preserve every single module in the unet with an adapter attached!
-        #this is a bit better.
-        state_dict = self.state_dict()
         state_to_save = {}
+        
+        # Get the internal state dict, which has the "dirty" keys we need to clean.
+        # Example dirty key: unet_loras.lora_unet___orig_mod_... .lora_down.weight
+        internal_state_dict = self.state_dict()
+        
+        prefix_to_remove = "unet_loras."
+        
+        for dirty_key, value in internal_state_dict.items():
+            if not dirty_key.startswith(prefix_to_remove):
+                continue
 
-        # Iterate through the full state dictionary and keep only the LoRA parameters.
-        # The LoRA parameters are identifiable by the names 'lora_up' and 'lora_down'.
-        for key, value in state_dict.items():
-            if "lora_down" in key or "lora_up" in key:
-                # Also ensure we are not accidentally saving optimizer states or something else
-                if "lora_down" in key or "lora_up" in key:
-                    state_to_save[key] = value.to(device=torch.device("cpu"), dtype=dtype)
+            # Remove the 'unet_loras.' part
+            key_without_prefix = dirty_key[len(prefix_to_remove):]
+            
+            # This is the crucial fix: replace the unwanted wrapper artifact
+            # to match the standard LoRA naming convention.
+            clean_key = key_without_prefix.replace('__orig_mod_', '_')
+            
+            if "lora_down" in clean_key or "lora_up" in clean_key or "alpha" in clean_key:
+                 state_to_save[clean_key] = value.to("cpu", dtype=dtype)
 
         if not state_to_save:
-            print("WARNING: No LoRA parameters found to save. The saved file will be empty.")
-            # This can happen if the network was not initialized correctly.
+            print("WARNING: No LoRA parameters found to save. Check network structure and key prefixes.")
+            return
 
         if os.path.splitext(file)[1] == ".safetensors":
-            save_file(state_to_save, file, metadata)
+            save_file(state_to_save, file, metadata=metadata)
         else:
             torch.save(state_to_save, file)

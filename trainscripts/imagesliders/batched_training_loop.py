@@ -157,15 +157,15 @@ def train_step(environment: dict, batch: dict):
     uncond_pooled_embeds, cond_pooled_embeds = cfg_pooled_embeds.chunk(2)
 
     # --- TIMESTEP LOGIC ---
-    with torch.no_grad():
-        noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
-        
-        timesteps_to = torch.randint(
-            1, config.train.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
-        ).long()
+    #with torch.no_grad():
+    noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
+    
+    timesteps_to = torch.randint(
+        1, config.train.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
+    ).long()
 
-        noise = torch.randn(latents.shape, device=latents.device, generator=generator)
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps_to)
+    noise = torch.randn(latents.shape, device=latents.device, generator=generator)
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps_to)
     
     # --- END TIMESTEP LOGIC ---
 
@@ -219,6 +219,11 @@ def training_loop(environment: dict, static_batches: list,):
     config = environment["config"]
     gradient_noise_estimator = environment.get("gradient_noise_estimator")
     gradient_accumulation_steps = config.train.get("gradient_accumulation_steps", 1)
+    
+    # Read the max_grad_norm from config, default to 0 (disabled)
+    max_grad_norm = config.train.get("max_grad_norm", 0.0)
+    if max_grad_norm > 0:
+        print(f"--- Gradient clipping enabled with max_norm={max_grad_norm} ---")
 
     progress_bar = tqdm(range(config.train.iterations), desc="training its")
     losses = []
@@ -262,19 +267,35 @@ def training_loop(environment: dict, static_batches: list,):
             #scaling to get mean from of sum-reduced non-profiling loss
             if is_profiling_step:
                 gradient_noise_estimator.post_accumulate_step(gradient_accumulation_steps)
+
+                # --- NEW: Check for and apply adaptive changes ---
+                new_steps = gradient_noise_estimator.propose_new_accumulation_steps(
+                    current_steps=gradient_accumulation_steps,
+                    min_steps=2,
+                    max_steps=int(config.train.iterations/2)
+                )
+                gradient_accumulation_steps = new_steps # The change takes effect on the *next* iteration
+                # --- END NEW ---
             #scale for logging
             avg_loss = total_loss/gradient_accumulation_steps
             losses.append(avg_loss)
+
+            if max_grad_norm > 0:
+                # clip_grad_norm_ returns the total norm before clipping, which is useful for logging.
+                total_norm = torch.nn.utils.clip_grad_norm_(network.parameters(), max_grad_norm)
+                # You could add total_norm to your progress bar if you want to monitor it
+                # e.g., progress_bar.set_postfix({"Norm": f"{total_norm:.2f}", ...})
+
             # Optimizer step and scheduler step
             #both profiling step and non profiling step have correct .grad attribute here
             optimizer.step()
             lr_scheduler.step()
 
-            progress_bar.set_postfix({"Loss;avg": f"{avg_loss:.3f};{sum(losses)/len(losses):.3f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+            progress_bar.set_postfix({"Loss;avg": f"{avg_loss:.3f};{sum(losses)/len(losses):.3f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}","Norm": f"{total_norm:.2f}",})
             # Print estimated gradient noise scale if enabled
-            if gradient_noise_estimator is not None and gradient_noise_estimator.ema_b_est is not None:
+            if gradient_noise_estimator is not None and gradient_noise_estimator.ema_zoomy_b_crit is not None:
                 # Print on the same line as tqdm progress bar
-                progress_bar.set_postfix_str({"Loss;avg": f"{avg_loss:.3f};{sum(losses)/len(losses):.3f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}", "B_crit": "{gradient_noise_estimator.ema_b_est:.2f}"})
+                progress_bar.set_postfix_str({"Loss;avg": f"{avg_loss:.3f};{sum(losses)/len(losses):.3f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}", "B_crit": f"{gradient_noise_estimator.ema_zoomy_b_crit:.2f}","Norm": f"{total_norm:.2f}",})
             global_step += 1 # Increment global step after each training step
     
     return environment
@@ -316,14 +337,7 @@ def main():
         # as per user instruction. It is understood that this is a deliberate design choice
         # for specific memory optimization needs.
         tdcpu = torch.device("cpu")
-        # Unload UNet to CPU to free VRAM for VAE and Text Encoders during batch preparation
-        unet1 = environment.pop('unet')
-        unet2 = unet1.to(device=tdcpu)
-        del unet1
-        environment['unet'] = unet2
-        gc.collect()
-        torch.cuda.empty_cache()
-
+        #unet is already offloaded to cpu in batch_confg_util return
         # Prepare cached batches (image latents and text embeddings)
         static_batches = prepare_cached_batches(config, environment)
         
@@ -334,6 +348,8 @@ def main():
         vae=vae.to(device=tdcpu)
         for te in text_encoders:
             te=te.to(device=tdcpu)
+        environment["vae"] = vae
+        environment["tokenizers"] = text_encoders
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -379,8 +395,9 @@ def main():
             # micro_batch_size for GNS is the actual batch size processed by UNet in one go
             micro_batch_size = config.train.batch_size
             profile_freq = config.train.get("gns_profile_freq", 10) # Default to 100 steps
-            ema_alpha = config.train.get("gns_ema_alpha", 0.05) # Default EMA alpha
-            gradient_noise_estimator = GradientNoiseEstimator(network, micro_batch_size, profile_freq, ema_alpha)
+            ema_alpha_fast = config.train.get("gns_ema_fast", 0.1) # Default EMA alpha
+            ema_alpha_slow = config.train.get("gns_ema_fast", 0.01) # Default EMA alpha
+            gradient_noise_estimator = GradientNoiseEstimator(network, micro_batch_size, profile_freq, ema_alpha_fast, ema_alpha_slow)
     environment["gradient_noise_estimator"] = gradient_noise_estimator
 
     #slurp optimizer args from config

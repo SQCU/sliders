@@ -2,9 +2,12 @@
 models/**
 
 trainscripts/imagesliders/__pycache__/**
-
+datasets/*.yaml
+datasets/*/latents/*
+datasets/trls/**
 *.deb
 #do we want all of these in our git history? no probably.
 #suspended for now bc gemini-cli changed behavior
 #logs/*.log
 refs/**
+uploads/** */
