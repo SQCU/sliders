@@ -177,9 +177,24 @@ def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     # --- 6. Loss Calculation ---
     # The training objective is to predict the noise from the text-conditioned prompt
     _, predicted_noise_text = predicted_noise.chunk(2)
-    
+
     # Loss is calculated in float32 for numerical stability
     loss = torch.nn.functional.mse_loss(predicted_noise_text.float(), noise)
+
+    if batch["guidance_scale"] is not None:
+        guidance_scale = batch["guidance_scale"]
+        if guidance_scale < 1:
+            print(f"your guidance scale sounds invalid: {guidance_scale}")
+            batch["guidance_scale"] = None
+        if guidance_scale == 1:
+            #no CFG case
+            pass
+        else:
+            predicted_noise_cfg_reduced = (_ + guidance_scale * (
+            predicted_noise_text - _
+            )).to(device)
+    
+            loss = torch.nn.functional.mse_loss(predicted_noise_cfg_reduced.float(), noise)
 
     return loss
 
@@ -427,7 +442,9 @@ def main():
             optimizer_kwargs[key] = value
     environment['network'] = network
     #optimizer_module = train_util.get_optimizer(config.train.optimizer)
-    optimizer = environment['optimizer'](network.prepare_optimizer_params(),
+    paramforoptim = network.prepare_optimizer_params()
+    print(f"length prepared optim parameters:{len(paramforoptim)}")
+    optimizer = environment['optimizer'](paramforoptim,
     lr=config.train.lr, 
     **optimizer_kwargs )
 
