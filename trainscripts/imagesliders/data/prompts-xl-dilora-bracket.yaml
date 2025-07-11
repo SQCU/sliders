@@ -4,7 +4,7 @@
   unconditional: "simple background" # invariant prompt
   neutral: "simple background chalk drawing cartoon sketch" # 'low prompt'
   action: "enhance" # erase or enhance, only meaningful in textsliders
-  guidance_scale: 2
+  guidance_scale: 1
   resolution: 512
   dynamic_resolution: false
 ####################################################################################################### IMAGE SLIDER

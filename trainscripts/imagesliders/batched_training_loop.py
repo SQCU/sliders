@@ -7,6 +7,7 @@ import datetime
 import sys
 import argparse
 import yaml
+import json
 from diffusers.optimization import get_scheduler
 import torch.optim as optim
 import hashlib
@@ -15,9 +16,9 @@ from pathlib import Path
 import time
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Union, Literal, List, Dict, Any
-from .batch_slider_algo import calculate_paired_loss, GradientNoiseEstimator
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
+from .batch_slider_algo import calculate_paired_loss, GradientNoiseEstimator
 from .batch_config_util import (
     setup_logging,
     AttrDict,
@@ -28,13 +29,9 @@ from .batch_config_util import (
 from . import batch_lora as lora
 from . import batch_train_util
 from . import batch_model_util
-from .data_processing_utils import (
-    resize_image_if_needed,
-    encode_images_to_latents,
-)
 from .data_schedule import TrainingSchedule, prepare_cached_batches
 
-from .data_schedule import TrainingSchedule # Import TrainingSchedule
+from . import batch_data_pipeline
 
 UNET_ATTENTION_TIME_EMBED_DIM = 256  # XL
 TEXT_ENCODER_2_PROJECTION_DIM = 1280
@@ -85,122 +82,104 @@ codecache.write_atomic = fixed_write_atomic
 print("--- Applied monkey-patch to torch._inductor.codecache.write_atomic for Windows compatibility ---")
 # --- END MONKEY-PATCH ---
 
-def rectify_batch_fn(batch: dict, device: torch.device, weight_dtype: torch.dtype) -> dict:
+def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     """
-    Moves batch data to the appropriate device and dtype.
+    Performs a single, self-contained training step.
+    Handles device/dtype placement, batch preparation, forward pass, and loss calculation.
     """
-    batch['latents'] = batch['latents'].to(device, dtype=weight_dtype)
-    batch['scales'] = batch['scales'].to(device, dtype=weight_dtype)
-    batch['pair_indices'] = batch['pair_indices'].to(device)
-    batch['is_low_cases'] = batch['is_low_cases'].to(device)
-    batch['cfg_text_embeddings'] = batch['cfg_text_embeddings'].to(device, dtype=weight_dtype)
-    batch['cfg_pooled_embeds'] = batch['cfg_pooled_embeds'].to(device, dtype=weight_dtype)
-    batch['add_time_ids'] = batch['add_time_ids'].to(device, dtype=torch.float32) # Keep this float32!
-    return batch
-
-
-
-
-def prepare_cfg_batch(
-    noisy_latents: torch.Tensor,
-    timesteps_to: torch.Tensor,
-    noise_scheduler,
-    weight_dtype: torch.dtype,
-    uncond_text_embeddings: torch.Tensor,
-    cond_text_embeddings: torch.Tensor,
-    uncond_pooled_embeds: torch.Tensor,
-    cond_pooled_embeds: torch.Tensor,
-    add_time_ids: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Prepares a CFG-ready batch by concatenating unconditional and conditional embeddings.
-    """
-    latents_cfg = torch.cat([noisy_latents, noisy_latents], dim=0)
-    text_embeddings_cfg = torch.cat([uncond_text_embeddings, cond_text_embeddings], dim=0)
-    pooled_embeds_cfg = torch.cat([uncond_pooled_embeds, cond_pooled_embeds], dim=0)
-    add_time_ids_cfg = torch.cat([add_time_ids, add_time_ids], dim=0)
-
-    #not to unet.dtype! these need to be a torch.long
-    unet_timesteps = noise_scheduler.timesteps[timesteps_to]#.to(weight_dtype)
-    unet_timesteps_cfg = torch.cat([unet_timesteps, unet_timesteps], dim=0)
-
-    return latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg
-
-
-def train_step(environment: dict, batch: dict):
-    """
-    Performs a single training step with optional gradient accumulation and gradient noise estimation.
-    """
+    # --- 1. Unpack Environment and Config ---
     unet = environment["unet"]
     noise_scheduler = environment["noise_scheduler"]
     network = environment["network"]
-    config = environment["config"]
     device = environment["device"]
     weight_dtype = environment["weight_dtype"]
-    generator = environment["generator"]
-    gradient_noise_estimator = environment["gradient_noise_estimator"]
+    config = environment["config"]
+    # The generator from the environment is now used for noise and timesteps
+    generator = environment.get("generator")
 
-    current_micro_batch = batch
-    # For now, we'll use the full 'batch' as a micro-batch, and scale loss.
+    # --- 2. Rectify Batch: Move to device and set dtypes ---
+    # This logic is now inside the train_step.
+    latents = batch['latents'].to(device, dtype=weight_dtype)
+    scales = batch['scales'].to(device, dtype=weight_dtype)
+    noise = batch['noise'].to(device, dtype=torch.float32)
+    add_time_ids = batch['add_time_ids'].to(device, dtype=torch.float32)
 
-    latents = current_micro_batch["latents"]
-    scales = current_micro_batch["scales"]
-    pair_indices = current_micro_batch["pair_indices"]
-    is_low_cases = current_micro_batch["is_low_cases"]
-    guidance_scale = current_micro_batch["guidance_scale"]
-    cfg_text_embeddings = current_micro_batch['cfg_text_embeddings']
-    cfg_pooled_embeds = current_micro_batch['cfg_pooled_embeds']
-    add_time_ids = current_micro_batch['add_time_ids']
-    gradient_noise_estimator = environment["gradient_noise_estimator"]
-
-    uncond_text_embeddings, cond_text_embeddings = cfg_text_embeddings.chunk(2)
-    uncond_pooled_embeds, cond_pooled_embeds = cfg_pooled_embeds.chunk(2)
-
-    # --- TIMESTEP LOGIC ---
-    #with torch.no_grad():
-    noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
+    text_embeddings_cfg = batch['cfg_text_embeddings'].to(device, dtype=weight_dtype)
+    pooled_embeds_cfg = batch['cfg_pooled_embeds'].to(device, dtype=weight_dtype)
+    add_time_ids_cfg = torch.cat([add_time_ids, add_time_ids], dim=0)
+   
+    # --- 3. Prepare for Denoising ---
+    # The noise and timesteps are now taken from the batch, not generated live.
     
+    # REFERENCE TIMESTEP CODE
+    noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
     timesteps_to = torch.randint(
-        1, config.train.max_denoising_steps, (latents.shape[0],), device=device, generator=generator
+        1, 
+        config.train.max_denoising_steps, 
+        (latents.shape[0],),  # The shape MUST match the latents batch size
+        device=device, 
+        generator=generator
     ).long()
 
-    noise = torch.randn(latents.shape, device=latents.device, generator=generator)
-    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps_to)
-    
-    # --- END TIMESTEP LOGIC ---
+    # 1 ~ 49 からランダム timesteps_to
+    #nl_timestep = noise_scheduler.timesteps[timesteps_to:timesteps_to+1]
+    nl_timestep = noise_scheduler.timesteps[timesteps_to]
+    noisy_latents = noise_scheduler.add_noise(latents, noise, nl_timestep)
+    #unet needs millenial (/1000) timesteps, not sampling stepsize timesteps as we use in our code!
+    #this unit conversion is absolutely mandatory!
+    # STILL REFERENCE CODE:
+    noise_scheduler.set_timesteps(1000)
+    normalized_tsteps = torch.round(timesteps_to * 1000 / config.train.max_denoising_steps).long()
+    unet_timesteps = noise_scheduler.timesteps[
+                normalized_tsteps.to("cpu")
+            ]
+    unet_timesteps = unet_timesteps.to(device)
+    # timesteps_to has shape [B]. Get scheduler timesteps and duplicate to [B*2]
+    unet_timesteps_cfg = torch.cat([unet_timesteps, unet_timesteps], dim=0)
+    # END REFERENCE TIMESTEP CODE
 
-    latents_cfg, text_embeddings_cfg, pooled_embeds_cfg, add_time_ids_cfg, unet_timesteps_cfg = prepare_cfg_batch(
-        noisy_latents,
-        timesteps_to,
-        noise_scheduler,
-        weight_dtype,
-        uncond_text_embeddings,
-        cond_text_embeddings,
-        uncond_pooled_embeds,
-        cond_pooled_embeds,
-        add_time_ids,
-    )
+    print_that_shit = False
+    if print_that_shit:
+        print(f"timesteps_to{timesteps_to}")
+        print(f"nnormalized_tsteps:{normalized_tsteps}")
+        print(f"nl_timestep{nl_timestep}")
+        print(f"unet_timesteps:{unet_timesteps}")
 
-    batched_scales_cfg = torch.cat([scales, scales], dim=0).unsqueeze(-1)
+
+    # --- 4. Prepare CFG-Ready Batch (formerly prepare_cfg_batch) ---
+    # We already prepared add_time_ids_cfg, now we do the rest.
+    latents_cfg = torch.cat([noisy_latents, noisy_latents], dim=0)
+    # add_time_ids has shape [B, ...]. Duplicate it to [B*2, ...]
+    add_time_ids_cfg = torch.cat([add_time_ids, add_time_ids])
+    # scales has shape [B]. Duplicate it to [B*2]
+    scales_cfg = torch.cat([scales, scales])
+
+
+
+    # --- 5. Forward Pass ---
+    # Set LoRA scales for the full CFG batch
+    batched_scales_cfg = torch.cat([scales, scales], dim=0)
     network.set_lora_scales(batched_scales_cfg)
 
-    #used to have with network here... have to move it to wrap around the backwards to avoid a gradient checkpointing error...
-    predicted_noise = batch_train_util.nocfg_predict_noise_xl(
-        unet,
-        noise_scheduler,
+    # The prediction function expects keyword arguments for the added conditions
+    added_cond_kwargs = {
+        "text_embeds": pooled_embeds_cfg,
+        "time_ids": add_time_ids_cfg,
+    }
+    
+    predicted_noise = unet(
+        latents_cfg.to(unet.dtype),
         unet_timesteps_cfg,
-        latents_cfg,
-        text_embeddings_cfg,
-        pooled_embeds_cfg,
-        add_time_ids_cfg,
-    )
+        encoder_hidden_states=text_embeddings_cfg.to(unet.dtype),
+        added_cond_kwargs=added_cond_kwargs
+    ).sample
 
-    predicted_noise_uncond, predicted_noise_text = predicted_noise.chunk(2)
-    predicted_noise_cfg_reduced = (predicted_noise_uncond + guidance_scale * (
-        predicted_noise_text - predicted_noise_uncond
-    )).to(device)
-
-    loss = calculate_paired_loss(predicted_noise_cfg_reduced, noise, pair_indices, is_low_cases)
+    # --- 6. Loss Calculation ---
+    # The training objective is to predict the noise from the text-conditioned prompt
+    _, predicted_noise_text = predicted_noise.chunk(2)
+    
+    # Loss is calculated in float32 for numerical stability
+    loss = torch.nn.functional.mse_loss(predicted_noise_text.float(), noise)
 
     return loss
 
@@ -225,9 +204,13 @@ def training_loop(environment: dict, static_batches: list,):
     if max_grad_norm > 0:
         print(f"--- Gradient clipping enabled with max_norm={max_grad_norm} ---")
 
-    progress_bar = tqdm(range(config.train.iterations), desc="training its")
+    total_sample_steps = config.train.iterations # Let's redefine 'iterations' as optimizer steps
+
+    progress_bar = tqdm(total=total_sample_steps, desc="sample steps")
     losses = []
-    for i in progress_bar:   
+    #for i in progress_bar:   
+    #refactor to avoid endless training runs w/ dynamic batchsize
+    while global_step < total_sample_steps:
         # Determine if this is a profiling step    
         if gradient_noise_estimator is not None:
             gradient_noise_estimator.pre_accumulate_step(global_step)
@@ -241,27 +224,32 @@ def training_loop(environment: dict, static_batches: list,):
             if is_profiling_step:
                 # Iterate over micro-batches for gradient accumulation
                 for _ in range(gradient_accumulation_steps):
-                    micro_batch = static_batches[i % len(static_batches)] 
-                    micro_batch = rectify_batch_fn(micro_batch, device, weight_dtype)
-                    loss = train_step(environment, micro_batch)
+                    micro_batch = static_batches[global_step % len(static_batches)]
+                    #rectify function rolled into train step 
+                    #micro_batch = rectify_batch_fn(micro_batch, device, weight_dtype)
+                    loss = train_step(micro_batch, **environment).to(weight_dtype)
                     #immediate backprop to get microgradient
                     loss.backward()
                     #tell estimator to capture and accumulate microgradient data
                     gradient_noise_estimator.post_micro_backward_step()
                     total_loss += loss.item()
+                    global_step += 1 # Increment global step after each training step
+                    progress_bar.update(1)
             else:
                 #NON-GRADIENTSTATS ACCUMULATION CONTROL FLOW
                 optimizer.zero_grad()
                 for _ in range(gradient_accumulation_steps):
-                    micro_batch = static_batches[i % len(static_batches)] 
-                    micro_batch = rectify_batch_fn(micro_batch, device, weight_dtype)
-                    loss = train_step(environment, micro_batch)
+                    micro_batch = static_batches[global_step % len(static_batches)] 
+                    #micro_batch = rectify_batch_fn(micro_batch, device, weight_dtype)
+                    loss = train_step(micro_batch, **environment).to(weight_dtype)
                     # Scale loss for accumulation
-                    loss = loss / gradient_accumulation_steps
-
+                    #RuntimeError: Found dtype Float but expected BFloat16
+                
                     # accumulate gradients
                     loss.backward()
-                    total_loss += loss.item() * gradient_accumulation_steps
+                    total_loss += loss.item()
+                    global_step += 1 # Increment global step after each training step
+                    progress_bar.update(1)
 
             #AFTER ACCUMULATION SEQUENCE
             #scaling to get mean from of sum-reduced non-profiling loss
@@ -296,7 +284,6 @@ def training_loop(environment: dict, static_batches: list,):
             if gradient_noise_estimator is not None and gradient_noise_estimator.ema_zoomy_b_crit is not None:
                 # Print on the same line as tqdm progress bar
                 progress_bar.set_postfix_str({"Loss;avg": f"{avg_loss:.3f};{sum(losses)/len(losses):.3f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}", "B_crit": f"{gradient_noise_estimator.ema_zoomy_b_crit:.2f}","Norm": f"{total_norm:.2f}",})
-            global_step += 1 # Increment global step after each training step
     
     return environment
 
@@ -332,14 +319,45 @@ def main():
         print(f"Configured Iterations: {iterations}", file=sys.stderr)
         print(f"Expected Total Samples (Batch Size * Iterations): {expected_total_samples}", file=sys.stderr)
 
-        # NOTE: The following VRAM management logic (moving UNet, VAE, Text Encoders to/from CPU)
-        # is intentionally kept as-is, despite its apparent complexity and manual nature,
-        # as per user instruction. It is understood that this is a deliberate design choice
-        # for specific memory optimization needs.
-        tdcpu = torch.device("cpu")
-        #unet is already offloaded to cpu in batch_confg_util return
+        # OBSOLETION NOTICE! NO MORE PREPARE_CACHED_BATCHES!
         # Prepare cached batches (image latents and text embeddings)
-        static_batches = prepare_cached_batches(config, environment)
+        #static_batches = prepare_cached_batches(config, environment)
+
+        # --- THE NEW, ROBUST DATA PIPELINE INTEGRATION ---
+        # Stage 1: Create the pure-python, reproducible training schedule.
+        # This happens before any VRAM-intensive operations.
+        schedule_dict = batch_data_pipeline.create_training_schedule(environment['config'])
+
+        # Stage 2: (Not really optional!) Dump the schedule for validation and debugging.
+        # This is our proof that the plan is correct BEFORE we burn GPU cycles.
+        schedule_log_dir = "logs"
+        os.makedirs(schedule_log_dir, exist_ok=True)
+        schedule_filename = os.path.join(
+            schedule_log_dir, 
+            f"training_schedule_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
+        )
+        print(f"Dumping full training schedule to: {schedule_filename}")
+        with open(schedule_filename, 'w') as f:
+            # Use a simple default converter for any non-serializable types like Path objects
+            json.dump(schedule_dict, f, indent=2, default=str)
+
+        # Stage 3: Materialize the schedule into tensor batches.
+        # This function now handles all VAE/CLIP encoding, caching, and batching.
+        # Note: The environment models (VAE, text encoders) will be moved to the GPU inside this function as needed.
+        with torch.no_grad():
+            static_batches = batch_data_pipeline.materialize_static_batches(schedule_dict, environment)
+
+        print("Data materialization complete. Managing VRAM for training loop.")
+
+        # --- END OF NEW PIPELINE INTEGRATION ---
+
+        # NOTE: The VRAM management logic from the original main() is now effectively
+        # handled INSIDE `materialize_static_batches`. The VAE is loaded to the GPU for
+        # optimal batch encoding and then should be offloaded back to the CPU.
+        # We will assume the materialize function is well-behaved and cleans up after itself.
+        # For good measure, we can explicitly manage VRAM here.
+
+        tdcpu = torch.device("cpu")
         
         # Unload VAE and Text Encoders to CPU after batch preparation
         vae = environment.pop('vae')

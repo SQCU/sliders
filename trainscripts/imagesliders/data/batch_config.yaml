@@ -48,8 +48,8 @@ logging:
   verbose: false
 other:
   use_xformers: false
-  use_pytorch_SDPA: false
-  torch_compile: true
+  use_pytorch_SDPA: true
+  torch_compile: false
   lycorisize: false
   gradient_checkpointing: true
 

@@ -1,3 +1,4 @@
+#data_processing_utils.py
 import torch
 import os
 import hashlib
@@ -51,6 +52,8 @@ def encode_images_to_latents(images, vae, device, weight_dtype):
     image_tensors = [image_processor.preprocess(image).to(dtype=weight_dtype) for image in images]
     image_batch = torch.cat(image_tensors, dim=0)
     latents = vae.encode(image_batch).latent_dist.sample(None)
+    #...huh?
+    latents = vae.config.scaling_factor * latents
     end_time = time.time()
     return latents.to(device=torch.device("cpu")), (end_time - start_time)
 

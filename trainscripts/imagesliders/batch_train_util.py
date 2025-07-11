@@ -1,8 +1,11 @@
+#batch_train_util.py
 import torch
 from typing import Tuple, Union, Literal, List, Dict, Any
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from diffusers import UNet2DConditionModel, SchedulerMixin
 
+UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも同じ。
+VAE_SCALE_FACTOR = 8  # 2 ** (len(vae.config.block_out_channels) - 1) = 8
 
 UNET_ATTENTION_TIME_EMBED_DIM = 256  # XL
 TEXT_ENCODER_2_PROJECTION_DIM = 1280
@@ -126,6 +129,20 @@ def get_add_time_ids(
     #debug print no longer needed.
     #print(f"Shape of add_time_ids in get_add_time_ids: {add_time_ids.shape}")
     return add_time_ids
+
+def get_random_noise(
+    batch_size: int, height: int, width: int, generator: torch.Generator = None
+) -> torch.Tensor:
+    return torch.randn(
+        (
+            batch_size,
+            UNET_IN_CHANNELS,
+            height // VAE_SCALE_FACTOR,  # 縦と横これであってるのかわからないけど、どっちにしろ大きな問題は発生しないのでこれでいいや
+            width // VAE_SCALE_FACTOR,   # 更新：長さと幅は間違いなく正しいです。ああ、これは大変な問題でした。
+        ),
+        generator=generator,
+        device="cpu",
+    )
 
 def nocfg_predict_noise_xl(
     unet: torch.nn.Module,

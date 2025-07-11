@@ -137,29 +137,36 @@ class GradientNoiseEstimator:
         if self.ema_ponderous_b_crit is None or self._profile_steps_since_last_update < self.update_cooldown:
             return current_steps
 
+        self.current_steps = current_steps
         current_effective_batch_size = self.micro_batch_size * current_steps
         
         # Trend confirmation from both EMAs
-        suggests_increase = self.ema_zoomy_b_crit > current_effective_batch_size and \
-                            self.ema_ponderous_b_crit > current_effective_batch_size
+        suggests_increase = self.ema_zoomy_b_crit * self.current_steps > self.current_steps and \
+                            self.ema_ponderous_b_crit * self.current_steps > self.current_steps
         
-        suggests_decrease = self.ema_zoomy_b_crit < current_effective_batch_size and \
-                            self.ema_ponderous_b_crit < current_effective_batch_size
+        suggests_decrease = self.ema_zoomy_b_crit * self.current_steps < self.current_steps and \
+                            self.ema_ponderous_b_crit * self.current_steps < self.current_steps
 
         # Use the stable (ponderous) EMA to determine the target
         # Add micro_batch_size to avoid division by zero or tiny values
-        target_steps = math.ceil(self.ema_ponderous_b_crit / self.micro_batch_size)
+        target_steps = math.ceil(self.ema_ponderous_b_crit * self.current_steps)
         
+        # accelerando: only 125% increase per update:
+        ratio = 1.25
+        if abs(target_steps) / (current_steps + 1e-6) > ratio:
+            target_steps = math.ceil(ratio * self.current_steps)
+            print(f"RATIO BLOCKED! target steps above scaling ratio {ratio} folded to {ratio * self.current_steps}")
+
         # Hysteresis: Only act if the proposed change is significant
         if abs(target_steps - current_steps) / (current_steps + 1e-6) < self.change_threshold:
              return current_steps
 
         new_steps = current_steps
         if suggests_increase:
-            print(f"📈 [Dynamic Accumulation] Trend suggests INCREASE. Current Eff. Batch: {current_effective_batch_size:.1f}, Ponderous B_crit: {self.ema_ponderous_b_crit:.1f}")
+            print(f"📈 [Dynamic Accumulation] Trend suggests INCREASE. Current Eff. Batch: {current_effective_batch_size:.1f}, Ponderous B_crit: {self.ema_ponderous_b_crit*current_effective_batch_size:.1f}")
             new_steps = target_steps
         elif suggests_decrease:
-            print(f"📉 [Dynamic Accumulation] Trend suggests DECREASE. Current Eff. Batch: {current_effective_batch_size:.1f}, Ponderous B_crit: {self.ema_ponderous_b_crit:.1f}")
+            print(f"📉 [Dynamic Accumulation] Trend suggests DECREASE. Current Eff. Batch: {current_effective_batch_size:.1f}, Ponderous B_crit: {self.ema_ponderous_b_crit*current_effective_batch_size:.1f}")
             new_steps = target_steps
         else:
             # Trends disagree, hold steady
@@ -253,33 +260,12 @@ def calculate_paired_loss(
         target_noise (torch.Tensor): Ground truth noise, duplicated for CFG.
         pair_indices (torch.Tensor): Indices of the paired items.
         is_low_cases (torch.Tensor): Boolean tensor indicating if an item is a low case.
-        model (torch.nn.Module): The model whose gradients will be used for noise estimation.
-        noise_estimator (GradientNoiseScaleEstimator): An instance of the noise estimator.
-
     Returns:
         torch.Tensor: The final scalar loss for the batch.
     """
-    # Calculate MSE loss per-element, then reduce to a per-item scalar.
-    # This is the generative error for each individual training data sample.
-    loss_per_sample = (predicted_noise - target_noise).pow(2).mean(dim=[1, 2, 3])
-
-    # The 'scale-tuple' (or pair, for now) is the smallest semantically valid unit of training.
-    # We sum the generative errors for all samples within the same 'scale-tuple'.
-    # This corresponds to the joint minimization of the generative error across related samples.
-    unique_pair_indices = torch.unique(pair_indices)
-    summed_pair_losses = torch.zeros(len(unique_pair_indices), device=predicted_noise.device, dtype=predicted_noise.dtype)
-
-    for i, p_idx in enumerate(unique_pair_indices):
-        # Select losses corresponding to the current pair index
-        current_pair_losses = loss_per_sample[pair_indices == p_idx]
-        # Sum them up to get the loss for this 'scale-tuple'
-        summed_pair_losses[i] = current_pair_losses.sum()
-
-    # Finally, mean reduce the summed 'scale-tuple' losses to get the batch loss.
-    # This is analogous to averaging policy optimization losses over multiple rollouts
-    # or averaging GPT losses over many context-continuation pairs in a batch.
-    final_loss = summed_pair_losses.mean()
-    return final_loss
+    #fine, fine, we can put the absurd stuff in the siglip auxiliary losss
+    loss = torch.nn.functional.mse_loss(predicted_noise.float(), target_noise.float(), reduction="mean")
+    return loss
 
 
 # from trainscripts/imagesliders/batch_loss_functions.py
