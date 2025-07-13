@@ -2,6 +2,7 @@
 # This script contains the full, self-contained system for the first phase of testing.
 # It includes initializers, a test model, and a main function to run an end-to-end
 # internal consistency check with *fully implemented* data-driven estimators.
+# python -m trainscripts.imagesliders.flexible_lora_system 
 
 import torch
 import torch.nn as nn
