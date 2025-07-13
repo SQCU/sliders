@@ -22,10 +22,10 @@ from tqdm import tqdm
 # A simple dictionary to cache computed scaling factors for kaiming_cheald.
 _kaiming_cheald_cache = {}
 
-def init_kaiming_cheald_(lora_down: nn.Module, lora_up: nn.Module):
+def init_kaiming_cheald_(lora_down: nn.Module, lora_up: nn.Module, verbosity=1):
     """
-    Initializes LoRA up/down matrices such that the norm of their product
-    approximates the norm of a full-rank matrix initialized with Kaiming Uniform.
+    Kaiming-Cheald v2: Initializes LoRA matrices so their ghost matrix norm is
+    SCALED DOWN relative to a full-rank matrix, appropriate for a low-rank update.
     This helps normalize the initial impact of LoRA modules across different ranks and shapes.
     """
     out_features, in_features = lora_up.weight.shape[0], lora_down.weight.shape[1]
@@ -33,21 +33,56 @@ def init_kaiming_cheald_(lora_down: nn.Module, lora_up: nn.Module):
     cache_key = f"{in_features}-{out_features}-{rank}"
 
     if cache_key in _kaiming_cheald_cache:
-        scale = _kaiming_cheald_cache[cache_key]
-    else:
-        print(f"  [Kaiming-Cheald] Calibrating for shape ({out_features}, {in_features}) rank {rank}...")
-        W_temp = torch.empty(out_features, in_features)
-        nn.init.kaiming_uniform_(W_temp, a=math.sqrt(5))
-        target_norm = torch.norm(W_temp)
+        balanced_scale = _kaiming_cheald_cache[cache_key]
+
         nn.init.uniform_(lora_down.weight, -0.01, 0.01)
         nn.init.uniform_(lora_up.weight, -0.01, 0.01)
+    else:
+        if verbosity:
+            print(f"  [Kaiming-Cheald] Calibrating for shape ({out_features}, {in_features}) rank {rank}...")
+        W_temp = torch.empty(out_features, in_features)
+        nn.init.kaiming_uniform_(W_temp, a=math.sqrt(5))
+        full_rank_norm = torch.norm(W_temp)
+
+        # 2. Scale this reference norm down. A good heuristic is sqrt(rank/dim).
+        # This ensures a rank-4 LoRA starts much smaller than a rank-128 LoRA.
+        norm_scaling_factor = math.sqrt(float(rank) / in_features)
+        target_norm = full_rank_norm * norm_scaling_factor
+
+        # 3. Initialize our matrices with a small, non-zero distribution
+        nn.init.uniform_(lora_down.weight, -0.01, 0.01)
+        nn.init.uniform_(lora_up.weight, -0.01, 0.01)
+
+        # 4. Get the current norm of the ghost matrix
         with torch.no_grad():
             current_norm = torch.norm(lora_up.weight @ lora_down.weight)
-        scale = target_norm / (current_norm + 1e-9)
-        _kaiming_cheald_cache[cache_key] = scale
+        if verbosity:
+            # --- NEW DIAGNOSTIC BLOCK 2: PRINT INTERMEDIATE VALUES ---
+            # This is where we'll find the NaN. We expect to see two normal floats.
+            # If either is zero, inf, or nan, we've found our problem.
+            print(f"  > Intermediate value `target_norm`: {target_norm}")
+            print(f"  > Intermediate value `current_norm`: {current_norm}")
+        
+        # 5. Calculate the total scaling factor needed.
+        total_scale = target_norm / (current_norm + 1e-9)
+
+        # --- NEW LOGIC: Apply a balanced scale ---
+        # 6. Apply the SQUARE ROOT of the scale to both matrices.
+        balanced_scale = math.sqrt(abs(total_scale))
+
+        _kaiming_cheald_cache[cache_key] = balanced_scale
 
     with torch.no_grad():
-        lora_up.weight.mul_(scale)
+        lora_down.weight.mul_(balanced_scale)
+        lora_up.weight.mul_(balanced_scale)
+        
+        if verbosity:
+            # --- NEW DIAGNOSTIC BLOCK 3: PRINT THE RESULT OF THE DIVISION ---
+            print(f"  > Calculated `scale` (target/current): {balanced_scale}")
+
+     # --- NEW DIAGNOSTIC BLOCK 4: CHECK THE FINAL WEIGHTS FOR NAN ---
+    if torch.isnan(lora_up.weight).any():
+        print("  > CRITICAL: NaN detected in lora_up.weight immediately after scaling.")
 
 def get_initializer(name: str):
     if name == "kaiming_cheald":
@@ -117,7 +152,7 @@ def estimate_ranks_from_svd(unet, cutoff=0.3, save_path=None):
     return estimated_ranks
 
 
-def warmup_and_estimate_alphas(unet_builder, base_lora_config, epochs=5, save_path=None):
+def warmup_and_estimate_alphas(unet_builder, base_lora_config, epochs=75, save_path=None):
     """
     (IMPLEMENTED) Performs a short training run to find optimal alpha ratios per layer.
     
@@ -139,7 +174,7 @@ def warmup_and_estimate_alphas(unet_builder, base_lora_config, epochs=5, save_pa
     # Build the network for alpha training
     temp_uvit = unet_builder().to(device)
     loader = LoRAConfigLoader(config_dict=alpha_train_config)
-    resolved_config = loader.get_resolved_config([name for name, _ in temp_uvit.named_modules()])
+    resolved_config = loader.get_resolved_config(temp_uvit)
     network = FlexibleLoRANetwork(temp_uvit, resolved_config).to(device)
 
     # Use the special optimizer setup for training alphas
@@ -158,11 +193,31 @@ def warmup_and_estimate_alphas(unet_builder, base_lora_config, epochs=5, save_pa
     # --- 3. Extract and compute the importance ratios ---
     alpha_ratios = {}
     initial_alphas = {
-        config['lora_name'].replace('lora_unet_', '').replace('_', '.'): config['alpha']
-        for config in resolved_config['lora_map'].values()
+        # The module name is the key we want for our final output file
+        module_name: config['alpha']
+        for module_name, config in resolved_config['lora_map'].items()
     }
     
+    # --- LOGGING BLOCK 1: VERIFY INITIAL_ALPHAS DICTIONARY ---
+    print("\n--- Alpha Estimator Diagnostics ---")
+    print(f"DEBUG: 'initial_alphas' dict created with {len(initial_alphas)} entries.")
+    if len(initial_alphas) > 0:
+        print(f"  > Sample initial_alphas keys: {list(initial_alphas.keys())[:5]}")
+    else:
+        print("  > CRITICAL: 'initial_alphas' dictionary is EMPTY. Check LoRAConfigLoader.")
+    
+
     trained_state_dict = network.state_dict()
+    # --- LOGGING BLOCK 2: VERIFY STATE_DICT KEYS ---
+    # Find and print all keys in the state_dict that are actually alpha parameters.
+    # This will show us the exact naming convention we need to match.
+    actual_alpha_keys = [k for k in trained_state_dict.keys() if k.endswith('.alpha')]
+    print(f"DEBUG: Found {len(actual_alpha_keys)} '.alpha' parameters in the trained state_dict.")
+    if len(actual_alpha_keys) > 0:
+        print(f"  > Sample actual alpha keys from state_dict: {actual_alpha_keys[:5]}")
+    else:
+        print("  > CRITICAL: No '.alpha' parameters found in state_dict. Check if 'train_alpha=True' is working.")
+
     for name, initial_alpha in initial_alphas.items():
         # The key in the state dict will be like 'unet_loras.lora_unet_...alpha'
         lora_name = f"lora_unet_{name.replace('.', '_')}"
@@ -173,6 +228,9 @@ def warmup_and_estimate_alphas(unet_builder, base_lora_config, epochs=5, save_pa
             # The ratio tells us how much the layer's alpha wanted to change
             ratio = final_alpha / (initial_alpha + 1e-9)
             alpha_ratios[name] = ratio
+        else:
+            # If a key we expect is missing, print a warning. This is our main debugging clue.
+            print(f"  > WARN: Expected key '{alpha_key}' not found in state_dict for module '{name}'.")
             
     # Juicy Log: Persist the learned ratios for reproducibility and to skip this phase.
     if save_path:
@@ -199,24 +257,72 @@ class LoRAConfigLoader:
             raise ValueError("Must provide either config_path or config_dict")
         self.rank_estimates = self._load_json(rank_estimates_path)
         self.alpha_estimates = self._load_json(alpha_estimates_path)
-    # ... (rest of the class is unchanged)
+        # --- NEW DIAGNOSTIC BLOCK: DATA INTEGRITY VALIDATION ---
+        # This block will immediately find the source of the float-in-rank bug.
+        # It checks if the data we loaded matches the type we expect for that attribute.
+        print("\n--- LoRAConfigLoader Data Integrity Check ---")
+        
+        # Check rank estimates: they MUST all be integers.
+        if self.rank_estimates:
+            first_rank_val = next(iter(self.rank_estimates.values()))
+            if isinstance(first_rank_val, float):
+                # This is the smoking gun. If this message prints, the wrong file was loaded.
+                raise TypeError(
+                    f"FATAL: `rank_estimates` contains floats (e.g., {first_rank_val}). "
+                    f"This almost certainly means that the alpha estimates file was incorrectly "
+                    f"passed as the rank estimates file."
+                )
+            print("  > Rank estimates appear to be of the correct type (int). OK.")
+        else:
+            print("  > Rank estimates not loaded (this may be expected).")
+
+        # Check alpha estimates: they SHOULD be floats.
+        if self.alpha_estimates:
+            first_alpha_val = next(iter(self.alpha_estimates.values()))
+            if isinstance(first_alpha_val, int):
+                 print(
+                    f"  > WARN: `alpha_estimates` contains integers (e.g., {first_alpha_val}). "
+                    f"This might mean the rank estimates file was passed as the alpha estimates file."
+                )
+            else:
+                 print("  > Alpha estimates appear to be of the correct type (float). OK.")
+        else:
+            print("  > Alpha estimates not loaded (this may be expected).")
+        print("-------------------------------------------\n")
+    
+
     def _load_json(self, path):
         if path and os.path.exists(path):
             print(f"Loading estimates from: {path}")
             with open(path, 'r') as f: return json.load(f)
         return {}
-    def get_resolved_config(self, unet_module_names: list) -> dict:
+    def get_resolved_config(self, unet) -> dict:
         module_to_rule = {}
         sorted_rules = sorted(self.base_config.get('lora_rules', []), key=lambda x: x.get('priority', 1.0), reverse=True)
         
-        for rule in sorted_rules:
-            for module_name in unet_module_names:
-                if self._module_matches_rule(module_name, rule):
-                    if module_name not in module_to_rule:
-                         module_to_rule[module_name] = rule
+
+        # We now iterate through the actual modules to use isinstance for filtering
+        for name, module in unet.named_modules():
+            # --- FIX #1: IGNORE CONTAINERS ---
+            # We only consider primitive layers that can actually have LoRA applied.
+            if not isinstance(module, (nn.Linear, nn.Conv2d)):
+                continue
+
+            for rule in sorted_rules:
+                if self._module_matches_rule(name, rule):
+                    if name not in module_to_rule:
+                         module_to_rule[name] = rule
         
         resolved_lora_map = {}
         for module_name, rule in module_to_rule.items():
+            # --- FIX #2: STRICT RANK VALIDATION ---
+            # Ensure the matched rule specifies a rank.
+            if 'rank' not in rule:
+                raise ValueError(
+                    f"Configuration Error: Rule '{rule.get('name', 'N/A')}' matched module '{module_name}' "
+                    f"but is missing a required 'rank' key."
+                )
+            
             rank = rule.get('rank')
             if rank == 'auto_svd':
                 rank = self.rank_estimates.get(module_name, 4)
@@ -335,18 +441,16 @@ class FlexibleLoRANetwork(nn.Module):
         
         for name, module in root_module.named_modules():
             if name in lora_map:
-                
-                # --- THE FIX IS HERE ---
-                # Add a guard to ensure we only apply LoRA to supported layer types.
-                # This prevents us from trying to wrap containers like ModuleDict.
                 if not isinstance(module, (nn.Linear, nn.Conv2d)):
-                    # Optional: Add a print here for debugging if a rule matches
-                    # a container but doesn't hit a valid child layer.
                     #print(f"DEBUG: Rule matched name '{name}' but module type is {type(module).__name__}, skipping.")
                     continue
-                # --- END OF FIX ---
+                lora_config = lora_map[name].copy() # Use a copy to avoid modifying the original dict
+                # --- THE FIX IS HERE ---
+                # Pop the 'lora_name' from the config dict. It's metadata for the network,
+                # not the module. This leaves only the keyword arguments that the
+                # FlexibleLoRAModule constructor expects.
+                lora_name = lora_config.pop('lora_name')
 
-                lora_config = lora_map[name]
                 lora_name = f"lora_unet_{name.replace('.', '_')}"
                 
                 lora_module = FlexibleLoRAModule(module, **lora_config)
@@ -391,83 +495,63 @@ class FlexibleLoRANetwork(nn.Module):
 # ==============================================================================
 
 class TestAttentionBlock(nn.Module):
-    def __init__(self, channels, ff_mult=2):
+    def __init__(self, channels, ff_mult=4):
         super().__init__()
-        # Use a single linear layer for QKV for simplicity in this test model
+        # FIX 1: Use separate q, k, v layers to match the config rules.
         self.attn = nn.ModuleDict({
-            'to_qkv': nn.Linear(channels, channels * 3),
+            'to_q': nn.Linear(channels, channels),
+            'to_k': nn.Linear(channels, channels),
+            'to_v': nn.Linear(channels, channels),
             'to_out': nn.Linear(channels, channels),
         })
-        self.ff = nn.Sequential(
-            nn.Linear(channels, channels * ff_mult),
-            nn.GELU(),
-            nn.Linear(channels * ff_mult, channels)
-        )
+        
+        # FIX 2: Use a ModuleDict for the FFN to get the '.net.' naming.
+        self.ff = nn.ModuleDict({
+            'net': nn.Sequential(
+                nn.Linear(channels, channels * ff_mult),
+                nn.GELU(),
+                nn.Linear(channels * ff_mult, channels)
+            )
+        })
+
     def forward(self, x):
-        # A dummy attention pass that preserves shape
-        q, k, v = self.attn.to_qkv(x).chunk(3, dim=-1)
+        # The forward pass now uses the separated Q, K, V layers.
+        q = self.attn.to_q(x)
+        k = self.attn.to_k(x)
+        v = self.attn.to_v(x)
         x = x + self.attn.to_out(q * k * v) # simplified attention
-        x = x + self.ff(x)
+        
+        # The FFN forward pass now calls through the 'net' ModuleDict.
+        x = x + self.ff.net(x)
         return x
 
 class TesterUViT(nn.Module):
-    """
-    A fictional UViT with realistic naming conventions for testing.
-    REVISED to include a long-range skip connection from the down_block
-    to the up_block, which is essential for any U-style architecture.
-    """
+    # This class remains unchanged, as the fix is entirely within TestAttentionBlock.
     def __init__(self):
         super().__init__()
+        # Scale up all channel dimensions
         self.initial_conv = nn.Conv2d(3, 128, kernel_size=3, padding=1)
-        
         self.down_blocks = nn.ModuleList([
             nn.ModuleDict({'attentions': nn.ModuleList([TestAttentionBlock(128)])})
         ])
-        
         self.mid_block = nn.ModuleDict({
             'attentions': nn.ModuleList([TestAttentionBlock(128), TestAttentionBlock(128)])
         })
-        
         self.up_blocks = nn.ModuleList([
-            # NOTE: In a real U-Net, this layer would handle concatenated input
-            # (e.g., channels * 2). For this test harness, we use addition
-            # to keep channel dimensions consistent and test the data path.
             nn.ModuleDict({'attentions': nn.ModuleList([TestAttentionBlock(128)])})
         ])
-        
         self.final_conv = nn.Conv2d(128, 3, kernel_size=3, padding=1)
     
     def forward(self, x):
-        # --- Encoder Path ---
-        x = self.initial_conv(x)
-        x = x.permute(0, 2, 3, 1) # B, C, H, W -> B, H, W, C
-        
-        # Process through down-blocks
+        x = self.initial_conv(x); x = x.permute(0, 2, 3, 1)
         for block in self.down_blocks:
-            for attn in block.attentions:
-                x = attn(x)
-        
-        # *** CAPTURE THE SKIP CONNECTION ***
-        # This is the output of the encoder path at this resolution.
+            for attn in block.attentions: x = attn(x)
         skip_connection = x
-        
-        # --- Bottleneck ---
-        for attn in self.mid_block.attentions:
-            x = attn(x)
-            
-        # --- Decoder Path ---
+        for attn in self.mid_block.attentions: x = attn(x)
         for block in self.up_blocks:
-            # *** APPLY THE SKIP CONNECTION ***
-            # In a real U-Net, this would be torch.cat, but addition tests the
-            # long-range data flow perfectly without altering channel dimensions.
             x = x + skip_connection
-            
-            for attn in block.attentions:
-                x = attn(x)
-                
-        # --- Final Output ---
-        x = x.permute(0, 3, 1, 2) # B, H, W, C -> B, C, H, W
-        return self.final_conv(x)
+            for attn in block.attentions: x = attn(x)
+        x = x.permute(0, 3, 1, 2); return self.final_conv(x)
 
 # ==============================================================================
 # SECTION 5: MAIN TEST HARNESS (REVISED)
@@ -493,9 +577,9 @@ def main_():
     # This config now acts as the 'base' config for the alpha warmup estimator
     config_dict = {
         'lora_rules': [
-            {'name': "Mid_Block_QK_High_Prio", 'priority': 1.0, 'rank': 'auto_svd', 'alpha': 2.0, 'init_scheme': 'kaiming_cheald'},
-            {'name': "All_Other_Attention", 'priority': 0.5, 'rank': 4, 'alpha': 1.0},
-            {'name': "Mid_Block_FFN", 'priority': 0.8, 'rank': 32, 'target_modules': ['mid_block.attentions.1.ff.net.2']}
+            {'name': "Mid_Block_QK_High_Prio", 'priority': 1.0, 'rank': 'auto_svd', 'alpha': 2.0, 'init_scheme': 'kaiming_cheald', 'target_modules': ['mid_block.attentions.1.attn.to_q'],},
+            {'name': "All_Other_Attention", 'priority': 0.5, 'rank': 4, 'alpha': 1.0, 'init_scheme': 'kaiming_cheald', 'target_name_contains': ['attn'],},
+            {'name': "Mid_Block_FFN", 'priority': 0.8, 'rank': 32, 'target_modules': ['mid_block.attentions.1.ff.net.2'],}
         ]
     }
 
@@ -513,12 +597,17 @@ def main_():
         # --- 3. Load and resolve the configuration ---
         print("\n--- Resolving LoRA Configuration ---")
         final_uvit = uvit_builder()
-        loader = LoRAConfigLoader(config_path, svd_path, alpha_path)
-        all_module_names = [name for name, _ in final_uvit.named_modules()]
-        resolved_config = loader.get_resolved_config(all_module_names)
+        #loader = LoRAConfigLoader(config_path, None, svd_path, alpha_path)
+        loader = LoRAConfigLoader(
+        config_path=config_path, 
+        rank_estimates_path=svd_path, 
+        alpha_estimates_path=alpha_path
+        )
+        resolved_config = loader.get_resolved_config(final_uvit)
         
         # --- 4. Instantiate the final network ---
         print("\n--- Applying LoRA to Tester UViT ---")
+        print(f"the config: {resolved_config}")
         network = FlexibleLoRANetwork(final_uvit, resolved_config)
         print(network)
         
