@@ -250,16 +250,33 @@ class FlexibleLoRANetwork(nn.Module):
 
     def _create_and_apply_modules(self, root_module):
         lora_map = self.resolved_config.get("lora_map", {})
+        
         for name, module in root_module.named_modules():
             if name in lora_map:
+                
+                # --- THE FIX IS HERE ---
+                # Add a guard to ensure we only apply LoRA to supported layer types.
+                # This prevents us from trying to wrap containers like ModuleDict.
+                if not isinstance(module, (nn.Linear, nn.Conv2d)):
+                    # Optional: Add a print here for debugging if a rule matches
+                    # a container but doesn't hit a valid child layer.
+                    print(f"DEBUG: Rule matched name '{name}' but module type is {type(module).__name__}, skipping.")
+                    continue
+                # --- END OF FIX ---
+
                 lora_config = lora_map[name]
                 lora_name = f"lora_unet_{name.replace('.', '_')}"
+                
                 lora_module = FlexibleLoRAModule(module, **lora_config)
                 self.unet_loras[lora_name] = lora_module
+
+                # This part recursively finds the parent to perform the replacement
                 path_parts = name.split('.')
                 parent = root_module
                 for part in path_parts[:-1]:
                     parent = getattr(parent, part)
+                
+                # Replace the original module with our injected layer
                 setattr(parent, path_parts[-1], LoRAInjectedLayer(module, lora_module))
                 print(f"Applied LoRA to '{name}' with config: {lora_config}")
 
