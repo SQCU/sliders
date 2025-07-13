@@ -1,13 +1,47 @@
 # In a new file, e.g., 'architecture_search.py'
-
+#stubbed AF.
+from flexible_lora_system import run_experiment
 import copy
 
 class ArchitectureSearchController:
-    def __init__(self, base_config, evaluator, training_function):
-        self.base_config = base_config
-        self.evaluator = evaluator
-        self.training_function = training_function # This is your main() or training_loop()
+    def __init__(self, base_config):
+        self.current_config = base_config
         self.history = []
+
+    def search_step(self):
+        # 1. Evaluate baseline
+        baseline_score = run_experiment(self.current_config, "logs/baseline")
+        
+        # 2. Generate and evaluate neighbors
+        neighbor_configs = self._generate_neighbors(self.current_config)
+        results = []
+        for name, config in neighbor_configs.items():
+            score = run_experiment(config, f"logs/probe_{name}")
+            results.append({'name': name, 'score': score, 'config': config})
+            
+        # 3. Select the best neighbor
+        # (Lower loss is better)
+        best_neighbor = min(results, key=lambda x: x['score'])
+        
+        print(f"Best move is '{best_neighbor['name']}' with score {best_neighbor['score']:.4f}")
+        
+        # 4. Update the baseline for the next step
+        self.current_config = best_neighbor['config']
+        self.history.append(best_neighbor)
+
+    def _generate_neighbors(self, config):
+        """Creates small variations of the current config."""
+        neighbors = {}
+        # Example: Create a neighbor with slightly higher rank in attention layers
+        config_plus_rank = copy.deepcopy(config)
+        for rule in config_plus_rank['lora_rules']:
+            if 'attn' in rule['name']:
+                # This logic would be more robust, finding the actual rank key
+                # and incrementing it.
+                pass 
+        neighbors['attn_rank_plus_4'] = config_plus_rank
+        return neighbors
+
 
     def run_search(self, num_steps=10, k_best=2):
         current_baseline_config = copy.deepcopy(self.base_config)

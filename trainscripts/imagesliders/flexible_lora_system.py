@@ -559,6 +559,79 @@ class TesterUViT(nn.Module):
 import datetime
 import shutil # For easier cleanup
 
+# In flexible_lora_system.py
+def run_experiment(config_dict, log_dir="advlogs"):
+    """
+    Takes a config, runs the full pipeline, and returns a performance score.
+    This is our core evaluation engine for the search.
+    """
+    log_root = log_dir
+    run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_log_dir = os.path.join(log_root, f"test_run_{run_timestamp}")
+    os.makedirs(run_log_dir, exist_ok=True)
+    print(f"--- Created temporary log directory for this run: {run_log_dir} ---")
+
+    # Define paths for all artifacts within the unique run directory
+    config_path = os.path.join(run_log_dir, "test_config.yaml")
+    svd_path = os.path.join(run_log_dir, "svd_ranks.json")
+    alpha_path = os.path.join(run_log_dir, "alpha_ratios.json")
+    
+    with open(config_path, 'w') as f: yaml.dump(config_dict, f)
+    
+    try:
+        print("\n--- PHASE 1: SETUP AND MODEL CREATION ---")
+
+        # --- 2. Run implemented estimators to generate their outputs ---
+        # Note: We pass the constructor of the model, not an instance
+        uvit_builder = TesterUViT 
+        estimate_ranks_from_svd(uvit_builder(), save_path=svd_path)
+        warmup_and_estimate_alphas(uvit_builder, config_dict, save_path=alpha_path, epochs=2)
+        
+        # --- 3. Load and resolve the configuration ---
+        print("\n--- Resolving LoRA Configuration ---")
+        final_uvit = uvit_builder()
+        #loader = LoRAConfigLoader(config_path, None, svd_path, alpha_path)
+        loader = LoRAConfigLoader(
+        config_path=config_path, 
+        rank_estimates_path=svd_path, 
+        alpha_estimates_path=alpha_path
+        )
+        resolved_config = loader.get_resolved_config(final_uvit)
+        
+        # --- 4. Instantiate the final network ---
+        print("\n--- Applying LoRA to Tester UViT ---")
+        print(f"the config: {resolved_config}")
+        network = FlexibleLoRANetwork(final_uvit, resolved_config)
+        print(network)
+        
+        # --- 5. Run a minimal training loop to test interfaces ---
+        print("\n--- PHASE 2: TESTING TRAINING INTERFACES ---")
+        dummy_dataset = [torch.randn(1, 3, 16, 16), torch.randn(1, 3, 16, 16)]
+        optimizer = torch.optim.AdamW(network.prepare_optimizer_params(), lr=1e-4)
+        
+        print("Starting mini training loop for 200 steps...")
+        final_loss = 0.0
+        for i in range(200):
+            data = dummy_dataset[i % 2]
+            optimizer.zero_grad()
+            output = network(data)
+            loss = output.mean()
+            loss.backward()
+            optimizer.step()
+            if i % 10 == 0:
+                print(f"  Step {i+1}, Loss: {loss.item():.4f} - OK")
+            final_loss = loss.item()
+            
+        #print("\n--- TEST COMPLETE: ALL INTERFACES FUNCTIONAL ---")
+        
+    finally:
+        # --- 6. Clean up the entire run-specific log directory ---
+        #if os.path.exists(run_log_dir):
+        #    shutil.rmtree(run_log_dir)
+        #    print(f"\nCleaned up temporary log directory: {run_log_dir}")
+        print(f"huh?")
+    return final_loss
+
 def main_():
     """Main function to run an end-to-end test of the flexible LoRA system."""
 
