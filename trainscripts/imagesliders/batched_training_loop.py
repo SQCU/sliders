@@ -122,6 +122,7 @@ def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     ).long()
 
     # 1 ~ 49 からランダム timesteps_to
+    #slice indexing only works for single-item training; we must use exact index for batched training
     #nl_timestep = noise_scheduler.timesteps[timesteps_to:timesteps_to+1]
     nl_timestep = noise_scheduler.timesteps[timesteps_to]
     noisy_latents = noise_scheduler.add_noise(latents, noise, nl_timestep)
