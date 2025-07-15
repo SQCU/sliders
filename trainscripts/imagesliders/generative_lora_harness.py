@@ -11,11 +11,11 @@ import yaml
 import os
 from PIL import Image, ImageDraw
 import numpy as np
+from tqdm import tqdm
 
 # We assume the previously "locked-in" components are available.
 # For this script, we'll redefine them for clarity.
 from .flexible_lora_system import FlexibleLoRANetwork, LoRAConfigLoader, TesterUViT
-from .architecture_search_controller import create_search_space_yaml
 #new project imports
 #uv pip install torchmetrics[image]
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
@@ -244,6 +244,7 @@ class GenerativeEvaluator:
         performance_score = lpips_score + fid_score * 0.1
         
         print(f"Evaluation Complete: LPIPS={lpips_score:.4f}, FID={fid_score:.4f} -> Final Score={performance_score:.4f}")
+        #return type of dict
         return performance_score.item()
 
 # ==============================================================================
@@ -330,19 +331,21 @@ def run_generative_experiment(config_dict,
     print(f"  Final Score (Trained):  {final_score:.4f}")
     print(f"  Learning Delta:         {learning_delta:.4f} (The key metric!)")
     
-    return {
+    # At the very end, instead of just returning the dictionary...
+    results_dict = {
         "initial_score": initial_score,
         "final_score": final_score,
         "learning_delta": learning_delta,
         "trajectory": evaluation_trajectory
     }
 
+    return network, results_dict
+
 
 # --- Example of how the search controller would use this ---
 if __name__ == "__main__":
     # The search controller would be nearly identical to the previous version,
     # but its main call would be to `run_generative_experiment`.
-    from tqdm import tqdm
     
     print("\n--- Example single run of the new Generative Harness ---")
     
@@ -356,6 +359,7 @@ if __name__ == "__main__":
     
     # Run the experiment.
     # We set freeze_base_model=True to run the "bold/stupid" test.
-    score = run_generative_experiment(config_dict, freeze_base_model=True, num_epochs=20, eval_every_n_epochs=6)
+    results = run_generative_experiment(config_dict, freeze_base_model=True, num_epochs=20, eval_every_n_epochs=6)
     
-    print(f"\nExperiment finished with final performance score: {score:.4f} (lower is better)")
+    # Access the specific metric you want to print from the dictionary
+    print(f"\nExperiment finished with final performance score (delta): {results['learning_delta']:.4f}")

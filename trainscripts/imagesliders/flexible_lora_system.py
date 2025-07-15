@@ -20,6 +20,28 @@ from tqdm import tqdm
 # (Formerly lora_initializers.py and lora_estimators.py)
 # ==============================================================================
 
+def is_valid_artifact(path: str) -> bool:
+    """
+    Checks if a given path points to a valid, non-empty JSON artifact file.
+    """
+    # 1. Check for basic existence
+    if not os.path.exists(path):
+        return False
+    
+    # 2. Check if the file is empty
+    if os.path.getsize(path) == 0:
+        return False
+
+    # 3. Check for valid JSON content
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        # Ensure the loaded data is a non-empty dictionary or list
+        return bool(data)
+    except (json.JSONDecodeError, IOError):
+        # File is corrupted, unreadable, or not valid JSON
+        return False
+
 # A simple dictionary to cache computed scaling factors for kaiming_cheald.
 _kaiming_cheald_cache = {}
 
@@ -153,7 +175,7 @@ def estimate_ranks_from_svd(unet, cutoff=0.3, save_path=None):
     return estimated_ranks
 
 
-def warmup_and_estimate_alphas(unet_builder, base_lora_config, epochs=75, save_path=None):
+def warmup_and_estimate_alphas(unet_builder, base_lora_config, training_harness_fn, gen_exp_kwargs={}, save_path=None):
     """
     (IMPLEMENTED) Performs a short training run to find optimal alpha ratios per layer.
     
@@ -161,8 +183,10 @@ def warmup_and_estimate_alphas(unet_builder, base_lora_config, epochs=75, save_p
     then trains it on dummy data. The ratio of the final learned alpha to its
     initial value provides an "importance score" for each layer, effectively
     performing per-layer learning rate discovery.
+    (UPGRADED) Performs a short training run using the REAL training harness
+    to find optimal alpha ratios per layer.
     """
-    print(f"--- [Real] Running Online Alpha Warmup for {epochs} epochs... ---")
+    print(f"--- [Real] Running Online Alpha Warmup using the provided training harness... ---")
     
     # --- 1. Setup a temporary training environment ---
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -171,78 +195,113 @@ def warmup_and_estimate_alphas(unet_builder, base_lora_config, epochs=75, save_p
     alpha_train_config = base_lora_config.copy()
     for rule in alpha_train_config.get('lora_rules', []):
         rule['train_alpha'] = True
-        
-    # Build the network for alpha training
-    temp_uvit = unet_builder().to(device)
-    loader = LoRAConfigLoader(config_dict=alpha_train_config)
-    resolved_config = loader.get_resolved_config(temp_uvit)
-    network = FlexibleLoRANetwork(temp_uvit, resolved_config).to(device)
-
-    # Use the special optimizer setup for training alphas
-    optimizer = torch.optim.AdamW(network.prepare_optimizer_params(), lr=1e-4)
-    dummy_dataset = [torch.randn(2, 3, 16, 16, device=device) for _ in range(4)]
     
-    # --- 2. The Alpha Warmup Training Loop ---
-    for epoch in tqdm(range(epochs), desc="Warming up Alphas"):
-        for data in dummy_dataset:
-            optimizer.zero_grad()
-            output = network(data)
-            loss = output.mean() # Simple dummy loss
-            loss.backward()
-            optimizer.step()
-            
-    # --- 3. Extract and compute the importance ratios ---
+    # --- 2. Run the REAL training harness ---
+    # We pass it our special config. We don't care about the performance score it returns,
+    # we only want the network object it produces after training.
+    print("  > Launching training harness for alpha warmup...")
+    trained_network, _ = training_harness_fn(alpha_train_config, **gen_exp_kwargs,) #num_epochs=5, eval_every_n_epochs=999)
+
+    # --- 3. Extract alpha ratios from the returned, trained network ---
+    print("  > Extracting learned alpha ratios from trained network...")
     alpha_ratios = {}
+
+    # Build the network for alpha training
+    temp_uvit_for_config = unet_builder().to(device)
+    loader = LoRAConfigLoader(config_dict=alpha_train_config)
+    resolved_config = loader.get_resolved_config(temp_uvit_for_config)
     initial_alphas = {
-        # The module name is the key we want for our final output file
-        module_name: config['alpha']
+        name: config['alpha'] for name, config in resolved_config['lora_map'].items()
+    }
+    lora_name_to_module_name = {
+        config['lora_name']: module_name
         for module_name, config in resolved_config['lora_map'].items()
     }
-    
-    # --- LOGGING BLOCK 1: VERIFY INITIAL_ALPHAS DICTIONARY ---
-    print("\n--- Alpha Estimator Diagnostics ---")
-    print(f"DEBUG: 'initial_alphas' dict created with {len(initial_alphas)} entries.")
-    if len(initial_alphas) > 0:
-        print(f"  > Sample initial_alphas keys: {list(initial_alphas.keys())[:5]}")
-    else:
-        print("  > CRITICAL: 'initial_alphas' dictionary is EMPTY. Check LoRAConfigLoader.")
-    
 
-    trained_state_dict = network.state_dict()
-    # --- LOGGING BLOCK 2: VERIFY STATE_DICT KEYS ---
-    # Find and print all keys in the state_dict that are actually alpha parameters.
-    # This will show us the exact naming convention we need to match.
-    actual_alpha_keys = [k for k in trained_state_dict.keys() if k.endswith('.alpha')]
-    print(f"DEBUG: Found {len(actual_alpha_keys)} '.alpha' parameters in the trained state_dict.")
-    if len(actual_alpha_keys) > 0:
-        print(f"  > Sample actual alpha keys from state_dict: {actual_alpha_keys[:5]}")
-    else:
-        print("  > CRITICAL: No '.alpha' parameters found in state_dict. Check if 'train_alpha=True' is working.")
+    trained_state_dict = trained_network.state_dict()
+    for key, final_alpha_tensor in trained_state_dict.items():
+        # We are only interested in our trainable alpha parameters
+        if not key.endswith('.alpha'):
+            continue
 
-    for name, initial_alpha in initial_alphas.items():
-        # The key in the state dict will be like 'unet_loras.lora_unet_...alpha'
-        lora_name = f"lora_unet_{name.replace('.', '_')}"
-        alpha_key = f"unet_loras.{lora_name}.alpha"
+        # Parse the module name from the state_dict key
+        # key format: 'unet_loras.lora_unet_down_blocks_0_..._to_q.alpha'
+        try:
+            lora_name = key.split('.')[1]
+        except IndexError as e:
+            print(f"indexerror? at {key}, {key.split('.')}[1]:{e}")
+            continue # Skip malformed keys
         
-        if alpha_key in trained_state_dict:
-            final_alpha = trained_state_dict[alpha_key].item()
-            # The ratio tells us how much the layer's alpha wanted to change
-            ratio = final_alpha / (initial_alpha + 1e-9)
-            alpha_ratios[name] = ratio
-        else:
-            # If a key we expect is missing, print a warning. This is our main debugging clue.
-            print(f"  > WARN: Expected key '{alpha_key}' not found in state_dict for module '{name}'.")
+        # Use the reverse map to find the original module name
+        if lora_name in lora_name_to_module_name:
+            module_name = lora_name_to_module_name[lora_name]
             
-    # Juicy Log: Persist the learned ratios for reproducibility and to skip this phase.
+            # Now, safely look up the initial alpha using the correct key
+            initial_alpha = initial_alphas.get(module_name)
+            
+            if initial_alpha is not None:
+                final_alpha = final_alpha_tensor.item()
+                ratio = final_alpha / (initial_alpha + 1e-9)
+                alpha_ratios[module_name] = ratio # Use the original module name as the key
+            else:
+                 print(f"  > LOGIC WARN: Mapped '{lora_name}' to '{module_name}' but couldn't find its initial alpha.")
+        else:
+             print(f"  > WARN: Found trained alpha for lora_name '{lora_name}' but couldn't map it back to an original module.")
+
+    # Persist the (now correctly populated) ratios
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, 'w') as f:
-            json.dump(alpha_ratios, f, indent=2)
-        print(f"  > Saved Alpha Warmup estimates to {save_path}")
+        # Ensure we have data to write
+        if not alpha_ratios:
+            print("  > CRITICAL WARN: Alpha ratio dictionary is empty. Nothing will be saved.")
+        else:
+            with open(save_path, 'w') as f: json.dump(alpha_ratios, f, indent=2)
+            print(f"  > Saved {len(alpha_ratios)} Alpha Warmup estimates to {save_path}")
 
-    del network, optimizer, temp_uvit
+    del trained_network, temp_uvit_for_config
     print("--- Alpha Warmup Complete ---")
     return alpha_ratios
+
+def run_all_estimators(
+    unet_builder,
+    base_config_for_warmup,
+    training_harness_fn, # <-- Accepts the REAL training function
+    artifacts_dir="search_artifacts",
+    force_rerun=False,
+    gen_exp_kwargs={},
+):
+    """
+    A single, clean entry point to run all pre-computation estimators.
+    This function is a pure utility. It takes configs and returns paths to artifacts.
+    """
+    print("--- Running Pre-computation Estimators ---")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    
+    svd_path = os.path.join(artifacts_dir, "svd_ranks.json")
+    alpha_path = os.path.join(artifacts_dir, "alpha_ratios.json")
+    
+     # --- THE FIX: Use the new, robust validation function ---
+    if not is_valid_artifact(svd_path) or force_rerun:
+        print(f"SVD artifact at '{svd_path}' is invalid or missing. Running estimator...")
+        estimate_ranks_from_svd(unet_builder(), save_path=svd_path)
+    else:
+        print(f"Found existing SVD estimates at {svd_path}, skipping.")
+        
+    if not is_valid_artifact(alpha_path) or force_rerun:
+        # Call the now-upgraded alpha warmer
+        print(f"Alpha artifact at '{alpha_path}' is invalid or missing. Running estimator...")
+        warmup_and_estimate_alphas(
+            unet_builder, 
+            base_config_for_warmup,
+            training_harness_fn, # <-- Pass the real harness through
+            save_path=alpha_path,
+            gen_exp_kwargs=gen_exp_kwargs,
+        )
+    else:
+        print(f"Found existing Alpha estimates at {alpha_path}, skipping.")
+        
+    print("--- Estimators Complete ---")
+    return svd_path, alpha_path
 
 # ==============================================================================
 # SECTION 2: CONFIGURATION LOADER (Modified to accept dict)
@@ -561,7 +620,7 @@ import datetime
 import shutil # For easier cleanup
 
 # In flexible_lora_system.py
-def run_experiment(config_dict, log_dir="advlogs"):
+def _internal_consistency_check(config_dict, log_dir="advlogs"):
     """
     Takes a config, runs the full pipeline, and returns a performance score.
     This is our core evaluation engine for the search.
