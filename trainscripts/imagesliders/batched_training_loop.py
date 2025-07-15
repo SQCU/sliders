@@ -15,6 +15,9 @@ from PIL import Image
 from pathlib import Path
 import time
 from torch.utils.data import Dataset, DataLoader
+import torch._inductor.codecache as codecache
+import threading
+
 from typing import Tuple, Union, Literal, List, Dict, Any
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
@@ -45,13 +48,6 @@ DIFFUSERS_CACHE_DIR = None # if you want to change the cache dir, change this
 # The default `Path.rename` fails if the destination file exists, which can
 # happen in multi-threaded/multi-process scenarios. `os.replace` is the
 # correct atomic "overwrite" operation.
-
-
-import torch._inductor.codecache as codecache
-import os
-import threading
-from pathlib import Path
-from typing import Union
 
 # Copy the original function's signature and body
 def fixed_write_atomic(
@@ -88,12 +84,13 @@ def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     Handles device/dtype placement, batch preparation, forward pass, and loss calculation.
     """
     # --- 1. Unpack Environment and Config ---
-    unet = environment["unet"]
-    noise_scheduler = environment["noise_scheduler"]
-    network = environment["network"]
     device = environment["device"]
     weight_dtype = environment["weight_dtype"]
     config = environment["config"]
+    unet = environment["unet"]
+    noise_scheduler = environment["noise_scheduler"].to(device)
+    network = environment["network"]
+
     # The generator from the environment is now used for noise and timesteps
     generator = environment.get("generator")
 
@@ -103,6 +100,7 @@ def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     scales = batch['scales'].to(device, dtype=weight_dtype)
     noise = batch['noise'].to(device, dtype=torch.float32)
     add_time_ids = batch['add_time_ids'].to(device, dtype=torch.float32)
+    timesteps_to = batch['timesteps_to'].to(device)
 
     text_embeddings_cfg = batch['cfg_text_embeddings'].to(device, dtype=weight_dtype)
     pooled_embeds_cfg = batch['cfg_pooled_embeds'].to(device, dtype=weight_dtype)
@@ -113,13 +111,14 @@ def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     
     # REFERENCE TIMESTEP CODE
     noise_scheduler.set_timesteps(config.train.max_denoising_steps, device=device)
-    timesteps_to = torch.randint(
-        1, 
-        config.train.max_denoising_steps, 
-        (latents.shape[0],),  # The shape MUST match the latents batch size
-        device=device, 
-        generator=generator
-    ).long()
+    #generating inside of train step does some kind of graph break probably.
+    #timesteps_to = torch.randint(
+    #    1, 
+    #    config.train.max_denoising_steps, 
+    #    (latents.shape[0],),  # The shape MUST match the latents batch size
+    #    device=device, 
+    #    generator=generator
+    #).long()
 
     # 1 ~ 49 からランダム timesteps_to
     #slice indexing only works for single-item training; we must use exact index for batched training
@@ -130,10 +129,11 @@ def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     #this unit conversion is absolutely mandatory!
     # STILL REFERENCE CODE:
     noise_scheduler.set_timesteps(1000)
+    noise_scheduler = noise_scheduler.to(device)
     normalized_tsteps = torch.round(timesteps_to * 1000 / config.train.max_denoising_steps).long()
     unet_timesteps = noise_scheduler.timesteps[
-                normalized_tsteps.to("cpu")
-            ]
+        normalized_tsteps
+    ]
     unet_timesteps = unet_timesteps.to(device)
     # timesteps_to has shape [B]. Get scheduler timesteps and duplicate to [B*2]
     unet_timesteps_cfg = torch.cat([unet_timesteps, unet_timesteps], dim=0)
@@ -156,7 +156,6 @@ def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     scales_cfg = torch.cat([scales, scales])
 
 
-
     # --- 5. Forward Pass ---
     # Set LoRA scales for the full CFG batch
     batched_scales_cfg = torch.cat([scales, scales], dim=0)
@@ -169,9 +168,9 @@ def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     }
     
     predicted_noise = unet(
-        latents_cfg.to(unet.dtype),
+        latents_cfg.to(weight_dtype),
         unet_timesteps_cfg,
-        encoder_hidden_states=text_embeddings_cfg.to(unet.dtype),
+        encoder_hidden_states=text_embeddings_cfg.to(weight_dtype),
         added_cond_kwargs=added_cond_kwargs
     ).sample
 
@@ -229,7 +228,7 @@ def training_loop(environment: dict, static_batches: list,):
     while global_step < total_sample_steps:
         # Determine if this is a profiling step    
         if gradient_noise_estimator is not None:
-            gradient_noise_estimator.pre_accumulate_step(global_step)
+            gradient_noise_estimator.pre_accumulate_step()
             is_profiling_step = gradient_noise_estimator is not None and gradient_noise_estimator.is_profiling
         else:
             is_profiling_step = False
@@ -255,7 +254,7 @@ def training_loop(environment: dict, static_batches: list,):
                 #NON-GRADIENTSTATS ACCUMULATION CONTROL FLOW
                 optimizer.zero_grad()
                 for _ in range(gradient_accumulation_steps):
-                    micro_batch = static_batches[global_step % len(static_batches)] 
+                    micro_batch = static_batches[global_step % len(static_batches)]
                     #micro_batch = rectify_batch_fn(micro_batch, device, weight_dtype)
                     loss = train_step(micro_batch, **environment).to(weight_dtype)
                     # Scale loss for accumulation
@@ -300,7 +299,7 @@ def training_loop(environment: dict, static_batches: list,):
             if gradient_noise_estimator is not None and gradient_noise_estimator.ema_zoomy_b_crit is not None:
                 # Print on the same line as tqdm progress bar
                 progress_bar.set_postfix_str({"Loss;avg": f"{avg_loss:.3f};{sum(losses)/len(losses):.3f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}", "B_crit": f"{gradient_noise_estimator.ema_zoomy_b_crit:.2f}","Norm": f"{total_norm:.2f}",})
-    
+    environment["losses"] = losses
     return environment
 
 
@@ -334,10 +333,6 @@ def main():
         print(f"Configured Batch Size: {batch_size}", file=sys.stderr)
         print(f"Configured Iterations: {iterations}", file=sys.stderr)
         print(f"Expected Total Samples (Batch Size * Iterations): {expected_total_samples}", file=sys.stderr)
-
-        # OBSOLETION NOTICE! NO MORE PREPARE_CACHED_BATCHES!
-        # Prepare cached batches (image latents and text embeddings)
-        #static_batches = prepare_cached_batches(config, environment)
 
         # --- THE NEW, ROBUST DATA PIPELINE INTEGRATION ---
         # Stage 1: Create the pure-python, reproducible training schedule.

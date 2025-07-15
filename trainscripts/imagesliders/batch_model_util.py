@@ -135,3 +135,39 @@ def load_diffusers_model_xl(
     )
     vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae")
     return tokenizers, text_encoders, unet, vae
+
+#gemini wanted this to be trainscripts/imagesliders/patcher.py
+import types
+
+def _to_method(self, *args, **kwargs):
+    """
+    The method that will be attached to the scheduler instance.
+    It iterates over all attributes and moves tensors to the specified device.
+    """
+    # Iterate through all attributes of the object
+    for attr_name in dir(self):
+        # Skip private/special methods and the 'to' method itself to avoid recursion
+        if attr_name.startswith('_') or attr_name == 'to':
+            continue
+
+        attr_value = getattr(self, attr_name)
+
+        # If the attribute is a tensor, move it
+        if isinstance(attr_value, torch.Tensor):
+            new_tensor = attr_value.to(*args, **kwargs)
+            setattr(self, attr_name, new_tensor)
+            
+    # Return self to allow for chaining, like nn.Module.to()
+    return self
+
+def add_to_method_to_instance(instance):
+    """
+    Monkey-patches a .to() method onto a single object instance.
+    This is safer than patching the entire class.
+
+    Args:
+        instance: The object instance (e.g., a DDIMScheduler) to patch.
+    """
+    # Use types.MethodType to bind our function to the instance as a method
+    instance.to = types.MethodType(_to_method, instance)
+    return instance

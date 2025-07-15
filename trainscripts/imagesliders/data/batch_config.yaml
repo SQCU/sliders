@@ -25,9 +25,9 @@ train:
   optimizer: "Adam8bit"
   noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
   max_denoising_steps: 50
-  resolution: [640, 640]  #read from here for some reason
-  iterations: 4000
-  gradient_accumulation_steps: 8
+  resolution: [512, 512]  #read from here for some reason
+  iterations: 500
+  gradient_accumulation_steps: 3
   batch_size: 4 #now must be assigned here
   bounds_test_vae_batch_size: true
   vae_encoding_batch_size: 20
@@ -39,7 +39,7 @@ train:
   max_grad_norm: 1.0 # Add this! A value > 0 enables it. 1.0 is a common default.
   #however gradient noise statistics suggest that might be too high?
 save:
-  name: "molKM_IL_imageslider_b_cfg" #used!
+  name: "molKM_IL_imageslider_c_rfctr" #used!
   path: "./models"
   per_steps: 20
   precision: "bfloat16"

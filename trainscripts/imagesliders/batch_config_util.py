@@ -37,16 +37,16 @@ def deep_merge_attrdict(d1, d2):
             d1[k] = v
     return d1
 
-def config_io():
+def config_io(config=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--batchtrainconfig", "--bconfig", "-c",
                         type=str,
                         help="Path to the batch training config file.",
                         default="trainscripts/imagesliders/data/batch_config.yaml")
     args = parser.parse_args()
-
-    print(f"Loading batch config from: {args.batchtrainconfig}")
-    config = AttrDict(load_config_from_yaml(args.batchtrainconfig))
+    if config is None:
+        print(f"Loading batch config from: {args.batchtrainconfig}")
+        config = AttrDict(load_config_from_yaml(args.batchtrainconfig))
 
     if 'dataset' in config and 'prompts_file_path' in config.dataset:
         prompts_file_path = "trainscripts/imagesliders/data/prompts-xl-dilora-bracket.yaml"
@@ -125,6 +125,7 @@ def envsetup(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = parse_precision(config.train.precision)
     save_dtype = parse_precision(config.save.precision)
+    from .batch_model_util import _to_method, add_to_method_to_instance
     
     # Load models from checkpoint
     vae, unet, tokenizers, text_encoders = load_models(config, device, weight_dtype)
@@ -140,6 +141,8 @@ def envsetup(config):
     optimizer = get_optimizer(optimizer_name)
 
     noise_scheduler = create_noise_scheduler(config.train.noise_scheduler) # Initialize directly for single file
+    noise_scheduler = add_to_method_to_instance(noise_scheduler)
+    noise_scheduler = noise_scheduler.to(device)
     environment = {
         "unet": unet,
         "vae": vae,

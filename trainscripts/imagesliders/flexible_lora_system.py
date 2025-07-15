@@ -540,7 +540,7 @@ class FlexibleLoRANetwork(nn.Module):
                 
                 # Replace the original module with our injected layer
                 setattr(parent, path_parts[-1], LoRAInjectedLayer(module, lora_module))
-                print(f"Applied LoRA to '{name}' with config: {lora_config}")
+                #print(f"Applied LoRA to '{name}' with config: {lora_config}")
 
     def prepare_optimizer_params(self):
         params = []
@@ -561,7 +561,22 @@ class FlexibleLoRANetwork(nn.Module):
         """
         for lora_module in self.unet_loras.values():
             lora_module.multiplier = scales
-            
+
+    def __enter__(self):
+        """Called when entering the 'with' block. Does nothing special."""
+        #return self # Often useful to return self
+        pass
+
+    def __exit__(self, exc_type, exc_value, tb):
+        """
+        Called when exiting the 'with' block.
+        This is crucial for resetting the LoRA state.
+        """
+        # Set all multipliers to 0.0 to ensure LoRA is "off" outside this block.
+        for lora_module in self.unet_loras.values():
+            lora_module.multiplier = torch.tensor(0.0)
+    
+    # --- END OF THE FIX ---
     def forward(self, *args, **kwargs):
         return self.unet(*args, **kwargs)
 

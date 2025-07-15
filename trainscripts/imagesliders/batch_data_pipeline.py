@@ -314,6 +314,14 @@ def materialize_static_batches(schedule_dict: Dict[str, Any], environment: Dict[
             noise_generator.manual_seed(item['noise_seed'])
             noise = torch.randn(latent_data['latent'].shape, generator=noise_generator)
             batch_tensors['noise'].append(noise)
+
+            timesteps_to = torch.randint(
+                1,
+                config['train']['max_denoising_steps'],
+                (1,), # Match the batch size
+                device='cpu' # Generate on CPU, it will be moved to GPU later
+            ).long(),
+            batch_tensors['timesteps_to'].append(timesteps_to)
             
             #timestep = torch.randint(1, config['train']['max_denoising_steps'], (1,)).long()
             #batch_tensors['timesteps_to'].append(timestep)
@@ -355,7 +363,12 @@ def materialize_static_batches(schedule_dict: Dict[str, Any], environment: Dict[
             "pair_indices": torch.tensor(batch_tensors['pair_indices'], dtype=torch.long),
             "is_low_cases": torch.tensor(batch_tensors['is_low_cases'], dtype=torch.bool),
             "noise": torch.stack(batch_tensors['noise']),
-            #"timesteps_to": torch.cat(batch_tensors['timesteps_to']),
+            "timesteps_to": torch.randint(
+                1,
+                config['train']['max_denoising_steps'],
+                (len(batch_tensors['latents']),), # Match the batch size
+                device='cpu' # Generate on CPU, it will be moved to GPU later
+            ).long(),
             "cfg_text_embeddings": torch.cat(batch_tensors['cfg_text_embeddings']),
             "cfg_pooled_embeds": torch.cat(batch_tensors['cfg_pooled_embeds']),
             "add_time_ids": torch.cat(batch_tensors['add_time_ids']),

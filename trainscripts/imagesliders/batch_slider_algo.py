@@ -54,9 +54,9 @@ class GradientNoiseEstimator:
                 norm_sq += torch.sum(grad.pow(2))
         return norm_sq
 
-    def pre_accumulate_step(self, global_step):
+    def pre_accumulate_step(self):
         """Call this before starting a gradient accumulation loop."""
-        self._step_count = global_step
+        self._step_count +=1
         self.is_profiling = (self._step_count % self.profile_freq == 0)
         
         if self.is_profiling:
