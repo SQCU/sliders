@@ -51,7 +51,15 @@ def init_kaiming_cheald_(lora_down: nn.Module, lora_up: nn.Module, verbosity=1):
     SCALED DOWN relative to a full-rank matrix, appropriate for a low-rank update.
     This helps normalize the initial impact of LoRA modules across different ranks and shapes.
     """
-    out_features, in_features = lora_up.weight.shape[0], lora_down.weight.shape[1]
+    if isinstance(lora_up, nn.Linear):
+        out_features, rank = lora_up.weight.shape
+        in_features = lora_down.weight.shape[1]
+    elif isinstance(lora_up, nn.Conv2d):
+        out_features, rank, _, _ = lora_up.weight.shape
+        in_features = lora_down.weight.shape[1]
+    else: # Fallback for unknown types
+        out_features, rank, in_features = 0, 0, 0
+
     rank = lora_down.weight.shape[0]
     cache_key = f"{in_features}-{out_features}-{rank}"
 
@@ -63,7 +71,12 @@ def init_kaiming_cheald_(lora_down: nn.Module, lora_up: nn.Module, verbosity=1):
     else:
         if verbosity:
             print(f"  [Kaiming-Cheald] Calibrating for shape ({out_features}, {in_features}) rank {rank}...")
-        W_temp = torch.empty(out_features, in_features)
+        if isinstance(lora_up, nn.Conv2d):
+            # For conv, the reference is also a conv weight
+            W_temp = torch.empty(out_features, in_features, lora_down.kernel_size[0], lora_down.kernel_size[1])
+        else: # Default to Linear
+            W_temp = torch.empty(out_features, in_features)
+
         nn.init.kaiming_uniform_(W_temp, a=math.sqrt(5))
         full_rank_norm = torch.norm(W_temp)
 
@@ -78,7 +91,16 @@ def init_kaiming_cheald_(lora_down: nn.Module, lora_up: nn.Module, verbosity=1):
 
         # 4. Get the current norm of the ghost matrix
         with torch.no_grad():
-            current_norm = torch.norm(lora_up.weight @ lora_down.weight)
+            if isinstance(lora_down, nn.Conv2d):
+                # lora_down: (rank, in_c, kH, kW) -> (rank, in_c * kH * kW)
+                down_matrix = lora_down.weight.view(rank, -1)
+                # lora_up: (out_c, rank, 1, 1) -> (out_c, rank)
+                up_matrix = lora_up.weight.view(out_features, rank)
+                ghost_matrix = up_matrix @ down_matrix
+            else: # Default case for nn.Linear, which is already 2D
+                ghost_matrix = lora_up.weight @ lora_down.weight
+            
+            current_norm = torch.norm(ghost_matrix)
         if verbosity:
             # --- NEW DIAGNOSTIC BLOCK 2: PRINT INTERMEDIATE VALUES ---
             # This is where we'll find the NaN. We expect to see two normal floats.
@@ -213,40 +235,34 @@ def warmup_and_estimate_alphas(unet_builder, base_lora_config, training_harness_
     initial_alphas = {
         name: config['alpha'] for name, config in resolved_config['lora_map'].items()
     }
-    lora_name_to_module_name = {
-        config['lora_name']: module_name
-        for module_name, config in resolved_config['lora_map'].items()
-    }
+    #lora_name_to_module_name = {
+    #    config['lora_name']: module_name
+    #    for module_name, config in resolved_config['lora_map'].items()
+    #}
 
     trained_state_dict = trained_network.state_dict()
     for key, final_alpha_tensor in trained_state_dict.items():
         # We are only interested in our trainable alpha parameters
-        if not key.endswith('.alpha'):
+        suffix_to_match = '.lora_module.alpha'
+        if not key.endswith(suffix_to_match):
             continue
 
         # Parse the module name from the state_dict key
         # key format: 'unet_loras.lora_unet_down_blocks_0_..._to_q.alpha'
-        try:
-            lora_name = key.split('.')[1]
-        except IndexError as e:
-            print(f"indexerror? at {key}, {key.split('.')}[1]:{e}")
-            continue # Skip malformed keys
+        # Reconstruct the original module name by removing the known suffix.
+        # 'down_blocks.0...q.lora_module.alpha' -> 'down_blocks.0...q'
+        module_name = key.removesuffix(suffix_to_match) 
+
+        # Now, `module_name` is guaranteed to be the correct key for lookup
+        initial_alpha = initial_alphas.get(module_name)
         
-        # Use the reverse map to find the original module name
-        if lora_name in lora_name_to_module_name:
-            module_name = lora_name_to_module_name[lora_name]
-            
-            # Now, safely look up the initial alpha using the correct key
-            initial_alpha = initial_alphas.get(module_name)
-            
-            if initial_alpha is not None:
-                final_alpha = final_alpha_tensor.item()
-                ratio = final_alpha / (initial_alpha + 1e-9)
-                alpha_ratios[module_name] = ratio # Use the original module name as the key
-            else:
-                 print(f"  > LOGIC WARN: Mapped '{lora_name}' to '{module_name}' but couldn't find its initial alpha.")
+        if initial_alpha is not None:
+            final_alpha = final_alpha_tensor.item()
+            ratio = final_alpha / (initial_alpha + 1e-9)
+            alpha_ratios[module_name] = ratio
         else:
-             print(f"  > WARN: Found trained alpha for lora_name '{lora_name}' but couldn't map it back to an original module.")
+            # This warning should ideally never appear now
+            print(f"  > LOGIC WARN: Correctly parsed '{module_name}' but couldn't find its initial alpha.")
 
     # Persist the (now correctly populated) ratios
     if save_path:

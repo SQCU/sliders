@@ -8,13 +8,13 @@ model_config:
   #refpath: "trainscripts/imagesliders/data/config-xl-batchtest.yaml"
 pretrained_model:
   #name_or_path: "stabilityai/stable-diffusion-xl-base-1.0" # you can also use .ckpt or .safetensors models
-  name_or_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_v3NoobaiXL.safetensors"
+  name_or_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
   v2: false # true if model is v2.x
   v_pred: false # true if model uses v-prediction
 network:
   type: "c3lier" # or "c3lier" or "lierla"
-  rank: 32
-  alpha: 32
+  rank: 64
+  alpha: 16
   training_method: "noxattn"
 train:
   seed: 42  #default training seed init
@@ -25,10 +25,10 @@ train:
   optimizer: "Adam8bit"
   noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
   max_denoising_steps: 50
-  resolution: [592, 592]  #read from here for some reason
-  iterations: 400
-  gradient_accumulation_steps: 4
-  batch_size: 2 #now must be assigned here
+  resolution: [640, 640]  #read from here for some reason
+  iterations: 4000
+  gradient_accumulation_steps: 8
+  batch_size: 4 #now must be assigned here
   bounds_test_vae_batch_size: true
   vae_encoding_batch_size: 20
   invalidate_latent_cache: false
@@ -39,7 +39,7 @@ train:
   max_grad_norm: 1.0 # Add this! A value > 0 enables it. 1.0 is a common default.
   #however gradient noise statistics suggest that might be too high?
 save:
-  name: "molKM_IL_imageslider_b" #used!
+  name: "molKM_IL_imageslider_b_cfg" #used!
   path: "./models"
   per_steps: 20
   precision: "bfloat16"
@@ -49,7 +49,7 @@ logging:
 other:
   use_xformers: false
   use_pytorch_SDPA: true
-  torch_compile: false
+  torch_compile: true
   lycorisize: false
   gradient_checkpointing: true
 

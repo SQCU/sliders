@@ -211,6 +211,9 @@ class GenerativeEvaluator:
         self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg').to(device)
         # NOTE: Using a smaller feature size for FID for speed in this test harness.
         self.fid = FrechetInceptionDistance(feature=64).to(device)
+        self.last_lpips_score = 0.0
+        self.last_fid_score = 0.0
+
         
     @torch.no_grad()
     def evaluate(self, model_to_test, num_samples=64, num_inference_steps=50):
@@ -232,11 +235,13 @@ class GenerativeEvaluator:
 
         # --- Calculate LPIPS ---
         lpips_score = self.lpips(generated_images, gt_images)
+        self.last_lpips_score = lpips_score 
 
         # --- THE FIX: Populate BOTH real and fake features for FID on every call ---
         self.fid.update((gt_images * 255).to(torch.uint8), real=True)
         self.fid.update((generated_images * 255).to(torch.uint8), real=False)
         fid_score = self.fid.compute()
+        self.last_fid_score = fid_score
         
         # Now, reset is safe because we will repopulate both on the next call.
         self.fid.reset() 
@@ -256,7 +261,8 @@ def run_generative_experiment(config_dict,
     num_epochs = 5,
     eval_every_n_epochs=1, # <-- New parameter to control interim evaluation
     eval_num_samples=32,    # <-- Use fewer samples for faster interim evals
-    log_dir="gen_logs"):
+    log_dir="gen_logs",
+    eval_kwargs={}):
     """
     The new experiment runner, focused on the generative task.
     This replaces the simple `run_experiment` and becomes our new "fitness function".
@@ -320,8 +326,6 @@ def run_generative_experiment(config_dict,
 
         # ===================================
 
-    # --- 4. Evaluate the trained model ---
-    # Pass the scheduler to the evaluator
     # --- 4. Finalize and Return Rich Results ---
     final_score = evaluation_trajectory[-1] if evaluation_trajectory else initial_score
     learning_delta = final_score - initial_score # Negative is better
@@ -336,6 +340,8 @@ def run_generative_experiment(config_dict,
         "initial_score": initial_score,
         "final_score": final_score,
         "learning_delta": learning_delta,
+        "lpips": evaluator.last_lpips_score,
+        "fid": evaluator.last_fid_score,
         "trajectory": evaluation_trajectory
     }
 
