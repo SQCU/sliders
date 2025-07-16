@@ -59,6 +59,42 @@ def encode_prompts_xl(
 
     return torch.concat(text_embeds_list, dim=-1), pooled_text_embeds
 
+def neo_create_batched_prompt_embeddings(prompt_recipe: dict, tokenizers: list, text_encoders: list):
+    """
+    Creates batched text and pooled embeddings from a single prompt recipe dictionary.
+    This is the modern, corrected interface.
+
+    Args:
+        prompt_recipe (dict): A dictionary containing 'positive', 'unconditional',
+                              and 'neutral' prompt strings.
+        tokenizers (list): A list of tokenizer objects.
+        text_encoders (list): A list of text encoder models.
+    """
+    # --- THIS IS THE FIX ---
+    # The function now directly consumes the recipe dictionary.
+    # It no longer assumes a list or any legacy structure.
+    
+    # Extract the three prompt variations required for a slider.
+    positive_text = prompt_recipe.get('positive', '')
+    unconditional_text = prompt_recipe.get('unconditional', '')
+    neutral_text = prompt_recipe.get('neutral', '')
+
+    # The function's core responsibility is to create a batch of these three prompts.
+    prompts_to_encode = [positive_text, unconditional_text, neutral_text]
+    
+    # The rest of the logic for tokenizing and encoding remains the same,
+    # as it operates on this simple list of strings.
+    # We assume a helper function `encode_prompts_xl` exists to do the heavy lifting.
+    text_embeds, pooled_embeds = encode_prompts_xl(
+        prompts=prompts_to_encode,
+        tokenizers=tokenizers,
+        text_encoders=text_encoders
+    )
+    
+    # It returns a tuple of tensors, where the batch dimension corresponds
+    # to [positive, unconditional, neutral].
+    return text_embeds, pooled_embeds
+
 def create_batched_prompt_embeddings(
     tokenizers: list[CLIPTokenizer],
     text_encoders: list[SDXL_TEXT_ENCODER_TYPE],

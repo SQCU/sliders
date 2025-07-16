@@ -14,11 +14,17 @@ import random
 from .flexible_lora_system import FlexibleLoRANetwork, LoRAConfigLoader, TesterUViT
 from .minimal_scheduler import MinimalDDPMScheduler
 from .batch_data_pipeline import materialize_sham_dataset
+from .batch_data_pipeline import materialize_sdxl_latent_dataset
 from .batch_model_util import run_evaluation_flow, testeruvit_decoder_fn, testeruvit_diffusion_fn # Assuming this exists for eval
 from .batch_model_util import diffusion_fn as sdxl_diffusion_fn, vae_decoder_fn as sdxl_decoder_fn
 
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image.fid import FrechetInceptionDistance
+
+# You'll also need to import the real models from diffusers
+from diffusers import UNet2DConditionModel, AutoencoderKL
+from diffusers.optimization import get_scheduler
+from .batch_slider_algo import GradientNoiseEstimator
 
 import warnings
 
@@ -62,7 +68,7 @@ class GenerativeEvaluator:
         # The model_inputs is now the list of workload dicts
         workload=self.model_inputs, 
         sampling_config=sampling_config
-    )
+        )
         generated_images = torch.cat(generated_images_list).to(self.device, dtype=torch.float32)
 
         # Correct FID usage: update both distributions before computing.
@@ -88,34 +94,148 @@ class GenerativeEvaluator:
 # SECTION! TWO! IT'S THE TRIALY! TRAINER!
 #
 
-def train_epoch(network, dataloader, scheduler, optimizer, training_config, device):
+def train_step(batch: dict, environment: dict):
+    """
+    Performs a single, self-contained training step using pre-calculated data.
+    This function is a pure executor of the batch data.
+    """
+    # --- 1. Unpack Environment ---
+    unet = environment["unet"]
+    network = environment["network"]
+    noise_scheduler = environment["noise_scheduler"]
+    device = environment["device"]
+    
+    # --- 2. Unpack the Pre-Calculated Batch Data from the Pipeline ---
+    latents = batch['latents'].to(device)
+    noise = batch['noise'].to(device)
+    text_embeddings_cfg = batch['cfg_text_embeddings'].to(device)
+    pooled_embeds_cfg = batch['cfg_pooled_embeds'].to(device)
+    add_time_ids_cfg = batch['add_time_ids'].to(device)
+    scales = batch['scales'].to(device)
+    guidance_scale_tensor = batch['guidance_scale'].to(device)
+
+    # These are now read directly from the batch, not calculated live.
+    noise_level_timesteps = batch['noise_level_timesteps'].to(device)
+    unet_input_timesteps = batch['unet_input_timesteps'].to(device)
+    
+    # --- 3. Denoising and Batch Preparation (Now Simplified) ---
+    noisy_latents = noise_scheduler.add_noise(latents, noise, noise_level_timesteps)
+    latents_cfg = torch.cat([noisy_latents, noisy_latents], dim=0)
+    unet_input_timesteps_cfg = torch.cat([unet_input_timesteps, unet_input_timesteps], dim=0)
+    
+    # --- 4. Forward Pass ---
+    # The LoRA network controller sets the scales for the injected layers.
+    network.set_lora_scales(torch.cat([scales, scales], dim=0))
+    added_cond_kwargs = {"text_embeds": pooled_embeds_cfg, "time_ids": add_time_ids_cfg}
+    
+    # The forward pass is called on the base UNet, which has been modified in-place.
+    predicted_noise = unet(
+        latents_cfg,
+        unet_input_timesteps_cfg,
+        encoder_hidden_states=text_embeddings_cfg,
+        added_cond_kwargs=added_cond_kwargs
+    ).sample
+
+    # --- 5. Loss Calculation (The Final Piece) ---
+    # The target for our model is always the original noise we added.
+    target_noise = torch.cat([noise, noise], dim=0)
+    
+    # We can use the guidance scale during training for a CFG-aware loss.
+    # Reshape guidance_scale to [B*2, 1, 1, 1] for broadcasting.
+    guidance_scale_b = guidance_scale_tensor.repeat(2).view(-1, 1, 1, 1)
+
+    # Perform the CFG-aware guidance on the predicted noise
+    uncond_pred, text_pred = predicted_noise.chunk(2)
+    guided_pred = uncond_pred + guidance_scale_b * (text_pred - uncond_pred)
+
+    # Calculate the MSE loss against the original noise.
+    # Use .float() for stability.
+    loss = F.mse_loss(guided_pred.float(), target_noise.float(), reduction="mean")
+    
+    return loss
+
+
+def train_epoch(
+    unet, network, dataloader, scheduler, optimizer, lr_scheduler, device, gns_estimator, training_config
+):
     """
     A stateless function to perform one epoch of training.
     """
     network.train()
     losses = []
-    progress_bar = tqdm(dataloader, desc="Training Batches", leave=False)
-    for batch in progress_bar:
-        optimizer.zero_grad()
-        clean_images = batch['clean_images'].to(device)
-        noise = torch.randn_like(clean_images)
-        timesteps = torch.randint(0, scheduler.num_train_timesteps, (clean_images.shape[0],), device=device).long()
+    
+    accum_steps = training_config.get('gradient_accumulation_steps', 1)
+    if accum_steps <= 0:
+        accum_steps = 1
         
-        noisy_images = scheduler.add_noise(clean_images, noise, timesteps)
-        target = scheduler.get_prediction_target(clean_images, noise, timesteps, prediction_type=training_config['prediction_type'])
+    # We now loop based on optimizer steps, not dataloader batches
+    num_optimizer_steps = len(dataloader) // accum_steps
+    data_iterator = iter(dataloader)
+    
+    # This step counter is local to the epoch, tracking optimizer updates
+    optimizer_step_count = 0
+    progress_bar = tqdm(range(num_optimizer_steps), desc="Optimizer Steps", leave=False)
+
+    environment_for_step = {"unet": unet, "network": network, "noise_scheduler": scheduler, "device": device}
+
+
+    for step in progress_bar:
+        # --- Gradient Accumulation Loop ---
+        is_profiling = False
+        if gns_estimator is not None:
+            # The global_step for profiling frequency can be the optimizer_step_count
+            gns_estimator.pre_accumulate_step(optimizer_step_count)
+            is_profiling = gns_estimator.is_profiling
+
+        total_loss_in_step = 0.0
+
+        if is_profiling:
+            # --- Profiling Path: accumulate gradients manually in GNS buffer ---
+            for _ in range(accum_steps):
+                batch = next(data_iterator)
+                loss = train_step(batch, environment_for_step)
+                loss.backward() # Immediate backprop for the micro-gradient
+                gns_estimator.post_micro_backward_step() # GNS captures the raw grad
+                total_loss_in_step += loss.item()
+        else:
+            # --- Standard Path: let PyTorch handle gradient summation ---
+            optimizer.zero_grad()
+            for _ in range(accum_steps):
+                batch = next(data_iterator)
+                loss = train_step(batch, environment_for_step)
+                # We scale the loss before backprop when accumulating
+                loss = loss / accum_steps
+                loss.backward()
+                total_loss_in_step += loss.item() * accum_steps # Un-scale for logging
+
+        # --- After Accumulation, Before Optimizer Step ---
+        if is_profiling:
+            # Finalize profiling: calculates stats and loads summed grad into model
+            gns_estimator.post_accumulate_step(accum_steps)
+
+            new_steps = gradient_noise_estimator.propose_new_accumulation_steps(
+                    current_steps=gradient_accumulation_steps,
+                    min_steps=2,
+                    max_steps=int(config.train.iterations/4)
+                )
+            accum_steps = new_steps
+     # Optional: Gradient Clipping would go here, applied before optimizer.step()
+        # torch.nn.utils.clip_grad_norm_(network.parameters(), max_grad_norm)
         
-        # The model call is now generic. It works as long as the base model
-        # accepts (input_tensor, timesteps).
-        model_output = network(noisy_images, timesteps) 
-        loss = F.mse_loss(model_output.float(), target.float())
-        
-        loss.backward()
         optimizer.step()
-        losses.append(loss.item())
-        progress_bar.set_postfix({"Loss": f"{sum(losses[-5:])/5:.4f}"})
+        lr_scheduler.step()
+        
+        avg_loss = total_loss_in_step / accum_steps
+        losses.append(avg_loss)
+        progress_bar.set_postfix({"Loss": f"{avg_loss:.4f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+        if gns_estimator and gns_estimator.ema_zoomy_b_crit is not None:
+             progress_bar.set_postfix_str(f"Loss: {avg_loss:.4f}, LR: {lr_scheduler.get_last_lr()[0]:.2e}, B_crit: {gns_estimator.ema_zoomy_b_crit:.2f}")
+
+        optimizer_step_count += 1
+        
     return losses
 
-def run_generative_trial(base_environment: dict, static_batches: list, exp_config: dict):
+def run_generative_trial(base_environment: dict, static_batches: list, exp_config: dict, batch_size: int ):
     """
     The new harness, adhering to our doctrine. Runs a single, self-contained trial.
     """
@@ -123,8 +243,8 @@ def run_generative_trial(base_environment: dict, static_batches: list, exp_confi
     
     # --- 1. Per-Trial Setup ---
     device = base_environment['device']
-    evaluator = base_environment['evaluator']
-    
+    weight_dtype = base_environment['weight_dtype'] 
+    evaluator = base_environment['evaluator'] 
     # Create a fresh copy of the base model. Model Agnosticism in action.
     trial_model = copy.deepcopy(base_environment['base_model']).to(device)
 
@@ -135,20 +255,55 @@ def run_generative_trial(base_environment: dict, static_batches: list, exp_confi
     # Create the specific, trainable LoRA network for this trial.
     loader = LoRAConfigLoader(config_dict=exp_config['lora_config'])
     resolved_config = loader.get_resolved_config(trial_model)
-    network = FlexibleLoRANetwork(trial_model, resolved_config).to(device)
-    
+    network = FlexibleLoRANetwork(trial_model, resolved_config).to(
+    device=device,
+    dtype=weight_dtype)
     optimizer = torch.optim.AdamW(network.prepare_optimizer_params(), lr=exp_config['optimizer_config']['lr'])
+
+    # b1. Initialize LR Scheduler for this trial
+    training_config = exp_config['training_config']
+    num_epochs = training_config['num_epochs']
+    accum_steps = training_config.get('gradient_accumulation_steps', 1)
+    num_optimizer_steps = (len(static_batches) // accum_steps) * num_epochs
+
+    lr_scheduler = get_scheduler(
+        name="constant", # Or read from config
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=num_optimizer_steps
+    )
+
+    # b2. Initialize GradientNoiseEstimator for this trial, if enabled
+    gns_estimator = None
+    if training_config.get('estimate_gradient_noise_scale'):
+        gns_estimator = GradientNoiseEstimator(
+            network,
+            batch_size,
+            training_config.get('gns_profile_freq', 10),
+            training_config.get('gns_ema_fast', 0.1),
+            training_config.get('gns_ema_slow', 0.01)
+        )
+
+    sampling_config_for_eval = exp_config['evaluation_config']['sampling_config']
 
     # --- 2. Run Experiment ---
     print("--- Evaluating untrained network (initial state)... ---")
-    initial_metrics = evaluator.evaluate(network, exp_config['evaluation_config'])
+    initial_metrics = evaluator.evaluate(network, sampling_config_for_eval)
 
     # Training Loop
     all_losses = []
     for epoch in range(exp_config['training_config']['num_epochs']):
         print(f"--- Epoch {epoch + 1}/{exp_config['training_config']['num_epochs']} ---")
         epoch_losses = train_epoch(
-            network, static_batches, base_environment['scheduler'], optimizer, exp_config['training_config'], device
+            unet=trial_model,
+            network=network,
+            dataloader=static_batches,
+            scheduler=base_environment['scheduler'],
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler, # Pass it down
+            device=device,
+            gns_estimator=gns_estimator, # Pass it down
+            training_config=training_config
         )
         all_losses.extend(epoch_losses)
 
@@ -179,6 +334,8 @@ def setup_generative_environment(manifest: dict) -> dict:
     # The harness doesn't know about TesterUViT. This setup function does.
     model_name = manifest['environment_setup']['base_model_name']
     environment = {}
+    environment["device"]=device
+    environment["weight_dtype"] = torch.bfloat16
     if model_name == 'TesterUViT':
         base_model = TesterUViT()
         # Install the TESTER shims into the environment
@@ -187,13 +344,26 @@ def setup_generative_environment(manifest: dict) -> dict:
         # The VAE is the model itself for decoding (identity op)
         environment['vae'] = base_model 
     elif model_name == 'StableDiffusionXL_UNet':
-        # ... load the real UNet ...
-        # ... load the real VAE ...
-        # Install the REAL processing functions
+        print("--- Loading REAL Stable Diffusion XL models... ---")
+        # Load the pre-trained models from disk (paths should be in the manifest)
+        unet_path = manifest['environment_setup']['model_path']
+        #vae_path = manifest['environment_setup']['vae_path']
+        #load from singlefile
+        model_config = manifest['environment_setup']
+        from .batch_model_util import load_models_path as load_xl_from_single_file
+        vae, base_model, tokenizers, text_encoders = load_xl_from_single_file(unet_path, weight_dtype=torch.bfloat16)
+
+        # Install the REAL processing functions for the orchestrator
         environment['diffusion_fn'] = sdxl_diffusion_fn
         environment['decoder_fn'] = sdxl_decoder_fn
-        # environment['vae'] = the_real_vae
-        raise NotImplementedError("SDXL UNet loading is a placeholder.")
+        environment['vae'] = vae
+        # The environment also needs the real text encoders for the data pipeline
+        # ... (logic to load CLIP models would go here) ...
+        environment['text_encoders'] = text_encoders
+        environment['tokenizers'] = tokenizers
+
+    # Create the scheduler early, so it can be passed to all components.
+    environment['scheduler'] = MinimalDDPMScheduler(device=device)
 
     # --- Principle 4: Unified Data Pipeline ---
     pipeline_name = manifest['data_setup']['pipeline']
@@ -202,38 +372,45 @@ def setup_generative_environment(manifest: dict) -> dict:
         # The environment object only needs the scheduler and device here.
         temp_env = {'scheduler': MinimalDDPMScheduler(device=device), 'device': device}
         static_batches = materialize_sham_dataset(manifest['data_setup']['config'], temp_env)
+    elif pipeline_name == 'sdxl_latent_dataset':
+        # --- THIS IS THE UNSTUBBED LOGIC ---
+        # Call our new, powerful data materializer
+        # It needs the full environment to access the VAE and text encoders.
+        static_batches = materialize_sdxl_latent_dataset(
+            manifest['data_setup']['config'],
+            environment # Pass the partially built environment
+        )
     else:
         raise ValueError(f"Unknown data pipeline in manifest: {pipeline_name}")
 
     # Unstub the eval_dataset creation by correctly deconstructing the static batches.
     # The orchestrator expects a flat list of individual items for its workload.
-    all_model_inputs_for_eval = []
-    all_ground_truth_for_eval = []
+    eval_dataset = {'model_inputs': [], 'ground_truth_outputs': []}
+    key_for_primary_data = 'latents' if pipeline_name == 'sdxl_latent_dataset' else 'clean_images'
 
     for batch in static_batches:
-        all_ground_truth_for_eval.append(batch['clean_images'])
-        num_items_in_batch = batch['clean_images'].shape[0]
+        primary_data_tensor = batch[key_for_primary_data]
+        num_items_in_batch = primary_data_tensor.shape[0]
+        
+        eval_dataset['ground_truth_outputs'].append(primary_data_tensor)
         for i in range(num_items_in_batch):
-            # Create a workload dict for each individual sample in the batch.
-            # The orchestrator will re-batch these later.
+            # 3. Use the polymorphic key again to get the per-item data.
+            #    This creates the workload for the orchestrator.
             item_dict = {
-                'initial_latents': batch['initial_latents'][i:i+1],
-                'timesteps': batch['timesteps'][i:i+1],
-                'conditioning': batch['conditioning'],
+                'initial_latents': batch['latents'][i:i+1],
+                'unet_input_timesteps': batch['unet_input_timesteps'][i:i+1],
+                'guidance_scale': batch['guidance_scale'][i:i+1],
+                # The CFG tensors are already stacked [uncond, cond]. We slice the i-th pair.
+                'cfg_text_embeddings': batch['cfg_text_embeddings'][i*2:(i+1)*2],
+                'cfg_pooled_embeds': batch['cfg_pooled_embeds'][i*2:(i+1)*2],
+                'add_time_ids': batch['add_time_ids'][i*2:(i+1)*2],
             }
-            all_model_inputs_for_eval.append(item_dict)
-
-    eval_dataset = {
-    'model_inputs': all_model_inputs_for_eval, # NOW A POPULATED LIST :)
-    'ground_truth_outputs': all_ground_truth_for_eval
-    }
+            eval_dataset['model_inputs'].append(item_dict)
 
     # Create the final environment dictionary
     environment.update({
         'device': device,
         'base_model': base_model,
-        'scheduler': MinimalDDPMScheduler(device=device),
-        # This is placeholder data for the evaluator, it needs to be made generic
         'eval_dataset': eval_dataset
     })
     environment['evaluator'] = GenerativeEvaluator(environment['eval_dataset'], environment)
@@ -256,7 +433,8 @@ class RandomSearchController:
                  harness_fn,
                  base_environment: dict,
                  static_batches: list,
-                 base_exp_config: dict):
+                 base_exp_config: dict,
+                 batch_size: int):
         """
         Initializes the controller.
 
@@ -275,6 +453,7 @@ class RandomSearchController:
         self.base_environment = base_environment
         self.static_batches = static_batches
         self.base_exp_config = base_exp_config
+        self.batch_size = batch_size
         self.results = []
         print("--- Random Search Controller Initialized (Doctrine-Compliant) ---")
 
@@ -310,7 +489,8 @@ class RandomSearchController:
             run_output = self.harness_fn(
                 base_environment=self.base_environment,
                 static_batches=self.static_batches,
-                exp_config=trial_config
+                exp_config=trial_config,
+                batch_size=self.batch_size
             )
 
             # 4. Log the results
@@ -367,7 +547,7 @@ def create_search_space_yaml(path="search_space.yaml"):
 
 if __name__ == "__main__":
     # --- STEP 1: Load the master configuration ---
-    with open('experiment_manifest.yaml', 'r') as f:
+    with open('experiment_manifest_xl.yaml', 'r') as f:
         manifest = yaml.safe_load(f)
 
     # --- STEP 2: One-time, expensive setup ---
@@ -376,12 +556,15 @@ if __name__ == "__main__":
     
     # --- STEP 3: Initialize the Search Controller ---
     search_space_file = create_search_space_yaml()
+    batch_size_from_config = manifest['data_setup']['config']['batch_size']
+
     controller = RandomSearchController(
         search_space_path=search_space_file,
         harness_fn=run_generative_trial, # Pass the harness function directly
         base_environment=environment,
         static_batches=static_batches,
-        base_exp_config=manifest['trial_config']
+        base_exp_config=manifest['trial_config'],
+        batch_size=batch_size_from_config
     )
 
     # --- STEP 4: Execute the Search Loop ---

@@ -17,7 +17,7 @@ from tqdm import tqdm
 from safetensors.torch import save_file, load_file
 from PIL import Image
 
-from .batch_train_util import create_batched_prompt_embeddings, get_add_time_ids
+from .batch_train_util import neo_create_batched_prompt_embeddings, get_add_time_ids
 #from .data_processing_utils import encode_images_to_latents # Still needed
 #not needed anymore!
 
@@ -171,13 +171,12 @@ def create_training_schedule(config: Dict[str, Any]) -> Dict[str, Any]:
     return schedule_dict
 
 
-# --- STAGE 2: MATERIALIZE THE SCHEDULE INTO TENSORS ---
-
 # MANDATORY HELPER FUNCTION FROM OLD DATA_PROCESSING_UTILS.PY.
 def encode_images_to_latents(images, **environment):
     vae = environment["vae"]
     #device=environment["device"]
-    weight_dtype=environment["weight_dtype"]
+    #weight_dtype=environment["weight_dtype"]
+    weight_dtype = torch.bfloat16
     
     from diffusers.image_processor import VaeImageProcessor
     start_time = time.time()
@@ -286,7 +285,7 @@ def materialize_static_batches(schedule_dict: Dict[str, Any], environment: Dict[
         "text_encoders": environment['text_encoders'],
         "prompts": prompt_dict,
         }
-        embeds = create_batched_prompt_embeddings(**text_encoder_kwargs)
+        embeds = neo_create_batched_prompt_embeddings(**text_encoder_kwargs)
         #returns (text_emb, text_pool)
         text_embeddings_cache[key] = tuple(t.cpu() for t in embeds)
 
@@ -424,4 +423,316 @@ def materialize_sham_dataset(config: dict, environment: dict) -> list[dict]:
         static_batches.append(batch_dict)
         
     print(f"--- Materialization complete. Created {len(static_batches)} static batches. ---")
+    return static_batches
+
+#in batch_data_pipeline.py
+import torch
+import random
+import os
+from pathlib import Path
+from collections import defaultdict
+from tqdm import tqdm
+# We would import our VAE/CLIP encoding utilities here
+
+def _get_composed_prompt(item_path: Path, prompt_config: dict, root_prompts: dict, metadata: dict, rng: random.Random) -> dict:
+    """
+    Selects a final prompt configuration for an item based on a hierarchy and sampling importance.
+    """
+    item_filename = item_path.name
+    folder_name = item_path.parent.name
+
+    # 1. Gather all potential prompt sources for this item
+    sources = []
+    weights = []
+
+    # Root prompt (always available as a fallback)
+    sources.append(root_prompts['default_prompt'])
+    weights.append(prompt_config['root']['importance'])
+
+    # Folder-level prompt
+    if folder_name in metadata.get('folders', {}):
+        folder_prompt_key = metadata['folders'][folder_name]['prompt_key']
+        sources.append(root_prompts[folder_prompt_key])
+        weights.append(prompt_config['metadata']['folder_importance'])
+    
+    # Item-level prompt
+    if item_filename in metadata.get('items', {}):
+        item_prompt_key = metadata['items'][item_filename]['prompt_key']
+        sources.append(root_prompts[item_prompt_key])
+        weights.append(prompt_config['metadata']['item_importance'])
+
+    # 2. Perform weighted random sampling to choose one prompt source
+    chosen_prompt_recipe = rng.choices(sources, weights=weights, k=1)[0]
+
+    # Return the full recipe and the final guidance
+    return chosen_prompt_recipe
+
+def get_recipe_key(recipe):
+        return hashlib.sha1(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
+
+def materialize_sdxl_latent_dataset(config: dict, environment: dict) -> list[dict]:
+    """
+    Creates a static list of tensor batches for SDXL slider training.
+    This pipeline is configurable, reproducible, and cache-aware.
+    """
+    print("--- [SDXL Data Pipeline] Beginning materialization... ---")
+    
+    # --- STAGE 0: LOAD ALL CONFIGURATION AND METADATA ---
+    rng = random.Random(config['seed'])
+    with open(config['prompt_sources']['root']['file'], 'r') as f:
+        root_prompts = yaml.safe_load(f)
+    with open(config['prompt_sources']['metadata']['file'], 'r') as f:
+        metadata = json.load(f)
+
+    # ==========================================================================
+    # STAGE 1: DISCOVER & FILTER DATA POOL (UNSTUBBED)
+    # ==========================================================================
+    print("--- Stage 1: Discovering and filtering image pool... ---")
+    rng = random.Random(config['seed'])
+    data_pool = defaultdict(dict)
+    
+    for folder_name, scale in zip(config['folders'], config['scales']):
+        subfolder_path = Path(config['folder_main']) / folder_name
+        if not subfolder_path.exists():
+            print(f"Warning: Folder not found, skipping: {subfolder_path}")
+            continue
+        for image_path in subfolder_path.glob("*"):
+            if image_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']:
+                data_pool[image_path.name][scale] = str(image_path)
+    
+    all_scales = config['scales']
+    if config['pairing_strategy'] == 'strict':
+        valid_filenames = [f for f, s_map in data_pool.items() if len(s_map) == len(all_scales)]
+    elif config['pairing_strategy'] == 'relaxed':
+        valid_filenames = [f for f, s_map in data_pool.items() if len(s_map) >= config['min_scales_required']]
+    else:
+        raise ValueError(f"Unknown pairing_strategy: {config['pairing_strategy']}")
+
+    with open(config['prompts_file'], 'r') as f:
+        prompt_map = yaml.safe_load(f)
+
+    print(f"Discovered {len(data_pool)} unique filenames. Filtered to {len(valid_filenames)} valid filenames for training.")
+    
+    # ==========================================================================
+    # STAGE 2: CREATE THE DETERMINISTIC TRAINING SCHEDULE
+    # ==========================================================================
+    print("--- Stage 2: Building deterministic training schedule... ---")
+    training_schedule = [] # A list of simple instruction dicts, not tensors
+    
+    for step_index in tqdm(range(config['iterations']), desc="Scheduling Training Units"):
+        batch_of_units = []
+        for i in range(config['batch_size'] // 2):
+            selected_filename = rng.choice(valid_filenames)
+            available_scales = sorted(data_pool[selected_filename].keys())
+            low_scale, high_scale = sorted(rng.sample(available_scales, 2))
+
+            high_path = Path(data_pool[selected_filename][high_scale])
+            low_path = Path(data_pool[selected_filename][low_scale])
+            
+            # Use the new composition helper for each item
+            high_prompt_recipe = _get_composed_prompt(high_path, config['prompt_sources'], root_prompts, metadata, rng)
+            low_prompt_recipe = _get_composed_prompt(low_path, config['prompt_sources'], root_prompts, metadata, rng)
+            
+            item_instruction_high = {"image_path": str(high_path), "prompt_recipe": high_prompt_recipe, "recipe_key": get_recipe_key(high_prompt_recipe), "scale": high_scale, "role": "high_scale_target"}
+            item_instruction_low = {"image_path": str(low_path), "prompt_recipe": low_prompt_recipe, "recipe_key": get_recipe_key(low_prompt_recipe), "scale": low_scale, "role": "low_scale_target"}
+            
+            training_unit = {"unit_id": f"unit_{step_index}_{i}_{selected_filename}", "type": "slider_pair", "items": [item_instruction_high, item_instruction_low]}
+            batch_of_units.append(training_unit)
+        training_schedule.append(batch_of_units)
+        
+    # ==========================================================================
+    # STAGE 3: MATERIALIZE & CACHE ASSETS (UNSTUBBED)
+    # ==========================================================================
+    print("--- Stage 3: Materializing and caching heavy assets... ---")
+    
+    # Extract all unique assets required by the full schedule
+    all_items = [item for batch in training_schedule for unit in batch for item in unit['items']]
+    unique_image_paths = sorted(list(set(item['image_path'] for item in all_items)))
+    # We no longer need to recalculate keys. We just grab the ones we already made.
+    unique_recipes = {item['recipe_key']: item['prompt_recipe'] for item in all_items}
+
+    # --- Latent Caching ---
+    latent_cache_dir = Path(config['latent_cache_dir'])
+    latent_cache_dir.mkdir(parents=True, exist_ok=True)
+    latent_cache_file = latent_cache_dir / "latents.safetensors"
+    latent_index_file = latent_cache_dir / "latents_index.json"
+    
+    # 1. Load existing cache
+    latent_cache = {}
+    if latent_cache_file.exists() and latent_index_file.exists():
+        print("Loading existing latent cache...")
+        index = json.loads(latent_index_file.read_text())
+        tensors = load_file(latent_cache_file, device='cpu')
+        # Ensure that loading from cache creates the same dictionary structure
+        # as the new-image encoding path.
+        for path, data in index.items():
+            # Instead of just storing the tensor, wrap it in our standard dict format.
+            latent_cache[path] = {
+                'latent': tensors[data['tensor_key']], 
+                'original_size': tuple(data['original_size'])
+            }
+
+    # 2. Identify and encode missing latents
+    missing_paths = [p for p in unique_image_paths if p not in latent_cache]
+    if missing_paths:
+        print(f"Encoding {len(missing_paths)} new images into latents...")
+        vae = environment['vae'].to(environment['device'], dtype=torch.bfloat16)
+        
+        # NOTE: A real implementation could use the ThroughputBatchFinder here.
+        # For simplicity, we use a fixed VAE batch size from the manifest.
+        vae_batch_size = config.get('vae_batch_size', 4)
+        newly_encoded_tensors, newly_created_index = {}, {}
+        
+        for i in tqdm(range(0, len(missing_paths), vae_batch_size), desc="Encoding Latents"):
+            batch_paths = missing_paths[i:i + vae_batch_size]
+            images = [Image.open(p).convert("RGB") for p in batch_paths]
+            original_sizes = [img.size for img in images]
+
+            latents_tensor, _latents_batch = encode_images_to_latents(images, vae=vae)#, config['resolution'])
+            
+            for j, path in enumerate(batch_paths):
+                tensor_key = f"latent_{hashlib.sha1(path.encode()).hexdigest()}"
+                latent_cache[path] = {'latent': latents_tensor[j], 'original_size': original_sizes[j]}
+                newly_encoded_tensors[tensor_key] = latents_tensor[j]
+                newly_created_index[path] = {'tensor_key': tensor_key, 'original_size': original_sizes[j]}
+
+        # 3. Save new additions to cache
+        if newly_encoded_tensors:
+            print(f"Saving {len(newly_encoded_tensors)} new latents to cache...")
+            # 1. Save the tensor data (this part was already correct).
+            save_file(newly_encoded_tensors, latent_cache_file, metadata={'format': 'pt'})
+            
+            # 2. Load the existing index, if it exists, or start with an empty dict.
+            existing_index = json.loads(latent_index_file.read_text()) if latent_index_file.exists() else {}
+            
+            # 3. Merge the existing index with the newly created index entries.
+            #    The `newly_created_index` already has the correct nested structure.
+            full_index = {**existing_index, **newly_created_index}
+            
+            # 4. Write the complete, correctly formatted index back to disk.
+            latent_index_file.write_text(json.dumps(full_index, indent=2))
+        
+        # Cleanup VRAM
+        vae.to('cpu'); gc.collect(); torch.cuda.empty_cache()
+
+    # --- Text Embedding Caching (In-Memory for this run) ---
+    print(f"Encoding {len(unique_recipes)} unique text prompt recipes...")
+    text_embed_cache = {} # -> {recipe_key: (embeds, pooled_embeds)}
+    text_encoders = [te.to(environment['device']) for te in environment['text_encoders']]
+    
+    for recipe_key, recipe in tqdm(unique_recipes.items(), desc="Encoding Prompts"):
+        # This function handles the positive, negative, and neutral prompts internally
+        embeds, pooled_embeds = neo_create_batched_prompt_embeddings(
+            recipe, environment['tokenizers'], text_encoders
+        )
+        # Store on CPU to conserve VRAM
+        text_embed_cache[recipe_key] = (embeds.cpu(), pooled_embeds.cpu())
+
+    # Cleanup VRAM
+    for te in text_encoders: te.to('cpu')
+    gc.collect(); torch.cuda.empty_cache()
+
+    # ==========================================================================
+    # STAGE 4: ASSEMBLE FINAL TENSOR BATCHES (UNSTUBBED)
+    # ==========================================================================
+    print("--- Stage 4: Assembling final tensor batches... ---")
+    static_batches = []
+    noise_generator = torch.Generator()
+
+    # We need the scheduler from the environment to perform the projection
+    noise_scheduler = environment['scheduler'] 
+    max_steps = config['max_denoising_steps']
+
+    for batch_of_units in tqdm(training_schedule, desc="Assembling Batches"):
+        batch_tensor_lists = defaultdict(list)
+        
+        # Flatten all items from all units in the batch
+        all_items_in_batch = [item for unit in batch_of_units for item in unit['items']]
+
+        for item in all_items_in_batch:
+            # --- Fetch pre-computed assets from caches ---
+            latent_data = latent_cache[item['image_path']]
+            recipe_key = item['recipe_key']
+            text_data = text_embed_cache[recipe_key]
+            
+            # --- Collate Tensors for this item ---
+            batch_tensor_lists['latents'].append(latent_data['latent'])
+            batch_tensor_lists['scales'].append(item['scale'])
+            
+            # Reproducible noise based on the unit ID. This ensures items
+            # in the same unit (e.g., a pair) get the same noise.
+            unit_id = next(u['unit_id'] for u in batch_of_units if item in u['items'])
+            noise_generator.manual_seed(hash(unit_id))
+            latent_shape = latent_data['latent'].shape
+            noise = torch.randn(latent_shape, generator=noise_generator)
+            batch_tensor_lists['noise'].append(noise)
+            
+            # Get additive time embeddings
+            add_time_ids = get_add_time_ids(
+                latent_data['original_size'][0], 
+                latent_data['original_size'][1], 
+                False, dtype=torch.float32
+            )
+            batch_tensor_lists['add_time_ids'].append(add_time_ids)
+            
+            # --- Select and Stack CFG Embeddings ---
+            # Index 0: Positive, 1: Unconditional, 2: Neutral
+            uncond_text, uncond_pool = text_data[0][1], text_data[1][1]
+
+            if item['role'] == 'high_scale_target':
+                cond_text, cond_pool = text_data[0][0], text_data[1][0]
+            elif item['role'] == 'low_scale_target':
+                cond_text, cond_pool = text_data[0][2], text_data[1][2]
+            else:
+                # Default to unconditional if role is unknown
+                cond_text, cond_pool = uncond_text, uncond_pool
+            
+            # Stack for CFG: [unconditional, conditional]
+            batch_tensor_lists['cfg_text_embeddings'].append(torch.stack([uncond_text, cond_text]))
+            batch_tensor_lists['cfg_pooled_embeds'].append(torch.stack([uncond_pool, cond_pool]))
+
+            # Perform the full two-step timestep calculation here.
+            unit_id = next(u['unit_id'] for u in batch_of_units if item in u['items'])
+            # Use a generator seeded by the unit to ensure items in a pair get same timesteps
+            ts_generator = torch.Generator().manual_seed(hash(unit_id))
+            
+            # Step 0: Generate the random integer for the "noise level"
+            timesteps_to = torch.randint(1, max_steps, (1,), generator=ts_generator).long()
+
+            # Steps 1 & 2: Calculate the actual timestep for noise addition
+            noise_scheduler.set_timesteps(max_steps, device='cpu')
+            noise_level_timestep = noise_scheduler.timesteps[timesteps_to]
+
+            # Steps 4, 5, & 6: Re-project to calculate the timestep for UNet input
+            noise_scheduler.set_timesteps(1000, device='cpu')
+            normalized_tsteps = torch.round(timesteps_to.float() * 1000 / max_steps).long()
+            unet_input_timestep = noise_scheduler.timesteps[normalized_tsteps]
+
+            # Store BOTH results for use in the training loop
+            batch_tensor_lists['noise_level_timesteps'].append(noise_level_timestep)
+            batch_tensor_lists['unet_input_timesteps'].append(unet_input_timestep)
+
+        # --- Assemble the final batch dictionary from the collected lists ---
+        if not batch_tensor_lists: continue # Skip empty batches if any
+
+        final_batch = {
+            "latents": torch.stack(batch_tensor_lists['latents']),
+            "scales": torch.tensor(batch_tensor_lists['scales']),
+            "noise": torch.stack(batch_tensor_lists['noise']),
+            # `add_time_ids` has an extra dim, so we cat instead of stack
+            "add_time_ids": torch.cat(batch_tensor_lists['add_time_ids']),
+            # These are already stacked per-item, so we concatenate them along the batch dim
+            "cfg_text_embeddings": torch.cat(batch_tensor_lists['cfg_text_embeddings']),
+            "cfg_pooled_embeds": torch.cat(batch_tensor_lists['cfg_pooled_embeds']),
+            "noise_level_timesteps": torch.cat(batch_tensor_lists['noise_level_timesteps']),
+            "unet_input_timesteps": torch.cat(batch_tensor_lists['unet_input_timesteps']),
+        }
+        
+        gs_value = config.get('guidance_scale', 1.0)
+        num_items_in_batch = final_batch['latents'].shape[0]
+        final_batch['guidance_scale'] = torch.full((num_items_in_batch,), gs_value)
+
+        static_batches.append(final_batch)
+
+    print("--- SDXL Data Pipeline Materialization Complete. ---")
     return static_batches

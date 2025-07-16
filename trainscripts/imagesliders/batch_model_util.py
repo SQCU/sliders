@@ -27,15 +27,38 @@ def load_models(config, device, weight_dtype):
     if len(text_encoders) == 2:
         text_encoders[1].pad_token_id = 0
     vae = pipe.vae
-    del pipe
-    #GET RID OF PIPE!!! 
-    #you HAVE TO GET RID OF THE PIPE EVERY TIME!!!
-    #if you do a 'blah = pipe.blah.to(device, dtype)' you DOUBLE LOAD THE MODEL,
+    del pipe    #compulsory pipe deletion, always delete that pipe!
 
     # Enable gradient checkpointing if configured
     if hasattr(config, 'other') and hasattr(config.other, 'gradient_checkpointing') and config.other.gradient_checkpointing:
         print("Enabling gradient checkpointing for UNet.")
         unet.enable_gradient_checkpointing()
+
+    return vae, unet, tokenizers, text_encoders
+
+def load_models_path(path, weight_dtype):
+    tdcpu = torch.device("cpu")
+    print(f"Loading models from {path} to device: {tdcpu} with dtype: {weight_dtype}")
+
+    # Load the pipeline from the local .safetensors file
+    pipe = StableDiffusionXLPipeline.from_single_file(
+        path,
+        torch_dtype=weight_dtype,
+        cache_dir=DIFFUSERS_CACHE_DIR,
+    )
+
+    unet = pipe.unet.to(device=tdcpu)
+    tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
+    text_encoders = [pipe.text_encoder.to(device=tdcpu), pipe.text_encoder_2.to(device=tdcpu)]
+    if len(text_encoders) == 2:
+        text_encoders[1].pad_token_id = 0
+
+    vae = pipe.vae.to(device=tdcpu)
+    del pipe  #compulsory pipe deletion, always delete that pipe!
+
+    # Enable gradient checkpointing no matter what.
+    print("Enabling gradient checkpointing for UNet.")
+    unet.enable_gradient_checkpointing()
 
     return vae, unet, tokenizers, text_encoders
 
@@ -292,47 +315,48 @@ def _get_pred_xl(unet, latents, timestep, conditioning, guidance_scale):
 def diffusion_fn(model, batch_work, environment):
     """
     Performs the ENTIRE multi-step diffusion loop for a batch.
-    This is the "simple function" called by the orchestrator.
+    This is the modern, refactored version that mirrors the train_step.
     """
-    # 1. Unpack components from environment
-    scheduler = environment['scheduler'] # MinimalDDPMScheduler is passed in
+    # 1. Unpack components
+    scheduler = environment['scheduler']
     device = environment['device']
 
-    # 2. Collate batch data and move initial state to device
-    initial_latents = torch.cat([d['initial_latents'] for d in batch_work]).to(device)
+    # 2. Collate the batch of workloads
+    # This assumes we are finding a batch size for a single item type, so all configs are the same.
+    sampling_config = environment['sampling_config']
+    guidance_scale = batch_work[0]['guidance_scale'].item() # This part was correct
+    total_timesteps = sampling_config['total_timesteps']
     
-    # 3. All items in a batch share diffusion parameters and conditioning
-    diffusion_params = batch_work[0]['diffusion_params']
-    conditioning_uncond = batch_work[0]['conditioning_uncond'] # Assuming an uncond is prepared
-    conditioning_cond = batch_work[0]['conditioning']
-
-    guidance_scale = diffusion_params['guidance_scale']
-    total_timesteps = diffusion_params['total_timesteps']
+    # Collate the tensor data into a single batch for efficiency
+    latents = torch.cat([d['initial_latents'] for d in batch_work]).to(device)
+    cfg_text_embeddings = torch.cat([d['cfg_text_embeddings'] for d in batch_work]).to(device)
+    cfg_pooled_embeds = torch.cat([d['cfg_pooled_embeds'] for d in batch_work]).to(device)
+    add_time_ids = torch.cat([d['add_time_ids'] for d in batch_work]).to(device)
     
-    # 4. Prepare for the loop
+    # 3. The Loop
     scheduler.set_timesteps(total_timesteps, device=device)
-    latents = initial_latents
-
-    # 5. The Loop (as an implementation detail inside this function)
+    
     for t in scheduler.timesteps:
-        # Prepare for CFG: duplicate latents and conditioning
-        latent_model_input = torch.cat([latents] * 2)
+        # Prepare for CFG: duplicate the latents for uncond/cond passes
+        latent_model_input = torch.cat([latents] * 2).to(torch.bfloat16)
         
-        # This is where the multiple conditioning dicts would be used
-        # For simplicity, we assume one cond and one uncond for the whole batch
-        combined_conditioning = {
-            'encoder_hidden_states': torch.cat([conditioning_uncond['encoder_hidden_states'], conditioning_cond['encoder_hidden_states']]),
-            'added_cond_kwargs': {
-                'text_embeds': torch.cat([conditioning_uncond['added_cond_kwargs']['text_embeds'], conditioning_cond['added_cond_kwargs']['text_embeds']]),
-                'time_ids': torch.cat([conditioning_uncond['added_cond_kwargs']['time_ids'], conditioning_cond['added_cond_kwargs']['time_ids']]),
-            }
-        }
+        # Build the conditioning kwargs for the model call
+        added_cond_kwargs = {"text_embeds": cfg_pooled_embeds, "time_ids": add_time_ids}
         
         # Get the model's prediction
-        model_pred = _get_pred_xl(model, latent_model_input, t, combined_conditioning, guidance_scale)
+        noise_pred = model(
+            latent_model_input,
+            t, # Timestep is a scalar for the whole batch here
+            encoder_hidden_states=cfg_text_embeddings,
+            added_cond_kwargs=added_cond_kwargs
+        ).sample
+        
+        # Perform guidance
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        guided_target = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
         
         # Compute the previous noisy sample x_t -> x_{t-1}
-        latents = scheduler.step(model_pred, t, latents)
+        latents = scheduler.step(guided_target, t, latents)#.prev_sample
 
     # 6. Return the final latents as a list of CPU tensors
     return list(torch.chunk(latents.cpu(), chunks=latents.shape[0], dim=0))
@@ -507,6 +531,7 @@ def run_evaluation_flow(model_to_test, environment, workload, sampling_config):
     # 1. Prepare the environment for this specific run
     eval_env = environment.copy()
     eval_env['inference_network'] = model_to_test
+    eval_env['sampling_config'] = sampling_config
     
     # These functions are assumed to be in the environment already
     # eval_env['diffusion_fn'] = diffusion_fn

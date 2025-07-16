@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 class MinimalDDPMScheduler:
     """
@@ -77,6 +78,16 @@ class MinimalDDPMScheduler:
             return sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * original_samples
         else:
             raise ValueError(f"Unknown prediction type: {prediction_type}")
+
+# Re-implement the required method.
+    def set_timesteps(self, num_inference_steps: int, device: str = None):
+        """
+        Sets the discrete timesteps used for the diffusion chain.
+        """
+        device = device or self.device
+        step_ratio = self.num_train_timesteps // num_inference_steps
+        timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        self.timesteps = torch.from_numpy(timesteps).to(device)
 
     def step(self, model_output: torch.Tensor, timestep: int, sample: torch.Tensor, prediction_type="epsilon") -> torch.Tensor:
         """
