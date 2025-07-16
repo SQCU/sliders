@@ -451,6 +451,10 @@ class ThroughputBatchFinder:
         best_throughput = 0.0
         slowdown_bs = -1
 
+        stagnation_counter = 0
+        search_start_time = time.time()
+        time_budget_seconds = 60 # Stop searching after 60 seconds regardless.
+
         # 1. Exponential search to find the performance cliff
         print(f"--- [BatchFinder] Starting exponential search for {self.model.__class__.__name__}... ---")
         bs = 1
@@ -474,10 +478,17 @@ class ThroughputBatchFinder:
             throughput = bs / ((end_time - start_time)+1e-6)   #a little epsilon for my friends
             print(f"  - Testing BS={bs}: {throughput:.2f} items/sec")
 
-            if throughput > best_throughput:
+            if throughput > best_throughput * 1.01: # Require at least a 1% improvement
                 best_throughput = throughput
                 best_bs = bs
+                stagnation_counter = 0 # Reset counter on improvement
+            else:
+                stagnation_counter += 1
             
+            if stagnation_counter >= 2:
+                print(f"  - Throughput has stagnated for {stagnation_counter} steps. Halting exponential search.")
+                break
+
             if throughput < best_throughput * self.slowdown_threshold and bs > best_bs:
                 print(f"  - Throughput slowdown detected at BS={bs}. Optimal is near {best_bs}.")
                 slowdown_bs = bs
@@ -486,7 +497,8 @@ class ThroughputBatchFinder:
             bs *= 2
             del batch_work, _ # Free memory before next iteration
 
-        # 2. Binary search to refine the optimal point if a slowdown was found
+        # Binary search is now conditional and less important, as stagnation will catch most cases.
+        # It's only useful if we hit a sharp memory cliff.
         if slowdown_bs != -1:
             print("--- [BatchFinder] Starting binary search to refine... ---")
             low = best_bs
