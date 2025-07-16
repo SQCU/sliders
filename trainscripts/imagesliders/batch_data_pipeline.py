@@ -391,3 +391,37 @@ def materialize_static_batches(schedule_dict: Dict[str, Any], environment: Dict[
 
     print("--- Materialization complete. ---")
     return static_batches
+
+#inside batch_data_pipeline.py 
+import torch
+from .batch_dataset_utils import ShamImageDataset
+from tqdm import tqdm
+
+def materialize_sham_dataset(config: dict, environment: dict) -> list[dict]:
+    """
+    Implements the unified data pipeline interface for the ShamImageDataset.
+    It produces a list of static batches, just like the real data pipeline.
+    """
+    print("--- [Data Pipeline] Materializing ShamImageDataset into static batches... ---")
+    dataset = ShamImageDataset(num_samples=config['num_samples'], size=config['size'])
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=config['batch_size'])
+    
+    static_batches = []
+    # A dummy timestep tensor, since it's generated live during training anyway
+    # but might be needed by the evaluation workload.
+    dummy_timesteps = torch.tensor([500], dtype=torch.long) 
+
+    for clean_images in tqdm(dataloader, desc="Materializing Sham Batches"):
+        # The batch now mimics the structure of an SDXL workload dict.
+        # This is the key to making the data flow model-agnostic.
+        batch_dict = {
+            'clean_images': clean_images, # For the training loop
+            'initial_latents': clean_images, # For the evaluation orchestrator
+            'timesteps': dummy_timesteps.expand(clean_images.shape[0]), # For eval
+            # Add a placeholder for conditioning, which TesterUViT will ignore.
+            'conditioning': {}, 
+        }
+        static_batches.append(batch_dict)
+        
+    print(f"--- Materialization complete. Created {len(static_batches)} static batches. ---")
+    return static_batches

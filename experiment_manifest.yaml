@@ -1,0 +1,47 @@
+      
+# experiment_manifest.yaml
+# The single source of truth for a generative harness experiment.
+
+search_config:
+  # This new block controls the search loop itself.
+  num_trials: 5
+  top_n_results_to_show: 3
+
+environment_setup:
+  # This block dictates the heavyweight, shared components.
+  # The harness is now model-agnostic. We specify what to load here.
+  base_model_name: 'TesterUViT'  # Can be 'TesterUViT' or 'StableDiffusionXL_UNet'
+  # Add any model-specific paths if loading a real model from disk
+  # model_path: '/path/to/your/sdxl/unet' 
+
+data_setup:
+  # The harness is data-agnostic. We specify the pipeline here.
+  pipeline: 'sham_image_dataset' # Can be 'sham_image_dataset' or 'sdxl_latent_dataset'
+  # Configs for the chosen pipeline
+  config:
+    num_samples: 128
+    size: 64
+    batch_size: 16
+
+trial_config:
+  # This block defines the parameters for the specific trial to be run.
+  lora_config:
+    lora_rules:
+      - name: "ATTN_and_FFN"
+        rank: 8
+        alpha: 1.0
+        target_name_contains: ['attn', 'ff.net']
+        
+  optimizer_config:
+    lr: 0.0005
+
+  training_config:
+    num_epochs: 10
+    prediction_type: 'epsilon' # 'epsilon', 'sample', or 'v_prediction'
+
+  evaluation_config:
+    sampling_config:
+      total_timesteps: 50
+      # guidance_scale will eventually be handled by the model_util functions
+
+    

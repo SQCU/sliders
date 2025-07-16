@@ -1,371 +1,394 @@
 # generative_lora_harness.py
-#python -m trainscripts.imagesliders.generative_lora_harness
-# The next evolution of our testing system, focused on a meaningful generative task.
-# This script includes a new scheduler, a synthetic dataset, real evaluation metrics,
-# and a new experiment runner to tie them all together.
+# The robust, doctrinally-sound generative experiment harness. Version 3.
+# python -m trainscripts.imagesliders.generative_lora_harness
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn as nn
 import yaml
-import os
-from PIL import Image, ImageDraw
-import numpy as np
+import copy
 from tqdm import tqdm
+import random
 
-# We assume the previously "locked-in" components are available.
-# For this script, we'll redefine them for clarity.
+# --- Core Imports ---
 from .flexible_lora_system import FlexibleLoRANetwork, LoRAConfigLoader, TesterUViT
-#new project imports
-#uv pip install torchmetrics[image]
+from .minimal_scheduler import MinimalDDPMScheduler
+from .batch_data_pipeline import materialize_sham_dataset
+from .batch_model_util import run_evaluation_flow, testeruvit_decoder_fn, testeruvit_diffusion_fn # Assuming this exists for eval
+from .batch_model_util import diffusion_fn as sdxl_diffusion_fn, vae_decoder_fn as sdxl_decoder_fn
+
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image.fid import FrechetInceptionDistance
 
-# ==============================================================================
-# SECTION 1: THE NEW, TRANSPARENT DIFFUSION SCHEDULER
-# ==============================================================================
+import warnings
 
-class MinimalDDPMScheduler:
-    """
-    A functional, from-scratch DDPM scheduler that is clear and supports
-    multiple prediction targets, as requested for serious research.
-    """
-    def __init__(self, num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012, device='cpu'):
-        self.num_train_timesteps = num_train_timesteps
-        self.device = device
-        
-        # The core of the schedule: a linear beta schedule
-        self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-
-        # These are the terms used in the q(x_t | x_0) forward process
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-
-        # === NEW: Values used in the REVERSE process (step) ===
-        # alphas_cumprod for the PREVIOUS timestep
-        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
-
-        # This is the term that gets multiplied by the model's output (predicted noise)
-        self.sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod)
-        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1)
-
-        # This is the variance of the posterior q(x_{t-1} | x_t, x_0)
-        self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-        
-        # Move everything to the correct device once during initialization
-        self.to(device)
-
-    def to(self, device):
-        # Move all pre-computed tensors to the specified device
-        for attr_name in dir(self):
-            attr_value = getattr(self, attr_name)
-            if torch.is_tensor(attr_value):
-                setattr(self, attr_name, attr_value.to(device))
-        return self
-
-    def _gather(self, consts: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Gathers the constants for a given timestep t."""
-        c = consts.gather(-1, t)
-        return c.reshape(-1, 1, 1, 1) # Reshape for broadcasting to image shape
-
-    def add_noise(self, original_samples: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        """The forward diffusion process q(x_t | x_0)."""
-        sqrt_alpha_prod = self._gather(self.sqrt_alphas_cumprod, timesteps)
-        sqrt_one_minus_alpha_prod = self._gather(self.sqrt_one_minus_alphas_cumprod, timesteps)
-        
-        noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
-        return noisy_samples
-
-    def get_prediction_target(self, original_samples, noise, timesteps, prediction_type="epsilon"):
-        """
-        As requested, this function provides the correct target for the model's
-        prediction based on the desired training objective.
-        - 'epsilon': (Default) Predict the noise that was added.
-        - 'sample': Predict the original clean image (x_0).
-        - 'v_prediction': Predict the "velocity", a reparameterization that can improve stability.
-        """
-        if prediction_type == "epsilon":
-            return noise
-        elif prediction_type == "sample":
-            return original_samples
-        elif prediction_type == "v_prediction":
-            sqrt_alpha_prod = self._gather(self.sqrt_alphas_cumprod, timesteps)
-            sqrt_one_minus_alpha_prod = self._gather(self.sqrt_one_minus_alphas_cumprod, timesteps)
-            # v = sqrt(alpha_prod) * noise - sqrt(1-alpha_prod) * x_0
-            return sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * original_samples
-        else:
-            raise ValueError(f"Unknown prediction type: {prediction_type}")
-
-    def step(self, model_output: torch.Tensor, timestep: int, sample: torch.Tensor, prediction_type="epsilon") -> torch.Tensor:
-        """
-        The core of the sampling loop. Predicts the sample at the previous timestep, x_{t-1}.
-        """
-        t = torch.tensor([timestep], device=self.device)
-        
-        # 1. Get the predicted original sample (x_0) from the model's output
-        if prediction_type == "epsilon":
-            # The formula to derive x_0 from x_t and the predicted noise (epsilon)
-            pred_original_sample = self._gather(self.sqrt_recip_alphas_cumprod, t) * sample - \
-                                   self._gather(self.sqrt_recipm1_alphas_cumprod, t) * model_output
-        else:
-            raise NotImplementedError("Only epsilon prediction is implemented for sampling.")
-
-        # Optional: Clamp the predicted x_0 to be in the valid range [-1, 1] or [0, 1]
-        # This is a common trick to improve stability. Assuming our data is [0, 1].
-        # pred_original_sample = torch.clamp(pred_original_sample, 0.0, 1.0)
-
-        # 2. Compute the coefficients for the posterior mean q(x_{t-1} | x_t, x_0)
-        beta_t = self._gather(self.betas, t)
-        sqrt_one_minus_alphas_cumprod_t = self._gather(self.sqrt_one_minus_alphas_cumprod, t)
-        sqrt_alpha_t_prev = self._gather(torch.sqrt(self.alphas_cumprod_prev), t)
-        
-        # Equation (7) from DDPM paper
-        posterior_mean = (sqrt_alpha_t_prev * beta_t / (1. - self.alphas_cumprod[t])) * pred_original_sample + \
-                         (self._gather(torch.sqrt(self.alphas), t) * (1. - self.alphas_cumprod_prev[t]) / (1. - self.alphas_cumprod[t])) * sample
-
-        # 3. Add noise to get the final sample for the previous timestep
-        variance = self._gather(self.posterior_variance, t)
-        noise = torch.randn_like(sample)
-
-        # No noise is added at the final step
-        prev_sample = posterior_mean + (variance.sqrt() * noise if timestep > 0 else 0)
-
-        return prev_sample
+# Suppress all FutureWarning messages
+warnings.simplefilter(action='ignore', category=FutureWarning) 
 
 # ==============================================================================
-# SECTION 2: THE "SHAM" SYNTHETIC DATASET
-# ==============================================================================
-
-class ShamImageDataset(torch.utils.data.Dataset):
-    """
-    Creates a synthetic dataset of two textured spheres on a textured background.
-    This provides a simple, reproducible, yet non-trivial generative task.
-    """
-    def __init__(self, num_samples=128, size=64):
-        self.num_samples = num_samples
-        self.size = size
-        self.cache = {}
-
-    def _create_texture(self, size, p1, p2, color1, color2):
-        """Creates a checkerboard or striped texture."""
-        img = Image.new('RGB', (size, size))
-        pixels = img.load()
-        for i in range(size):
-            for j in range(size):
-                if (i // p1) % 2 == (j // p2) % 2:
-                    pixels[i, j] = color1
-                else:
-                    pixels[i, j] = color2
-        return np.array(img) / 255.0
-
-    def _create_image(self, index):
-        """Generates a single image for the dataset."""
-        # Background texture
-        bg_color1, bg_color2 = ((50, 50, 50), (60, 60, 60)) if index % 2 == 0 else ((200, 200, 200), (210, 210, 210))
-        background = self._create_texture(self.size, 8, 8, bg_color1, bg_color2)
-
-        # Sphere 1
-        s1_texture = self._create_texture(self.size, 4, 8, (255, 0, 0), (200, 0, 0)) # Red stripes
-        s1_mask = Image.new('L', (self.size, self.size), 0)
-        draw = ImageDraw.Draw(s1_mask)
-        draw.ellipse((5, 10, 25, 30), fill=255)
-        
-        # Sphere 2
-        s2_texture = self._create_texture(self.size, 5, 5, (0, 0, 255), (0, 0, 200)) # Blue checkerboard
-        s2_mask = Image.new('L', (self.size, self.size), 0)
-        draw = ImageDraw.Draw(s2_mask)
-        draw.ellipse((35, 25, 60, 50), fill=255)
-
-        # Composite the image
-        s1_mask_np = np.array(s1_mask)[:, :, None] / 255.0
-        s2_mask_np = np.array(s2_mask)[:, :, None] / 255.0
-        
-        image = background * (1 - s1_mask_np) + s1_texture * s1_mask_np
-        image = image * (1 - s2_mask_np) + s2_texture * s2_mask_np
-
-        return torch.from_numpy(image).permute(2, 0, 1).float() # HWC -> CHW
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, index):
-        if index in self.cache:
-            return self.cache[index]
-        image = self._create_image(index)
-        self.cache[index] = image
-        return image
-
-# ==============================================================================
-# SECTION 3: REAL EVALUATION SUITE
+# SECTION 1: THE EVALUATOR (Now Doctrine-Compliant)
 # ==============================================================================
 
 class GenerativeEvaluator:
-    """Uses real metrics (LPIPS, FID) to evaluate generative model quality."""
-    def __init__(self, ground_truth_dataset, scheduler, device='cpu'):
-        self.device = device
-        self.ground_truth_dataset = ground_truth_dataset
-        self.scheduler = scheduler # <-- STORE SCHEDULER
-        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg').to(device)
-        # NOTE: Using a smaller feature size for FID for speed in this test harness.
-        self.fid = FrechetInceptionDistance(feature=64).to(device)
-        self.last_lpips_score = 0.0
-        self.last_fid_score = 0.0
-
+    """
+    Evaluates a model using the centralized `run_evaluation_flow` utility.
+    This class is now stateless during the evaluation call itself.
+    """
+    def __init__(self, eval_dataset: dict, environment: dict):
+        self.device = environment['device']
+        self.env = environment
         
+        # We now assume the dataset is already prepared
+        self.model_inputs = eval_dataset['model_inputs']
+        self.ground_truth_outputs = torch.cat(eval_dataset['ground_truth_outputs']).to(self.device)
+
+        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg').to(self.device)
+        self.fid = FrechetInceptionDistance(feature=64).to(self.device)
+
     @torch.no_grad()
-    def evaluate(self, model_to_test, num_samples=64, num_inference_steps=50):
-        """Generates images from the model and computes performance scores."""
+    def evaluate(self, model_to_test: nn.Module, sampling_config: dict) -> dict:
+        """
+        Calls the stateless evaluation flow and computes metrics.
+        The model_to_test is the specific network for the current trial.
+        """
         model_to_test.eval()
-        
-        # --- Generate Images from the model to test ---
-        image_shape = (num_samples, 3, self.ground_truth_dataset.size, self.ground_truth_dataset.size)
-        latents = torch.randn(image_shape, device=self.device)
-        timesteps = torch.linspace(self.scheduler.num_train_timesteps - 1, 0, num_inference_steps, dtype=torch.long, device=self.device)
+        print(f"--- [Evaluator] Beginning evaluation...")
 
-        for t in tqdm(timesteps, desc="Generating Images"):
-            model_output = model_to_test(latents)
-            latents = self.scheduler.step(model_output, t.item(), latents)
-        generated_images = latents.clamp(0, 1)
+        # Doctrine: Use the central, stateless function for the generation process.
+        # This function encapsulates the OffloadingOrchestrator and diffusion loop.
+        generated_images_list = run_evaluation_flow(
+        model_to_test=model_to_test,
+        environment=self.env,
+        # The model_inputs is now the list of workload dicts
+        workload=self.model_inputs, 
+        sampling_config=sampling_config
+    )
+        generated_images = torch.cat(generated_images_list).to(self.device, dtype=torch.float32)
 
-        # --- Get ground truth images ---
-        gt_images = torch.stack([self.ground_truth_dataset[i] for i in range(num_samples)]).to(self.device)
-
-        # --- Calculate LPIPS ---
-        lpips_score = self.lpips(generated_images, gt_images)
-        self.last_lpips_score = lpips_score 
-
-        # --- THE FIX: Populate BOTH real and fake features for FID on every call ---
-        self.fid.update((gt_images * 255).to(torch.uint8), real=True)
-        self.fid.update((generated_images * 255).to(torch.uint8), real=False)
+        # Correct FID usage: update both distributions before computing.
+        self.fid.update((self.ground_truth_outputs * 255).byte(), real=True)
+        self.fid.update((generated_images * 255).byte(), real=False)
         fid_score = self.fid.compute()
-        self.last_fid_score = fid_score
+        self.fid.reset()
+
+        lpips_score = self.lpips(generated_images, self.ground_truth_outputs)
         
-        # Now, reset is safe because we will repopulate both on the next call.
-        self.fid.reset() 
+        # The primary score to minimize (lower is better)
+        primary_score = lpips_score + fid_score * 0.1
 
-        performance_score = lpips_score + fid_score * 0.1
+        metrics = {
+            "primary_score": primary_score.item(),
+            "lpips": lpips_score.item(),
+            "fid": fid_score.item(),
+        }
+        print(f"--- Evaluation Complete: {metrics} ---")
+        return metrics
+
+#
+# SECTION! TWO! IT'S THE TRIALY! TRAINER!
+#
+
+def train_epoch(network, dataloader, scheduler, optimizer, training_config, device):
+    """
+    A stateless function to perform one epoch of training.
+    """
+    network.train()
+    losses = []
+    progress_bar = tqdm(dataloader, desc="Training Batches", leave=False)
+    for batch in progress_bar:
+        optimizer.zero_grad()
+        clean_images = batch['clean_images'].to(device)
+        noise = torch.randn_like(clean_images)
+        timesteps = torch.randint(0, scheduler.num_train_timesteps, (clean_images.shape[0],), device=device).long()
         
-        print(f"Evaluation Complete: LPIPS={lpips_score:.4f}, FID={fid_score:.4f} -> Final Score={performance_score:.4f}")
-        #return type of dict
-        return performance_score.item()
+        noisy_images = scheduler.add_noise(clean_images, noise, timesteps)
+        target = scheduler.get_prediction_target(clean_images, noise, timesteps, prediction_type=training_config['prediction_type'])
+        
+        # The model call is now generic. It works as long as the base model
+        # accepts (input_tensor, timesteps).
+        model_output = network(noisy_images, timesteps) 
+        loss = F.mse_loss(model_output.float(), target.float())
+        
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+        progress_bar.set_postfix({"Loss": f"{sum(losses[-5:])/5:.4f}"})
+    return losses
 
-# ==============================================================================
-# SECTION 4: THE NEW GENERATIVE EXPERIMENT RUNNER
-# ==============================================================================
+def run_generative_trial(base_environment: dict, static_batches: list, exp_config: dict):
+    """
+    The new harness, adhering to our doctrine. Runs a single, self-contained trial.
+    """
+    print(f"\n--- Running Trial: {exp_config['lora_config']['lora_rules'][0]['name']} ---")
+    
+    # --- 1. Per-Trial Setup ---
+    device = base_environment['device']
+    evaluator = base_environment['evaluator']
+    
+    # Create a fresh copy of the base model. Model Agnosticism in action.
+    trial_model = copy.deepcopy(base_environment['base_model']).to(device)
 
-def run_generative_experiment(config_dict, 
-    freeze_base_model=True, 
-    num_epochs = 5,
-    eval_every_n_epochs=1, # <-- New parameter to control interim evaluation
-    eval_num_samples=32,    # <-- Use fewer samples for faster interim evals
-    log_dir="gen_logs",
-    eval_kwargs={}):
+    # Freeze base model weights (a common PEFT strategy)
+    for param in trial_model.parameters():
+        param.requires_grad = False
+
+    # Create the specific, trainable LoRA network for this trial.
+    loader = LoRAConfigLoader(config_dict=exp_config['lora_config'])
+    resolved_config = loader.get_resolved_config(trial_model)
+    network = FlexibleLoRANetwork(trial_model, resolved_config).to(device)
+    
+    optimizer = torch.optim.AdamW(network.prepare_optimizer_params(), lr=exp_config['optimizer_config']['lr'])
+
+    # --- 2. Run Experiment ---
+    print("--- Evaluating untrained network (initial state)... ---")
+    initial_metrics = evaluator.evaluate(network, exp_config['evaluation_config'])
+
+    # Training Loop
+    all_losses = []
+    for epoch in range(exp_config['training_config']['num_epochs']):
+        print(f"--- Epoch {epoch + 1}/{exp_config['training_config']['num_epochs']} ---")
+        epoch_losses = train_epoch(
+            network, static_batches, base_environment['scheduler'], optimizer, exp_config['training_config'], device
+        )
+        all_losses.extend(epoch_losses)
+
+    print("--- Evaluating trained network (final state)... ---")
+    final_metrics = evaluator.evaluate(network, exp_config['evaluation_config'])
+
+    # --- 3. Return Structured Results ---
+    learning_delta = final_metrics['primary_score'] - initial_metrics['primary_score']
+    
+    return {
+        "results": {
+            "initial_metrics": initial_metrics,
+            "final_metrics": final_metrics,
+            "learning_delta": learning_delta,
+            "loss_history": all_losses,
+        }
+    }
+
+def setup_generative_environment(manifest: dict) -> dict:
     """
-    The new experiment runner, focused on the generative task.
-    This replaces the simple `run_experiment` and becomes our new "fitness function".
-    It now returns a dictionary with initial, final, and delta scores.
+    Handles the expensive, one-time setup based on the experiment manifest.
+    This is where model-specific logic is isolated.
     """
+    print("--- Setting up Generative Environment (ONCE)... ---")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # --- 1. Setup Dataset and Scheduler ---
-    dataset = ShamImageDataset()
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=True)
-    scheduler = MinimalDDPMScheduler(device=device)
-    
-    # --- 2. Build the Network---
-    uvit = TesterUViT()
-    if freeze_base_model:
-        print("--- Freezing base model weights for adapter-only training stress test ---")
-        for param in uvit.parameters():
-            param.requires_grad = False
-    
-    # Use the existing config loader
-    loader = LoRAConfigLoader(config_dict=config_dict)
-    resolved_config = loader.get_resolved_config(uvit)
-    network = FlexibleLoRANetwork(uvit, resolved_config).to(device)
-    
-    # === NEW: PRE-TRAINING EVALUATION ===
-    # Instantiate the evaluator before the training loop starts.
-    evaluator = GenerativeEvaluator(dataset, scheduler, device=device)
-    
-    print("\n--- Pre-Training Evaluation (Baseline of Random Network) ---")
-    initial_score = evaluator.evaluate(network, num_samples=eval_num_samples)
-    print(f"Initial Untrained Score: {initial_score:.4f}")
-    # ==================================
 
-    optimizer = torch.optim.AdamW(network.prepare_optimizer_params(), lr=1e-3)
-    evaluation_trajectory = [] # To store interim scores
+    # --- Principle 3: Model Agnosticism via a Factory ---
+    # The harness doesn't know about TesterUViT. This setup function does.
+    model_name = manifest['environment_setup']['base_model_name']
+    environment = {}
+    if model_name == 'TesterUViT':
+        base_model = TesterUViT()
+        # Install the TESTER shims into the environment
+        environment['diffusion_fn'] = testeruvit_diffusion_fn
+        environment['decoder_fn'] = testeruvit_decoder_fn
+        # The VAE is the model itself for decoding (identity op)
+        environment['vae'] = base_model 
+    elif model_name == 'StableDiffusionXL_UNet':
+        # ... load the real UNet ...
+        # ... load the real VAE ...
+        # Install the REAL processing functions
+        environment['diffusion_fn'] = sdxl_diffusion_fn
+        environment['decoder_fn'] = sdxl_decoder_fn
+        # environment['vae'] = the_real_vae
+        raise NotImplementedError("SDXL UNet loading is a placeholder.")
 
-    # --- 3. The Generative Training Loop ---
-    print("--- Starting Generative Training Loop ---")
-    for epoch in range(num_epochs):
-        for i, clean_images in enumerate(dataloader):
-            optimizer.zero_grad()
-            clean_images = clean_images.to(device)
-            noise = torch.randn_like(clean_images)
-            timesteps = torch.randint(0, scheduler.num_train_timesteps, (clean_images.shape[0],), device=device).long()
-            noisy_images = scheduler.add_noise(clean_images, noise, timesteps)
-            target = scheduler.get_prediction_target(clean_images, noise, timesteps, prediction_type="epsilon")            
-            model_output = network(noisy_images) # The model predicts the target
-            loss = F.mse_loss(model_output, target)
-            loss.backward()
-            optimizer.step()
-        print(f"Epoch {epoch+1}, Final Batch Loss: {loss.item():.4f}")
-        # === NEW: INTERIM EVALUATION LOGIC ===
-        if (epoch + 1) % eval_every_n_epochs == 0:
-            print(f"--- Interim Evaluation after Epoch {epoch+1} ---")
-            interim_score = evaluator.evaluate(network, num_samples=eval_num_samples)
-            evaluation_trajectory.append(interim_score)
-        elif (epoch+1)==num_epochs:
-            print(f"--- Final Evaluation after Epoch {epoch+1} ---")
-            interim_score = evaluator.evaluate(network, num_samples=eval_num_samples)
-            evaluation_trajectory.append(interim_score)
+    # --- Principle 4: Unified Data Pipeline ---
+    pipeline_name = manifest['data_setup']['pipeline']
+    if pipeline_name == 'sham_image_dataset':
+        # The data pipeline is now a swappable component.
+        # The environment object only needs the scheduler and device here.
+        temp_env = {'scheduler': MinimalDDPMScheduler(device=device), 'device': device}
+        static_batches = materialize_sham_dataset(manifest['data_setup']['config'], temp_env)
+    else:
+        raise ValueError(f"Unknown data pipeline in manifest: {pipeline_name}")
 
-        # ===================================
+    # Unstub the eval_dataset creation by correctly deconstructing the static batches.
+    # The orchestrator expects a flat list of individual items for its workload.
+    all_model_inputs_for_eval = []
+    all_ground_truth_for_eval = []
 
-    # --- 4. Finalize and Return Rich Results ---
-    final_score = evaluation_trajectory[-1] if evaluation_trajectory else initial_score
-    learning_delta = final_score - initial_score # Negative is better
-    
-    print(f"\n--- Experiment Run Summary ---")
-    print(f"  Initial Score (Random): {initial_score:.4f}")
-    print(f"  Final Score (Trained):  {final_score:.4f}")
-    print(f"  Learning Delta:         {learning_delta:.4f} (The key metric!)")
-    
-    # At the very end, instead of just returning the dictionary...
-    results_dict = {
-        "initial_score": initial_score,
-        "final_score": final_score,
-        "learning_delta": learning_delta,
-        "lpips": evaluator.last_lpips_score,
-        "fid": evaluator.last_fid_score,
-        "trajectory": evaluation_trajectory
+    for batch in static_batches:
+        all_ground_truth_for_eval.append(batch['clean_images'])
+        num_items_in_batch = batch['clean_images'].shape[0]
+        for i in range(num_items_in_batch):
+            # Create a workload dict for each individual sample in the batch.
+            # The orchestrator will re-batch these later.
+            item_dict = {
+                'initial_latents': batch['initial_latents'][i:i+1],
+                'timesteps': batch['timesteps'][i:i+1],
+                'conditioning': batch['conditioning'],
+            }
+            all_model_inputs_for_eval.append(item_dict)
+
+    eval_dataset = {
+    'model_inputs': all_model_inputs_for_eval, # NOW A POPULATED LIST :)
+    'ground_truth_outputs': all_ground_truth_for_eval
     }
 
-    return network, results_dict
+    # Create the final environment dictionary
+    environment.update({
+        'device': device,
+        'base_model': base_model,
+        'scheduler': MinimalDDPMScheduler(device=device),
+        # This is placeholder data for the evaluator, it needs to be made generic
+        'eval_dataset': eval_dataset
+    })
+    environment['evaluator'] = GenerativeEvaluator(environment['eval_dataset'], environment)
+    
+    print("--- Generative Environment Setup Complete. ---")
+    return environment, static_batches
+
+#
+#   SECTION! THREE! IT'S THE SEARCH ABSTRACTA!
+#
 
 
-# --- Example of how the search controller would use this ---
+class RandomSearchController:
+    """
+    Performs a simple random search by generating LoRA configurations and
+    invoking a self-contained "harness function" to run each trial.
+    """
+    def __init__(self,
+                 search_space_path: str,
+                 harness_fn,
+                 base_environment: dict,
+                 static_batches: list,
+                 base_exp_config: dict):
+        """
+        Initializes the controller.
+
+        Args:
+            search_space_path: Path to YAML file defining the LoRA search space.
+            harness_fn: The function that runs a full, self-contained experiment trial.
+                        Expected signature: harness_fn(base_env, static_batches, exp_config)
+            base_environment: The heavy, reusable environment objects.
+            static_batches: The pre-materialized training data.
+            base_exp_config: The non-LoRA part of the experiment config.
+        """
+        with open(search_space_path, 'r') as f:
+            self.search_space = yaml.safe_load(f)
+
+        self.harness_fn = harness_fn
+        self.base_environment = base_environment
+        self.static_batches = static_batches
+        self.base_exp_config = base_exp_config
+        self.results = []
+        print("--- Random Search Controller Initialized (Doctrine-Compliant) ---")
+
+    def _sample_config(self) -> dict:
+        """Generates a random LoRA configuration from the search space."""
+        config_dict = {'lora_rules': []}
+        num_rules = random.randint(self.search_space['num_rules']['min'], self.search_space['num_rules']['max'])
+        for i in range(num_rules):
+            target_type = random.choice(list(self.search_space['targets'].keys()))
+            target_params = self.search_space['targets'][target_type]
+            rule = {
+                'name': f"{target_type}_rule_{i}_{random.randint(1000, 9999)}",
+                'rank': random.choice(self.search_space['rank']),
+                'alpha': random.choice(self.search_space['alpha']),
+                'target_name_contains': target_params['target_name_contains']
+            }
+            config_dict['lora_rules'].append(rule)
+        return config_dict
+
+    def run_search(self, num_trials: int):
+        """Executes the main random search loop."""
+        for i in range(num_trials):
+            print(f"\n{'='*25} Search Trial {i+1}/{num_trials} {'='*25}")
+            
+            # 1. Controller samples a new LoRA config
+            lora_config = self._sample_config()
+            
+            # 2. Update the master experiment manifest for this specific trial
+            trial_config = copy.deepcopy(self.base_exp_config)
+            trial_config['lora_config'] = lora_config
+
+            # 3. Invoke the harness to run the entire trial. This is the core doctrine.
+            run_output = self.harness_fn(
+                base_environment=self.base_environment,
+                static_batches=self.static_batches,
+                exp_config=trial_config
+            )
+
+            # 4. Log the results
+            result_entry = {
+                'trial_num': i+1,
+                'config_name': lora_config['lora_rules'][0]['name'],
+                **run_output['results']
+            }
+            self.results.append(result_entry)
+            print(f"--- Trial Complete. Delta: {result_entry['learning_delta']:.4f}, Final Score: {result_entry['final_metrics']['primary_score']:.4f} ---")
+
+    def show_best_results(self, top_n=3):
+        """Sorts and prints the best results from the search."""
+        if not self.results:
+            print("No results to show.")
+            return
+
+        # Lower learning_delta is better
+        sorted_results = sorted(self.results, key=lambda x: x['learning_delta'])
+        
+        print("\n" + "="*60)
+        print("--- TOP SEARCH RESULTS (by Learning Delta) ---")
+        for i, result in enumerate(sorted_results[:top_n]):
+            print(f"  RANK {i+1}:")
+            print(f"    - Config Name: {result['config_name']}")
+            print(f"    - Learning Delta: {result['learning_delta']:.4f}")
+            print(f"    - Final Score: {result['final_metrics']['primary_score']:.4f}")
+            print(f"    - Final LPIPS: {result['final_metrics']['lpips']:.4f}")
+            print(f"    - Final FID: {result['final_metrics']['fid']:.4f}")
+        print("="*60)
+
+def create_search_space_yaml(path="search_space.yaml"):
+    """Helper function to create an example search space config file."""
+    search_space = {
+        'num_rules': {'min': 1, 'max': 1}, # Keep it simple for now
+        'rank': [4, 8, 16, 32],
+        'alpha': [1.0, 2.0, 4.0],
+        'targets': {
+            'all_attention': {'target_name_contains': ['attn']},
+            'all_ffn': {'target_name_contains': ['ff.net']},
+            'mid_block_only': {'target_name_contains': ['mid_block']},
+            'up_blocks_only': {'target_name_contains': ['up_blocks']},
+            'qkv_only': {'target_name_contains': ['to_q', 'to_k', 'to_v']}
+        }
+    }
+    with open(path, 'w') as f:
+        yaml.dump(search_space, f, indent=2)
+    return path
+
+# ==============================================================================
+# SECTION 4: MAIN EXECUTION BLOCK
+# ==============================================================================
+
+
 if __name__ == "__main__":
-    # The search controller would be nearly identical to the previous version,
-    # but its main call would be to `run_generative_experiment`.
+    # --- STEP 1: Load the master configuration ---
+    with open('experiment_manifest.yaml', 'r') as f:
+        manifest = yaml.safe_load(f)
+
+    # --- STEP 2: One-time, expensive setup ---
+    environment, static_batches = setup_generative_environment(manifest)
+    print(f"\nReusable environment ready. Contains: {list(environment.keys())}")
     
-    print("\n--- Example single run of the new Generative Harness ---")
+    # --- STEP 3: Initialize the Search Controller ---
+    search_space_file = create_search_space_yaml()
+    controller = RandomSearchController(
+        search_space_path=search_space_file,
+        harness_fn=run_generative_trial, # Pass the harness function directly
+        base_environment=environment,
+        static_batches=static_batches,
+        base_exp_config=manifest['trial_config']
+    )
+
+    # --- STEP 4: Execute the Search Loop ---
+    num_search_trials = manifest['search_config']['num_trials']
+    controller.run_search(num_trials=num_search_trials)
     
-    # Create a sample config to test with
-    config_dict = {
-        'lora_rules': [
-            {'name': "All_Attention", 'rank': 8, 'alpha': 1.0, 'init_scheme': 'kaiming_cheald', 'target_name_contains': ['attn']},
-            {'name': "All_FFN", 'rank': 16, 'alpha': 2.0, 'target_name_contains': ['ff.net']}
-        ]
-    }
-    
-    # Run the experiment.
-    # We set freeze_base_model=True to run the "bold/stupid" test.
-    results = run_generative_experiment(config_dict, freeze_base_model=True, num_epochs=20, eval_every_n_epochs=6)
-    
-    # Access the specific metric you want to print from the dictionary
-    print(f"\nExperiment finished with final performance score (delta): {results['learning_delta']:.4f}")
+    # --- STEP 5: Show summary of results ---
+    # Doctrine Compliance: The number of results to show is also from the manifest.
+    top_n = manifest['search_config'].get('top_n_results_to_show', 3)
+    controller.show_best_results(top_n=top_n)

@@ -633,7 +633,8 @@ class TesterUViT(nn.Module):
         ])
         self.final_conv = nn.Conv2d(128, 3, kernel_size=3, padding=1)
     
-    def forward(self, x):
+    def forward(self, x, *args, **kwargs):
+        #if you pass a latents then a timesteps, the timesteps are absorbed and ignored ;)
         x = self.initial_conv(x); x = x.permute(0, 2, 3, 1)
         for block in self.down_blocks:
             for attn in block.attentions: x = attn(x)
