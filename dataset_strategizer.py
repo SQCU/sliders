@@ -5,6 +5,7 @@ import os
 import random
 import hashlib
 from typing import Iterator, Callable
+from discovery_scanner import call_from_path as discover_data_pool_from_manifest
 
 # --- Helper Functions ---
 
@@ -137,17 +138,13 @@ def dataset_strategizer(manifest_path: Path) -> Callable[[], Iterator[dict]]:
     if not train_config:
         raise ValueError("'data_setup.config' (for train config) not found in the manifest.")
 
-    # 2. Get Data Pool (using a placeholder for discover_data_pool_from_manifest)
-    _project_root = Path(os.getcwd())
-    _datasets_bracket_path = _project_root / "datasets" / "bracket"
-    data_pool = {
-        'A.png': {0.15: str(_datasets_bracket_path / "0" / "A.png"), 1.0: str(_datasets_bracket_path / "1" / "A.png"), 2.0: str(_datasets_bracket_path / "2" / "A.png")},
-        'B.jpg': {0.15: str(_datasets_bracket_path / "0" / "B.jpg"), 1.0: str(_datasets_bracket_path / "1" / "B.jpg"), 2.0: str(_datasets_bracket_path / "2" / "B.jpg")},
-        'B.png': {0.15: str(_datasets_bracket_path / "0" / "B.png"), 1.0: str(_datasets_bracket_path / "1" / "B.png"), 2.0: str(_datasets_bracket_path / "2" / "B.png")},
-        'C.png': {0.15: str(_datasets_bracket_path / "0" / "C.png"), 1.0: str(_datasets_bracket_path / "1" / "C.png"), 2.0: str(_datasets_bracket_path / "2" / "C.png")},
-    }
+    # 2. Get Data Pool (using discover_data_pool_from_manifest)
+    data_pool = discover_data_pool_from_manifest(manifest_path)
+    if not data_pool:
+        raise ValueError("Data pool discovery failed or returned empty.")
 
     # Load prompt sources
+    _project_root = Path(os.getcwd())
     root_prompts_path = _project_root / data_config['prompt_sources']['root']['file']
     metadata_path = _project_root / data_config['prompt_sources']['metadata']['file']
 

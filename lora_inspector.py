@@ -1,5 +1,4 @@
-##
-#   ?python lora_inspector.py "path/to/your/good_lora.safetensors" "path/to/your/molKM_IL_imageslider_b.safetensors" 
+# python lora_inspector.py 
 #
 #
 
