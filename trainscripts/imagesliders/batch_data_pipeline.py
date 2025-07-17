@@ -16,7 +16,7 @@ from collections import defaultdict
 from tqdm import tqdm
 from safetensors.torch import save_file, load_file
 from PIL import Image
-
+from .batch_train_util import create_batched_prompt_embeddings
 from .batch_train_util import neo_create_batched_prompt_embeddings, get_add_time_ids
 #from .data_processing_utils import encode_images_to_latents # Still needed
 #not needed anymore!
@@ -285,7 +285,7 @@ def materialize_static_batches(schedule_dict: Dict[str, Any], environment: Dict[
         "text_encoders": environment['text_encoders'],
         "prompts": prompt_dict,
         }
-        embeds = neo_create_batched_prompt_embeddings(**text_encoder_kwargs)
+        embeds = create_batched_prompt_embeddings(**text_encoder_kwargs)
         #returns (text_emb, text_pool)
         text_embeddings_cache[key] = tuple(t.cpu() for t in embeds)
 
@@ -484,12 +484,17 @@ def materialize_sdxl_latent_dataset(config: dict, environment: dict) -> list[dic
     with open(config['prompt_sources']['metadata']['file'], 'r') as f:
         metadata = json.load(f)
 
+    # Get the weight_dtype from the environment.
+    weight_dtype = environment.get("weight_dtype", torch.bfloat16)
+
     # ==========================================================================
     # STAGE 1: DISCOVER & FILTER DATA POOL (UNSTUBBED)
     # ==========================================================================
     print("--- Stage 1: Discovering and filtering image pool... ---")
     rng = random.Random(config['seed'])
     data_pool = defaultdict(dict)
+    #are some of our scales being read as integers? we can maybe fix this in our data pool filtering + discovery.
+    config['scales'] = [float(scale) for scale in config['scales']]
     
     for folder_name, scale in zip(config['folders'], config['scales']):
         subfolder_path = Path(config['folder_main']) / folder_name
@@ -664,16 +669,19 @@ def materialize_sdxl_latent_dataset(config: dict, environment: dict) -> list[dic
             unit_id = next(u['unit_id'] for u in batch_of_units if item in u['items'])
             noise_generator.manual_seed(hash(unit_id))
             latent_shape = latent_data['latent'].shape
-            noise = torch.randn(latent_shape, generator=noise_generator)
+            noise = torch.randn(latent_shape, generator=noise_generator, dtype=weight_dtype)
             batch_tensor_lists['noise'].append(noise)
             
             # Get additive time embeddings
             add_time_ids = get_add_time_ids(
                 latent_data['original_size'][0], 
                 latent_data['original_size'][1], 
-                False, dtype=torch.float32
+                False, dtype=torch.float32  # this is part of our guess at the implicit 'api contract' of sdxl.
             )
-            batch_tensor_lists['add_time_ids'].append(add_time_ids)
+            #batch_tensor_lists['add_time_ids'].append(add_time_ids)
+            # FIX: Duplicate the time_ids for the [unconditional, conditional] pair
+            # to match the structure of the other cfg_ tensors.
+            batch_tensor_lists['add_time_ids'].append(torch.cat([add_time_ids, add_time_ids]))
             
             # --- Select and Stack CFG Embeddings ---
             # Index 0: Positive, 1: Unconditional, 2: Neutral
@@ -717,10 +725,10 @@ def materialize_sdxl_latent_dataset(config: dict, environment: dict) -> list[dic
 
         final_batch = {
             "latents": torch.stack(batch_tensor_lists['latents']),
-            "scales": torch.tensor(batch_tensor_lists['scales']),
+            "scales": torch.tensor(batch_tensor_lists['scales']).to(dtype=weight_dtype),
             "noise": torch.stack(batch_tensor_lists['noise']),
             # `add_time_ids` has an extra dim, so we cat instead of stack
-            "add_time_ids": torch.cat(batch_tensor_lists['add_time_ids']),
+            "add_time_ids": torch.cat(batch_tensor_lists['add_time_ids']).to(dtype=weight_dtype),
             # These are already stacked per-item, so we concatenate them along the batch dim
             "cfg_text_embeddings": torch.cat(batch_tensor_lists['cfg_text_embeddings']),
             "cfg_pooled_embeds": torch.cat(batch_tensor_lists['cfg_pooled_embeds']),

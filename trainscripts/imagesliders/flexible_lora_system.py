@@ -381,6 +381,8 @@ class LoRAConfigLoader:
         for name, module in unet.named_modules():
             # --- FIX #1: IGNORE CONTAINERS ---
             # We only consider primitive layers that can actually have LoRA applied.
+            if "time_embed" in name:
+                continue # Skip this module entirely, do not even consider it.
             if not isinstance(module, (nn.Linear, nn.Conv2d)):
                 continue
 
@@ -437,44 +439,36 @@ class LoRAInjectedLayer(nn.Module):
         self.org_module = org_module
         self.lora_module = lora_module
 
-    def forward(self, x, *args, **kwargs):
-        # 1. Get the output from the original, frozen module
-        original_output = self.org_module(x, *args, **kwargs)
-
-        # 2. Get the LoRA delta from our flexible module
-        lora_delta = self.lora_module(x)
-
-        # 3. Get the per-item multiplier for this batch
+    def forward(self, x):
+        # 1. Get the output from the original, frozen module.
+        # Pass through any extra args for compatibility with different layers.
+        original_output = self.org_module(x)
+        lora_output = self.lora_module.lora_up(self.lora_module.lora_down(x))
         multiplier = self.lora_module.multiplier
-
-        # 4. Dynamically compute the scale (alpha / rank)
-        # This works correctly whether alpha is a buffer or a trainable parameter.
-        scale = self.lora_module.alpha / self.lora_module.lora_dim
+        scale = self.lora_module.scale
 
         # 5. Reshape the multiplier for broadcasting
         # This ensures each item in the batch gets its own scale applied.
         if multiplier.ndim == 0 or multiplier.numel() == 1:
             # Scalar multiplier applies to the whole batch
-            reshaped_multiplier = multiplier.to(lora_delta.device, dtype=lora_delta.dtype)
+            reshaped_multiplier = multiplier.to(x.device, dtype=x.dtype)
         else:
-            # Tensor multiplier needs to be reshaped to (B, 1, 1, 1) for Conv or (B, 1) for Linear
             reshaped_multiplier = multiplier.view(
-                lora_delta.shape[0], *([1] * (lora_delta.ndim - 1))
-            ).to(lora_delta.device, dtype=lora_delta.dtype)
+                lora_output.shape[0], *([1] * (lora_output.ndim - 1))
+            ).to(lora_output.device, dtype=lora_output.dtype)
 
         # 6. Combine everything for the final output
-        return original_output + (lora_delta * reshaped_multiplier * scale)
+        return original_output + (lora_output * reshaped_multiplier * scale)
 
 
 class FlexibleLoRAModule(nn.Module):
-    """A flexible LoRA module driven by a detailed configuration."""
-    def __init__(self, org_module, rank, alpha, train_alpha, init_scheme):
+    """A flexible LoRA module that acts as a simple data container."""
+    def __init__(self,
+    lora_name: str,
+     org_module, rank, alpha, train_alpha, init_scheme):
         super().__init__()
+        self.lora_name = lora_name
         self.lora_dim = rank
-
-        # --- RE-INTRODUCE THE MULTIPLIER BUFFER ---
-        # Each module holds its own multiplier, which will be set by the network.
-        # Default to 1.0, which means LoRA is fully active if not otherwise specified.
         self.register_buffer("multiplier", torch.tensor(1.0))
 
         if isinstance(org_module, nn.Linear):
@@ -490,57 +484,75 @@ class FlexibleLoRAModule(nn.Module):
             print(f"wait what? you tried to lora a \"{org_module}\"")
             raise NotImplementedError
 
+        # Initialize the weights using the specified scheme
         get_initializer(init_scheme)(self.lora_down, self.lora_up)
 
+        # Handle alpha as either a trainable parameter or a fixed buffer
         if train_alpha:
             self.alpha = nn.Parameter(torch.tensor(float(alpha)))
         else:
             self.register_buffer("alpha", torch.tensor(float(alpha)))
-
-    def forward(self, x):
-        # The forward pass is now clean: it only computes the LoRA delta.
-        # The LoRAInjectedLayer handles scaling and multiplication.
-        return self.lora_up(self.lora_down(x))
-
+            
+        # Pre-calculate and store the scale value, matching the original working code.
+        self.register_buffer("scale", torch.tensor(alpha / self.lora_dim))
 
 class FlexibleLoRANetwork(nn.Module):
-    """Builds and manages a LoRA network based on a fully resolved configuration map."""
+    """
+    Builds and manages a LoRA network based on a fully resolved configuration map.
+    This implementation is now architecturally identical to the proven BatchedLoRANetwork.
+    """
     def __init__(self, unet, resolved_config):
         super().__init__()
-        self.unet = unet
-        self.resolved_config = resolved_config
-        self.unet_loras = nn.ModuleDict()
-        self._create_and_apply_modules(self.unet)
+        self.unet_loras: nn.ModuleDict = nn.ModuleDict()
+        self.module_creation_count = 0
+        self.module_replacement_count = 0
 
-    def _create_and_apply_modules(self, root_module):
-        lora_map = self.resolved_config.get("lora_map", {})
+        # Pass both the unet and the config map to the creation method.
+        self._create_and_apply_modules(unet, resolved_config)
+
+        # --- Identical Debugging and Assertions ---
+        print(f"DEBUG: Total FlexibleLoRAModule creations: {self.module_creation_count}")
+        print(f"DEBUG: Total module replacements: {self.module_replacement_count}")
+
+        lora_names = set(self.unet_loras.keys())
+        assert len(lora_names) == len(self.unet_loras), "Duplicate LoRA names found."
         
+        # The unet is no longer stored in self, matching the original.
+        del unet
+        torch.cuda.empty_cache()
+
+    def _create_and_apply_modules(self, root_module: nn.Module, resolved_config: dict):
+        lora_map = resolved_config.get("lora_map", {})
+        
+        # --- PASS 1: DISCOVERY (Identical Structure) ---
+        modules_to_replace = []
         for name, module in root_module.named_modules():
+            # The ONLY difference is the condition: a map lookup vs. a function call.
             if name in lora_map:
-                if not isinstance(module, (nn.Linear, nn.Conv2d)):
-                    #print(f"DEBUG: Rule matched name '{name}' but module type is {type(module).__name__}, skipping.")
-                    continue
-                lora_config = lora_map[name].copy() # Use a copy to avoid modifying the original dict
-                # --- THE FIX IS HERE ---
-                # Pop the 'lora_name' from the config dict. It's metadata for the network,
-                # not the module. This leaves only the keyword arguments that the
-                # FlexibleLoRAModule constructor expects.
-                lora_name = lora_config.pop('lora_name')
+                modules_to_replace.append((name, module))
 
-                lora_name = f"lora_unet_{name.replace('.', '_')}"
-                
-                lora_module = FlexibleLoRAModule(module, **lora_config)
-                self.unet_loras[lora_name] = lora_module
+        # --- PASS 2: APPLICATION (Identical Structure) ---
+        for name, module in modules_to_replace:
+            path_parts = name.split('.')
+            parent_module = root_module
+            for part in path_parts[:-1]:
+                parent_module = getattr(parent_module, part)
+            
+            child_name = path_parts[-1]
+            
+            # Retrieve the specific configuration for this exact module from the map.
+            lora_config = lora_map[name].copy()
+            lora_name_key = lora_config.pop('lora_name')
+            
+            # Instantiate the lora_module using its specific, flexible config.
+            lora_module = FlexibleLoRAModule(lora_name_key, module, **lora_config)
+            
+            self.unet_loras[lora_name_key] = lora_module
+            self.module_creation_count += 1
 
-                # This part recursively finds the parent to perform the replacement
-                path_parts = name.split('.')
-                parent = root_module
-                for part in path_parts[:-1]:
-                    parent = getattr(parent, part)
-                
-                # Replace the original module with our injected layer
-                setattr(parent, path_parts[-1], LoRAInjectedLayer(module, lora_module))
-                #print(f"Applied LoRA to '{name}' with config: {lora_config}")
+            injected_layer = LoRAInjectedLayer(module, lora_module)
+            setattr(parent_module, child_name, injected_layer)
+            self.module_replacement_count += 1
 
     def prepare_optimizer_params(self):
         params = []
@@ -576,9 +588,42 @@ class FlexibleLoRANetwork(nn.Module):
         for lora_module in self.unet_loras.values():
             lora_module.multiplier = torch.tensor(0.0)
     
-    # --- END OF THE FIX ---
-    def forward(self, *args, **kwargs):
-        return self.unet(*args, **kwargs)
+    
+    def save_weights(self, file, dtype= torch.bfloat16, metadata= None):
+        """
+        Saves the state dictionary with keys matching the standard LoRA format.
+        This version translates the internal, "dirty" keys to "clean" standard keys on the fly.
+        """
+        state_to_save = {}
+        
+        # Get the internal state dict, which has the "dirty" keys we need to clean.
+        # Example dirty key: unet_loras.lora_unet___orig_mod_... .lora_down.weight
+        internal_state_dict = self.state_dict()
+        
+        prefix_to_remove = "unet_loras."
+        
+        for dirty_key, value in internal_state_dict.items():
+            if not dirty_key.startswith(prefix_to_remove):
+                continue
+
+            # Remove the 'unet_loras.' part
+            key_without_prefix = dirty_key[len(prefix_to_remove):]
+            
+            # This is the crucial fix: replace the unwanted wrapper artifact
+            # to match the standard LoRA naming convention.
+            clean_key = key_without_prefix.replace('__orig_mod_', '_')
+            
+            if "lora_down" in clean_key or "lora_up" in clean_key or "alpha" in clean_key:
+                 state_to_save[clean_key] = value.to("cpu", dtype=dtype)
+
+        if not state_to_save:
+            print("WARNING: No LoRA parameters found to save. Check network structure and key prefixes.")
+            return
+
+        if os.path.splitext(file)[1] == ".safetensors":
+            save_file(state_to_save, file, metadata=metadata)
+        else:
+            torch.save(state_to_save, file)
 
 
 # ==============================================================================

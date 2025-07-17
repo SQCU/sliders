@@ -37,8 +37,7 @@ def load_models(config, device, weight_dtype):
     return vae, unet, tokenizers, text_encoders
 
 def load_models_path(path, weight_dtype):
-    tdcpu = torch.device("cpu")
-    print(f"Loading models from {path} to device: {tdcpu} with dtype: {weight_dtype}")
+    print(f"Loading models from {path} with dtype: {weight_dtype}")
 
     # Load the pipeline from the local .safetensors file
     pipe = StableDiffusionXLPipeline.from_single_file(
@@ -47,13 +46,13 @@ def load_models_path(path, weight_dtype):
         cache_dir=DIFFUSERS_CACHE_DIR,
     )
 
-    unet = pipe.unet.to(device=tdcpu)
+    unet = pipe.unet
     tokenizers = [pipe.tokenizer, pipe.tokenizer_2]
-    text_encoders = [pipe.text_encoder.to(device=tdcpu), pipe.text_encoder_2.to(device=tdcpu)]
+    text_encoders = [pipe.text_encoder, pipe.text_encoder_2]
     if len(text_encoders) == 2:
         text_encoders[1].pad_token_id = 0
 
-    vae = pipe.vae.to(device=tdcpu)
+    vae = pipe.vae
     del pipe  #compulsory pipe deletion, always delete that pipe!
 
     # Enable gradient checkpointing no matter what.
@@ -424,8 +423,6 @@ def testeruvit_decoder_fn(model, batch_work, environment):
     # It exists solely to satisfy the orchestrator's pipeline structure.
     return batch_work
 
-import time
-import numpy as np
 
 class ThroughputBatchFinder:
     """
@@ -477,6 +474,12 @@ class ThroughputBatchFinder:
 
             throughput = bs / ((end_time - start_time)+1e-6)   #a little epsilon for my friends
             print(f"  - Testing BS={bs}: {throughput:.2f} items/sec")
+
+            if best_throughput:
+                elapsed = time.time()-search_start_time
+                if bs/best_throughput + elapsed >= time_budget_seconds:
+                    print(f"{bs/best_throughput + elapsed} next batch projected duration exceeds time_budget.")
+                    break
 
             if throughput > best_throughput * 1.01: # Require at least a 1% improvement
                 best_throughput = throughput

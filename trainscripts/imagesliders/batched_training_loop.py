@@ -131,9 +131,7 @@ def train_step(batch: Dict[str, Any], **environment: Dict[str, Any]):
     noise_scheduler.set_timesteps(1000)
     noise_scheduler = noise_scheduler.to(device)
     normalized_tsteps = torch.round(timesteps_to * 1000 / config.train.max_denoising_steps).long()
-    unet_timesteps = noise_scheduler.timesteps[
-        normalized_tsteps
-    ]
+    unet_timesteps = noise_scheduler.timesteps[normalized_tsteps]
     unet_timesteps = unet_timesteps.to(device)
     # timesteps_to has shape [B]. Get scheduler timesteps and duplicate to [B*2]
     unet_timesteps_cfg = torch.cat([unet_timesteps, unet_timesteps], dim=0)

@@ -15,8 +15,10 @@ from .flexible_lora_system import FlexibleLoRANetwork, LoRAConfigLoader, TesterU
 from .minimal_scheduler import MinimalDDPMScheduler
 from .batch_data_pipeline import materialize_sham_dataset
 from .batch_data_pipeline import materialize_sdxl_latent_dataset
+from .batch_model_util import ThroughputBatchFinder
 from .batch_model_util import run_evaluation_flow, testeruvit_decoder_fn, testeruvit_diffusion_fn # Assuming this exists for eval
 from .batch_model_util import diffusion_fn as sdxl_diffusion_fn, vae_decoder_fn as sdxl_decoder_fn
+#from .batch_model_util import _estimate_training_throughput
 
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image.fid import FrechetInceptionDistance
@@ -94,19 +96,106 @@ class GenerativeEvaluator:
 # SECTION! TWO! IT'S THE TRIALY! TRAINER!
 #
 
+import time
+import numpy as np
+import copy
+
+
+def _estimate_training_throughput(environment: dict, sample_batch: dict, search_space: dict) -> float:
+    """
+    A utility to time a training run by transparently wrapping the train_epoch function.
+    This ensures the timing is based on the exact same code path as real training.
+    """
+    from .flexible_lora_system import LoRAConfigLoader, FlexibleLoRANetwork # Keep local to avoid circular import at top level
+    
+    print("    - Building representative network for timing estimate...")
+    
+    # --- 1. Create a "median" LoRA config (remains the same) ---
+    median_rank = sorted(search_space['rank'])[len(search_space['rank']) // 2]
+    median_alpha = sorted(search_space['alpha'])[len(search_space['alpha']) // 2]
+    representative_target = search_space['targets']['all_attention']['target_name_contains']
+    representative_lora_config = {
+        'lora_rules': [{'name': "timing_estimator_rule", 'rank': median_rank, 'alpha': median_alpha, 'target_name_contains': representative_target}]
+    }
+    print(f"    - Using representative config: rank={median_rank}, target='{representative_target}'")
+    weight_dtype = environment["weight_dtype"]
+    # --- 2. Build the network and optimizer (remains the same) ---
+    device = environment['device']
+    trial_model = (environment['base_model']).to(
+    device=device,
+    dtype=weight_dtype  # <--- THIS LINE IS MISSING IN THE TIMING FUNCTION
+    )
+    for param in trial_model.parameters():
+        param.requires_grad = False
+    loader = LoRAConfigLoader(config_dict=representative_lora_config)
+    resolved_config = loader.get_resolved_config(trial_model)
+    network = FlexibleLoRANetwork(trial_model, resolved_config).to(
+    device=device,
+    dtype=weight_dtype  # <--- THIS LINE IS MISSING IN THE TIMING FUNCTION
+    )
+    optimizer = torch.optim.AdamW(network.prepare_optimizer_params(), lr=0.001)
+
+    # --- 3. THE REFACTOR: Prepare inputs for and call train_epoch ---
+    
+    # a. Create a dummy dataloader with a single batch for one step of training
+    dummy_dataloader = [sample_batch] 
+    
+    # b. Create a minimal LR scheduler
+    lr_scheduler = get_scheduler(name="constant", optimizer=optimizer, num_training_steps=2)
+    
+    # c. Create a minimal training config for the epoch function
+    timing_run_config = {'gradient_accumulation_steps': 1}
+
+    # d. Warm-up run (one epoch with one step)
+    train_epoch(
+        unet=trial_model, network=network, dataloader=dummy_dataloader,
+        scheduler=environment['scheduler'], optimizer=optimizer, lr_scheduler=lr_scheduler,
+        device=device, gns_estimator=None, training_config=timing_run_config
+    )
+    
+    # e. Timed run
+    torch.cuda.synchronize(device)
+    start_time = time.time()
+    
+    train_epoch(
+        unet=trial_model, network=network, dataloader=dummy_dataloader,
+        scheduler=environment['scheduler'], optimizer=optimizer, lr_scheduler=lr_scheduler,
+        device=device, gns_estimator=None, training_config=timing_run_config
+    )
+
+    torch.cuda.synchronize(device)
+    end_time = time.time()
+    
+    # Cleanup to free VRAM
+    del trial_model, network, optimizer, loader, lr_scheduler
+    
+    # The duration is now for a full epoch of one step, which is equivalent to one step.
+    return end_time - start_time
+
 def train_step(batch: dict, environment: dict):
     """
     Performs a single, self-contained training step using pre-calculated data.
     This function is a pure executor of the batch data.
     """
+    def diagprint():
+        print("\n--- Shape and Dtype Census Before UNet Call ---")
+        print(f"  - latents_cfg:                {latents_cfg.shape}, {latents_cfg.dtype}")
+        print(f"  - unet_input_timesteps_cfg:   {unet_input_timesteps_cfg.shape}, {unet_input_timesteps_cfg.dtype}")
+        print(f"  - text_embeddings_cfg (main): {text_embeddings_cfg.shape}, {text_embeddings_cfg.dtype}")
+        print(f"  - added_cond_kwargs['text_embeds'] (pooled): {added_cond_kwargs['text_embeds'].shape}, {added_cond_kwargs['text_embeds'].dtype}")
+        print(f"  - added_cond_kwargs['time_ids']:             {added_cond_kwargs['time_ids'].shape}, {added_cond_kwargs['time_ids'].dtype}")
+        print(f"  - unet:                        {unet.dtype}")
+        print("---------------------------------------------------\n")
     # --- 1. Unpack Environment ---
+    device = environment["device"]
     unet = environment["unet"]
     network = environment["network"]
-    noise_scheduler = environment["noise_scheduler"]
-    device = environment["device"]
+    noise_scheduler = environment["noise_scheduler"].to(device)
+
     
     # --- 2. Unpack the Pre-Calculated Batch Data from the Pipeline ---
     latents = batch['latents'].to(device)
+    weight_dtype = latents.dtype
     noise = batch['noise'].to(device)
     text_embeddings_cfg = batch['cfg_text_embeddings'].to(device)
     pooled_embeds_cfg = batch['cfg_pooled_embeds'].to(device)
@@ -119,7 +208,7 @@ def train_step(batch: dict, environment: dict):
     unet_input_timesteps = batch['unet_input_timesteps'].to(device)
     
     # --- 3. Denoising and Batch Preparation (Now Simplified) ---
-    noisy_latents = noise_scheduler.add_noise(latents, noise, noise_level_timesteps)
+    noisy_latents = noise_scheduler.add_noise(latents, noise, noise_level_timesteps).to(device=device, dtype=weight_dtype)
     latents_cfg = torch.cat([noisy_latents, noisy_latents], dim=0)
     unet_input_timesteps_cfg = torch.cat([unet_input_timesteps, unet_input_timesteps], dim=0)
     
@@ -128,29 +217,36 @@ def train_step(batch: dict, environment: dict):
     network.set_lora_scales(torch.cat([scales, scales], dim=0))
     added_cond_kwargs = {"text_embeds": pooled_embeds_cfg, "time_ids": add_time_ids_cfg}
     
+    #diagprint()
     # The forward pass is called on the base UNet, which has been modified in-place.
     predicted_noise = unet(
-        latents_cfg,
+        latents_cfg.to(dtype=weight_dtype),
         unet_input_timesteps_cfg,
-        encoder_hidden_states=text_embeddings_cfg,
+        encoder_hidden_states=text_embeddings_cfg.to(dtype=weight_dtype),
         added_cond_kwargs=added_cond_kwargs
     ).sample
 
+
     # --- 5. Loss Calculation (The Final Piece) ---
-    # The target for our model is always the original noise we added.
+    # this is the target we would use if we were jointly training the cond and uncond!
+    # (hint: this is possible as an aux loss hehe)
+    # instead we are training the cfg 2.0 augmented target because we are cool and epic.
     target_noise = torch.cat([noise, noise], dim=0)
     
     # We can use the guidance scale during training for a CFG-aware loss.
-    # Reshape guidance_scale to [B*2, 1, 1, 1] for broadcasting.
-    guidance_scale_b = guidance_scale_tensor.repeat(2).view(-1, 1, 1, 1)
+    # Reshape guidance_scale to [B, 1, 1, 1] for broadcasting.
+    guidance_scale_b = guidance_scale_tensor.view(-1, 1, 1, 1)
+    #print(f"guidscale{guidance_scale_tensor}")
+    #guidance_scale_b = guidance_scale_tensor.chunk(2)
 
     # Perform the CFG-aware guidance on the predicted noise
     uncond_pred, text_pred = predicted_noise.chunk(2)
+    #print(uncond_pred.shape), print(text_pred.shape), print(guidance_scale_b.shape)
     guided_pred = uncond_pred + guidance_scale_b * (text_pred - uncond_pred)
 
     # Calculate the MSE loss against the original noise.
     # Use .float() for stability.
-    loss = F.mse_loss(guided_pred.float(), target_noise.float(), reduction="mean")
+    loss = F.mse_loss(guided_pred.float(), noise.float(), reduction="mean")
     
     return loss
 
@@ -176,62 +272,67 @@ def train_epoch(
     optimizer_step_count = 0
     progress_bar = tqdm(range(num_optimizer_steps), desc="Optimizer Steps", leave=False)
 
-    environment_for_step = {"unet": unet, "network": network, "noise_scheduler": scheduler, "device": device}
+    environment_for_step = {"unet": unet, "network": network, "noise_scheduler": scheduler.to(device), "device": device}
+    network=network.to(device)
+    unet=unet.to(device)
+    
+    weight_dtype = unet.dtype
+    with network:
+        for step in progress_bar:
+            # --- Gradient Accumulation Loop ---
+            is_profiling = False
+            if gns_estimator is not None:
+                # The global_step for profiling frequency can be the optimizer_step_count
+                gns_estimator.pre_accumulate_step(optimizer_step_count)
+                is_profiling = gns_estimator.is_profiling
 
+            total_loss_in_step = 0.0
 
-    for step in progress_bar:
-        # --- Gradient Accumulation Loop ---
-        is_profiling = False
-        if gns_estimator is not None:
-            # The global_step for profiling frequency can be the optimizer_step_count
-            gns_estimator.pre_accumulate_step(optimizer_step_count)
-            is_profiling = gns_estimator.is_profiling
+            if is_profiling:
+                # --- Profiling Path: accumulate gradients manually in GNS buffer ---
+                for _ in range(accum_steps):
+                    batch = next(data_iterator)
+                    loss = train_step(batch, environment_for_step).to(weight_dtype)
+                    loss.backward() # Immediate backprop for the micro-gradient
+                    gns_estimator.post_micro_backward_step() # GNS captures the raw grad
+                    total_loss_in_step += loss.item()
+            else:
+                # --- Standard Path: let PyTorch handle gradient summation ---
+                optimizer.zero_grad()
+                for _ in range(accum_steps):
+                    batch = next(data_iterator)
+                    loss = train_step(batch, environment_for_step).to(weight_dtype)
+                    # We scale the loss before backprop when accumulating
+                    loss = loss / accum_steps
+                    loss.backward()
+                    total_loss_in_step += loss.item() * accum_steps # Un-scale for logging
 
-        total_loss_in_step = 0.0
+            del batch
+            
+            # --- After Accumulation, Before Optimizer Step ---
+            if is_profiling:
+                # Finalize profiling: calculates stats and loads summed grad into model
+                gns_estimator.post_accumulate_step(accum_steps)
 
-        if is_profiling:
-            # --- Profiling Path: accumulate gradients manually in GNS buffer ---
-            for _ in range(accum_steps):
-                batch = next(data_iterator)
-                loss = train_step(batch, environment_for_step)
-                loss.backward() # Immediate backprop for the micro-gradient
-                gns_estimator.post_micro_backward_step() # GNS captures the raw grad
-                total_loss_in_step += loss.item()
-        else:
-            # --- Standard Path: let PyTorch handle gradient summation ---
-            optimizer.zero_grad()
-            for _ in range(accum_steps):
-                batch = next(data_iterator)
-                loss = train_step(batch, environment_for_step)
-                # We scale the loss before backprop when accumulating
-                loss = loss / accum_steps
-                loss.backward()
-                total_loss_in_step += loss.item() * accum_steps # Un-scale for logging
+                new_steps = gradient_noise_estimator.propose_new_accumulation_steps(
+                        current_steps=gradient_accumulation_steps,
+                        min_steps=2,
+                        max_steps=int(config.train.iterations/4)
+                    )
+                accum_steps = new_steps
+        # Optional: Gradient Clipping would go here, applied before optimizer.step()
+            # torch.nn.utils.clip_grad_norm_(network.parameters(), max_grad_norm)
+            
+            optimizer.step()
+            lr_scheduler.step()
+            
+            avg_loss = total_loss_in_step / accum_steps
+            losses.append(avg_loss)
+            progress_bar.set_postfix({"Loss": f"{avg_loss:.4f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+            if gns_estimator and gns_estimator.ema_zoomy_b_crit is not None:
+                progress_bar.set_postfix_str(f"Loss: {avg_loss:.4f}, LR: {lr_scheduler.get_last_lr()[0]:.2e}, B_crit: {gns_estimator.ema_zoomy_b_crit:.2f}")
 
-        # --- After Accumulation, Before Optimizer Step ---
-        if is_profiling:
-            # Finalize profiling: calculates stats and loads summed grad into model
-            gns_estimator.post_accumulate_step(accum_steps)
-
-            new_steps = gradient_noise_estimator.propose_new_accumulation_steps(
-                    current_steps=gradient_accumulation_steps,
-                    min_steps=2,
-                    max_steps=int(config.train.iterations/4)
-                )
-            accum_steps = new_steps
-     # Optional: Gradient Clipping would go here, applied before optimizer.step()
-        # torch.nn.utils.clip_grad_norm_(network.parameters(), max_grad_norm)
-        
-        optimizer.step()
-        lr_scheduler.step()
-        
-        avg_loss = total_loss_in_step / accum_steps
-        losses.append(avg_loss)
-        progress_bar.set_postfix({"Loss": f"{avg_loss:.4f}", "LR": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
-        if gns_estimator and gns_estimator.ema_zoomy_b_crit is not None:
-             progress_bar.set_postfix_str(f"Loss: {avg_loss:.4f}, LR: {lr_scheduler.get_last_lr()[0]:.2e}, B_crit: {gns_estimator.ema_zoomy_b_crit:.2f}")
-
-        optimizer_step_count += 1
+            optimizer_step_count += 1
         
     return losses
 
@@ -246,7 +347,7 @@ def run_generative_trial(base_environment: dict, static_batches: list, exp_confi
     weight_dtype = base_environment['weight_dtype'] 
     evaluator = base_environment['evaluator'] 
     # Create a fresh copy of the base model. Model Agnosticism in action.
-    trial_model = copy.deepcopy(base_environment['base_model']).to(device)
+    trial_model = (base_environment['base_model']).to(device=device, dtype=weight_dtype)
 
     # Freeze base model weights (a common PEFT strategy)
     for param in trial_model.parameters():
@@ -276,18 +377,20 @@ def run_generative_trial(base_environment: dict, static_batches: list, exp_confi
     # b2. Initialize GradientNoiseEstimator for this trial, if enabled
     gns_estimator = None
     if training_config.get('estimate_gradient_noise_scale'):
-        gns_estimator = GradientNoiseEstimator(
-            network,
-            batch_size,
-            training_config.get('gns_profile_freq', 10),
-            training_config.get('gns_ema_fast', 0.1),
-            training_config.get('gns_ema_slow', 0.01)
-        )
+        with torch.no_grad:
+            gns_estimator = GradientNoiseEstimator(
+                network,
+                batch_size,
+                training_config.get('gns_profile_freq', 10),
+                training_config.get('gns_ema_fast', 0.1),
+                training_config.get('gns_ema_slow', 0.01)
+            )
 
     sampling_config_for_eval = exp_config['evaluation_config']['sampling_config']
 
     # --- 2. Run Experiment ---
     print("--- Evaluating untrained network (initial state)... ---")
+    trial_model = trial_model.to(device)
     initial_metrics = evaluator.evaluate(network, sampling_config_for_eval)
 
     # Training Loop
@@ -329,6 +432,7 @@ def setup_generative_environment(manifest: dict) -> dict:
     """
     print("--- Setting up Generative Environment (ONCE)... ---")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    tdcpu = torch.device("cpu")
 
     # --- Principle 3: Model Agnosticism via a Factory ---
     # The harness doesn't know about TesterUViT. This setup function does.
@@ -352,7 +456,15 @@ def setup_generative_environment(manifest: dict) -> dict:
         model_config = manifest['environment_setup']
         from .batch_model_util import load_models_path as load_xl_from_single_file
         vae, base_model, tokenizers, text_encoders = load_xl_from_single_file(unet_path, weight_dtype=torch.bfloat16)
+        
+        print(f"pushing models to device:{torch.device('cpu')}")
+        base_model= base_model.requires_grad_(False).eval().to(torch.device("cpu"))
+        vae = vae.requires_grad_(False).eval().to(torch.device("cpu"))
+        for text_encoder in text_encoders:
+            text_encoder = text_encoder.requires_grad_(False).eval().to(torch.device("cpu"))
 
+        environment['device'] = device
+        environment['base_model'] = base_model
         # Install the REAL processing functions for the orchestrator
         environment['diffusion_fn'] = sdxl_diffusion_fn
         environment['decoder_fn'] = sdxl_decoder_fn
@@ -407,10 +519,74 @@ def setup_generative_environment(manifest: dict) -> dict:
             }
             eval_dataset['model_inputs'].append(item_dict)
 
+    print("\n--- Applying Evaluation Safeguards from Manifest ---")
+    eval_config = manifest['trial_config']['evaluation_config']
+    current_eval_samples = len(eval_dataset['model_inputs'])
+    max_allowed_samples = current_eval_samples
+    # --- Safeguard 1: Proportion of Training Data ---
+    if 'proportion_of_train' in eval_config:
+        prop = eval_config['proportion_of_train']
+        num_train_samples = manifest['data_setup']['config']['iterations'] * manifest['data_setup']['config']['batch_size']
+        max_allowed_by_prop = int(num_train_samples * prop)
+        print(f"  [Proportion Guard] Training samples: {num_train_samples}. Eval proportion: {prop} -> max {max_allowed_by_prop} samples.")
+        max_allowed_samples = min(max_allowed_samples, max_allowed_by_prop)
+
+    # --- Safeguard 2: Proportion of Training Time ---
+    if 'max_eval_time_proportion' in eval_config:
+        print("  [Time Guard] Estimating training and evaluation throughput...")
+        with open(manifest['search_config']['search_space_file'], 'r') as f:
+            search_space_dict = yaml.safe_load(f)
+        # a) Estimate total training time
+        time_per_train_batch = _estimate_training_throughput(environment, static_batches[0], search_space_dict)
+        total_train_steps = manifest['data_setup']['config']['iterations']
+        projected_train_time = time_per_train_batch * total_train_steps
+        print(f"    - Estimated time per training step: {time_per_train_batch:.3f}s")
+        print(f"    - Projected total training time: {projected_train_time / 60:.2f} minutes")
+
+        # b) Estimate time per evaluation sample
+        # We need a dummy model to run the batch finder on the diffusion step
+        dummy_model = (environment['base_model']).to(device)
+        finder_env = environment.copy()
+        finder_env['inference_network'] = dummy_model
+        finder_env['sampling_config'] = eval_config['sampling_config']
+        
+        throughput_finder = ThroughputBatchFinder(dummy_model, eval_dataset['model_inputs'][0], environment['device'], environment['diffusion_fn'], finder_env)
+        items_per_sec = throughput_finder.find()
+        time_per_eval_sample = 1.0 / (items_per_sec + 1e-6)
+        print(f"    - Estimated time per evaluation sample (diffusion): {time_per_eval_sample:.3f}s")
+
+        # c) Calculate the new limit
+        eval_time_budget = projected_train_time * eval_config['max_eval_time_proportion']
+        max_allowed_by_time = int(eval_time_budget / time_per_eval_sample)
+        print(f"    - Evaluation time budget: {eval_time_budget:.1f}s -> max {max_allowed_by_time} samples.")
+        max_allowed_samples = min(max_allowed_samples, max_allowed_by_time)
+        del dummy_model, finder_env # Cleanup
+        
+    # --- Enforce the final decision ---
+    if max_allowed_samples < current_eval_samples:
+        print(f"--- Safeguards triggered. Truncating evaluation dataset from {current_eval_samples} to {max_allowed_samples} samples. ---")
+        eval_dataset['model_inputs'] = eval_dataset['model_inputs'][:max_allowed_samples]
+        
+        # We need to truncate the ground truth tensor to match.
+        # This is tricky because it's a single tensor. We find how many batches the new sample count corresponds to.
+        num_items_per_batch = len(static_batches[0]['latents'])
+        num_batches_to_keep = (max_allowed_samples + num_items_per_batch - 1) // num_items_per_batch
+        
+        truncated_gt_list = []
+        for i in range(num_batches_to_keep):
+            key = 'latents' if manifest['data_setup']['pipeline'] == 'sdxl_latent_dataset' else 'clean_images'
+            truncated_gt_list.append(static_batches[i][key])
+
+        eval_dataset['ground_truth_outputs'] = torch.cat(truncated_gt_list)[:max_allowed_samples]
+        
+        # Write the decision back into the config for logging and transparency
+        manifest['trial_config']['evaluation_config']['effective_num_samples'] = max_allowed_samples
+    else:
+        print("--- No safeguards triggered. Using full evaluation dataset. ---")
+        manifest['trial_config']['evaluation_config']['effective_num_samples'] = current_eval_samples
+
     # Create the final environment dictionary
     environment.update({
-        'device': device,
-        'base_model': base_model,
         'eval_dataset': eval_dataset
     })
     environment['evaluator'] = GenerativeEvaluator(environment['eval_dataset'], environment)
@@ -550,13 +726,17 @@ if __name__ == "__main__":
     with open('experiment_manifest_xl.yaml', 'r') as f:
         manifest = yaml.safe_load(f)
 
+    #search space is now used to do model autocalibration
+    search_space_file = create_search_space_yaml()
+    batch_size_from_config = manifest['data_setup']['config']['batch_size']
+    manifest['search_config']['search_space_file'] = search_space_file
+
     # --- STEP 2: One-time, expensive setup ---
     environment, static_batches = setup_generative_environment(manifest)
     print(f"\nReusable environment ready. Contains: {list(environment.keys())}")
     
     # --- STEP 3: Initialize the Search Controller ---
-    search_space_file = create_search_space_yaml()
-    batch_size_from_config = manifest['data_setup']['config']['batch_size']
+
 
     controller = RandomSearchController(
         search_space_path=search_space_file,
