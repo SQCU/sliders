@@ -15,9 +15,6 @@ from PIL import Image
 from pathlib import Path
 import time
 from torch.utils.data import Dataset, DataLoader
-import torch._inductor.codecache as codecache
-import threading
-
 from typing import Tuple, Union, Literal, List, Dict, Any
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
@@ -49,6 +46,8 @@ DIFFUSERS_CACHE_DIR = None # if you want to change the cache dir, change this
 # happen in multi-threaded/multi-process scenarios. `os.replace` is the
 # correct atomic "overwrite" operation.
 
+import threading
+import torch._inductor.codecache as codecache
 # Copy the original function's signature and body
 def fixed_write_atomic(
     path_: str,

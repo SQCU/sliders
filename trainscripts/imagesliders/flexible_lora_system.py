@@ -235,10 +235,6 @@ def warmup_and_estimate_alphas(unet_builder, base_lora_config, training_harness_
     initial_alphas = {
         name: config['alpha'] for name, config in resolved_config['lora_map'].items()
     }
-    #lora_name_to_module_name = {
-    #    config['lora_name']: module_name
-    #    for module_name, config in resolved_config['lora_map'].items()
-    #}
 
     trained_state_dict = trained_network.state_dict()
     for key, final_alpha_tensor in trained_state_dict.items():
@@ -460,7 +456,6 @@ class LoRAInjectedLayer(nn.Module):
         # 6. Combine everything for the final output
         return original_output + (lora_output * reshaped_multiplier * scale)
 
-
 class FlexibleLoRAModule(nn.Module):
     """A flexible LoRA module that acts as a simple data container."""
     def __init__(self,
@@ -565,7 +560,6 @@ class FlexibleLoRANetwork(nn.Module):
             {"params": alpha_params, "lr": 1e-1}
         ]
 
-    # --- RE-INTRODUCE THE METHOD TO SET BATCH-WISE SCALES ---
     def set_lora_scales(self, scales: torch.Tensor):
         """
         Sets the multiplier for each LoRA module in the network.
@@ -605,14 +599,10 @@ class FlexibleLoRANetwork(nn.Module):
         for dirty_key, value in internal_state_dict.items():
             if not dirty_key.startswith(prefix_to_remove):
                 continue
-
             # Remove the 'unet_loras.' part
-            key_without_prefix = dirty_key[len(prefix_to_remove):]
-            
-            # This is the crucial fix: replace the unwanted wrapper artifact
-            # to match the standard LoRA naming convention.
-            clean_key = key_without_prefix.replace('__orig_mod_', '_')
-            
+            key_without_prefix = dirty_key[len(prefix_to_remove):] 
+            # replace the unwanted wrapper artifact to match the standard LoRA naming convention.
+            clean_key = key_without_prefix.replace('__orig_mod_', '_') 
             if "lora_down" in clean_key or "lora_up" in clean_key or "alpha" in clean_key:
                  state_to_save[clean_key] = value.to("cpu", dtype=dtype)
 
@@ -727,7 +717,6 @@ def _internal_consistency_check(config_dict, log_dir="advlogs"):
         # --- 3. Load and resolve the configuration ---
         print("\n--- Resolving LoRA Configuration ---")
         final_uvit = uvit_builder()
-        #loader = LoRAConfigLoader(config_path, None, svd_path, alpha_path)
         loader = LoRAConfigLoader(
         config_path=config_path, 
         rank_estimates_path=svd_path, 

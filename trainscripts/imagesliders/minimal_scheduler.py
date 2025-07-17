@@ -13,6 +13,7 @@ class MinimalDDPMScheduler:
     def __init__(self, num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012, device='cpu'):
         self.num_train_timesteps = num_train_timesteps
         self.device = device
+        self.init_noise_sigma = torch.tensor(1.0).to(torch.bfloat16)
         
         # The core of the schedule: a linear beta schedule
         self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
@@ -59,6 +60,13 @@ class MinimalDDPMScheduler:
         noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
         return noisy_samples
 
+    def scale_model_input(self, sample: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        """
+        Ensures scheduler compatibility with the diffusion loop.
+        For DDPM with epsilon prediction, this is an identity function.
+        """
+        return sample*self.init_noise_sigma
+
     def get_prediction_target(self, original_samples, noise, timesteps, prediction_type="epsilon"):
         """
         As requested, this function provides the correct target for the model's
@@ -78,6 +86,14 @@ class MinimalDDPMScheduler:
             return sqrt_alpha_prod * noise - sqrt_one_minus_alpha_prod * original_samples
         else:
             raise ValueError(f"Unknown prediction type: {prediction_type}")
+
+    def _get_pred_original_sample(self, model_output, timestep, sample, prediction_type="epsilon"):
+            """Helper to derive the predicted x_0 from the model output."""
+            if prediction_type == "epsilon":
+                return self._gather(self.sqrt_recip_alphas_cumprod, timestep) * sample - \
+                    self._gather(self.sqrt_recipm1_alphas_cumprod, timestep) * model_output
+            else:
+                raise NotImplementedError(f"Prediction type {prediction_type} not implemented for getting x_0")
 
 # Re-implement the required method.
     def set_timesteps(self, num_inference_steps: int, device: str = None):
@@ -124,3 +140,54 @@ class MinimalDDPMScheduler:
         prev_sample = posterior_mean + (variance.sqrt() * noise if timestep > 0 else 0)
 
         return prev_sample
+
+    def step_ddpm(self, model_output: torch.Tensor, timestep: torch.Tensor, sample: torch.Tensor) -> dict:
+        """
+        The original DDPM step. Predicts the sample at the previous timestep, x_{t-1}.
+        This is a stochastic sampler.
+        """
+        pred_original_sample = self._get_pred_original_sample(model_output, timestep, sample)
+        
+        # 2. Compute the coefficients for the posterior mean q(x_{t-1} | x_t, x_0)
+        beta_t = self._gather(self.betas, timestep)
+        alpha_t_cumprod = self._gather(self.alphas_cumprod, timestep)
+        alpha_t_cumprod_prev = self._gather(self.alphas_cumprod_prev, timestep)
+        
+        posterior_mean_coef1 = alpha_t_cumprod_prev.sqrt() * beta_t / (1. - alpha_t_cumprod)
+        posterior_mean_coef2 = (1. - alpha_t_cumprod_prev) * (1-beta_t).sqrt() / (1. - alpha_t_cumprod)
+        posterior_mean = posterior_mean_coef1 * pred_original_sample + posterior_mean_coef2 * sample
+        
+        # 3. Add noise to get the final sample
+        variance = self._gather(self.posterior_variance, timestep)
+        noise = torch.randn_like(sample)
+        prev_sample = posterior_mean + (variance.sqrt() * noise if timestep > 0 else 0)
+
+        return {"prev_sample": prev_sample, "pred_original_sample": pred_original_sample}
+
+    def step_euler(self, model_output: torch.Tensor, timestep: torch.Tensor, sample: torch.Tensor) -> dict:
+        """
+        A deterministic Euler step. Also known as DDIM with eta=0.
+        """
+        pred_original_sample = self._get_pred_original_sample(model_output, timestep, sample)
+        
+        # Find the index of the current timestep to get the previous one
+        idx = (self.timesteps == timestep).nonzero().item()
+        prev_idx = idx + 1
+        
+        # Get alpha_prod for the previous timestep
+        if prev_idx < len(self.timesteps):
+            alpha_prod_t_prev = self.alphas_cumprod[self.timesteps[prev_idx]]
+        else:
+            # Last step, so the "previous" is the fully denoised image
+            alpha_prod_t_prev = torch.tensor(1.0, device=sample.device)
+        
+        alpha_prod_t_prev = alpha_prod_t_prev.view(-1, 1, 1, 1)
+
+        # The Euler/DDIM step formula
+        # x_{t-1} = sqrt(alpha_prod_{t-1}) * pred_x0 + sqrt(1 - alpha_prod_{t-1}) * pred_noise
+        sqrt_one_minus_alpha_prod_t_prev = torch.sqrt(1.0 - alpha_prod_t_prev)
+        
+        prev_sample = torch.sqrt(alpha_prod_t_prev) * pred_original_sample + \
+                      sqrt_one_minus_alpha_prod_t_prev * model_output
+                      
+        return {"prev_sample": prev_sample, "pred_original_sample": pred_original_sample}

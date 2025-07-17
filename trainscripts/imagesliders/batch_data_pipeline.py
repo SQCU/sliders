@@ -391,6 +391,11 @@ def materialize_static_batches(schedule_dict: Dict[str, Any], environment: Dict[
     print("--- Materialization complete. ---")
     return static_batches
 
+
+
+###
+###
+###
 #inside batch_data_pipeline.py 
 import torch
 from .batch_dataset_utils import ShamImageDataset
@@ -432,7 +437,6 @@ import os
 from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
-# We would import our VAE/CLIP encoding utilities here
 
 def _get_composed_prompt(item_path: Path, prompt_config: dict, root_prompts: dict, metadata: dict, rng: random.Random) -> dict:
     """
@@ -651,96 +655,153 @@ def materialize_sdxl_latent_dataset(config: dict, environment: dict) -> list[dic
     for batch_of_units in tqdm(training_schedule, desc="Assembling Batches"):
         batch_tensor_lists = defaultdict(list)
         
-        # Flatten all items from all units in the batch
         all_items_in_batch = [item for unit in batch_of_units for item in unit['items']]
 
+        # Assuming guidance_scale is per-prompt, take the first one
+        # The prompt_recipe is attached to each item, but guidance_scale is constant per prompt_recipe
+        # So we get it once per *batch*, assuming all items in a batch might share a common prompt recipe,
+        # or it is defined per recipe. Let's simplify and take from the first item's recipe for now.
+        # It's safer to get the guidance scale per item from its recipe.
+        
         for item in all_items_in_batch:
-            # --- Fetch pre-computed assets from caches ---
             latent_data = latent_cache[item['image_path']]
             recipe_key = item['recipe_key']
-            text_data = text_embed_cache[recipe_key]
+            text_data = text_embed_cache[recipe_key] # (embeds, pooled_embeds)
             
-            # --- Collate Tensors for this item ---
-            batch_tensor_lists['latents'].append(latent_data['latent'])
+            # --- Collate Core Tensors for this item ---
+            batch_tensor_lists['clean_latents'].append(latent_data['latent'])
             batch_tensor_lists['scales'].append(item['scale'])
-            
-            # Reproducible noise based on the unit ID. This ensures items
-            # in the same unit (e.g., a pair) get the same noise.
+            batch_tensor_lists['is_low_cases'].append(item['role'] == 'low_scale_target') # Store bool
+
+            # Reproducible noise for training based on a unit ID
             unit_id = next(u['unit_id'] for u in batch_of_units if item in u['items'])
             noise_generator.manual_seed(hash(unit_id))
             latent_shape = latent_data['latent'].shape
             noise = torch.randn(latent_shape, generator=noise_generator, dtype=weight_dtype)
             batch_tensor_lists['noise'].append(noise)
             
-            # Get additive time embeddings
+            # Additive time embeddings
             add_time_ids = get_add_time_ids(
                 latent_data['original_size'][0], 
                 latent_data['original_size'][1], 
-                False, dtype=torch.float32  # this is part of our guess at the implicit 'api contract' of sdxl.
+                False, dtype=torch.float32 # Ensure dtype consistency for this operation
             )
-            #batch_tensor_lists['add_time_ids'].append(add_time_ids)
-            # FIX: Duplicate the time_ids for the [unconditional, conditional] pair
-            # to match the structure of the other cfg_ tensors.
-            batch_tensor_lists['add_time_ids'].append(torch.cat([add_time_ids, add_time_ids]))
+            batch_tensor_lists['add_time_ids'].append(add_time_ids)
             
-            # --- Select and Stack CFG Embeddings ---
-            # Index 0: Positive, 1: Unconditional, 2: Neutral
-            uncond_text, uncond_pool = text_data[0][1], text_data[1][1]
-
-            if item['role'] == 'high_scale_target':
-                cond_text, cond_pool = text_data[0][0], text_data[1][0]
-            elif item['role'] == 'low_scale_target':
-                cond_text, cond_pool = text_data[0][2], text_data[1][2]
-            else:
-                # Default to unconditional if role is unknown
-                cond_text, cond_pool = uncond_text, uncond_pool
+            # Individual Text/Pooled Embeddings (NOT YET CFG STACKED)
+            # text_data is (embeds, pooled_embeds)
+            # embeds is (pos_embed, uncond_embed, neutral_embed)
+            # pooled_embeds is (pos_pooled, uncond_pooled, neutral_pooled)
             
-            # Stack for CFG: [unconditional, conditional]
-            batch_tensor_lists['cfg_text_embeddings'].append(torch.stack([uncond_text, cond_text]))
-            batch_tensor_lists['cfg_pooled_embeds'].append(torch.stack([uncond_pool, cond_pool]))
+            batch_tensor_lists['text_embeddings_cond'].append(text_data[0][0])
+            batch_tensor_lists['text_embeddings_uncond'].append(text_data[0][1])
+            batch_tensor_lists['text_embeddings_neutral'].append(text_data[0][2])
 
-            # Perform the full two-step timestep calculation here.
-            unit_id = next(u['unit_id'] for u in batch_of_units if item in u['items'])
-            # Use a generator seeded by the unit to ensure items in a pair get same timesteps
+            batch_tensor_lists['pooled_embeds_cond'].append(text_data[1][0])
+            batch_tensor_lists['pooled_embeds_uncond'].append(text_data[1][1])
+            batch_tensor_lists['pooled_embeds_neutral'].append(text_data[1][2])
+
+            # Store the individual guidance scale for this prompt recipe
+            batch_tensor_lists['guidance_scale'].append(item['prompt_recipe'].get('guidance_scale', config.get('guidance_scale', 1.0)))
+
+            # Original image sizes for evaluation's VAE decoder
+            batch_tensor_lists['original_sizes'].append(torch.tensor(latent_data['original_size']))
+
+
+            # Timestep calculations for training. These are specific to *training*.
             ts_generator = torch.Generator().manual_seed(hash(unit_id))
             
-            # Step 0: Generate the random integer for the "noise level"
             timesteps_to = torch.randint(1, max_steps, (1,), generator=ts_generator).long()
-
-            # Steps 1 & 2: Calculate the actual timestep for noise addition
+            
             noise_scheduler.set_timesteps(max_steps, device='cpu')
             noise_level_timestep = noise_scheduler.timesteps[timesteps_to]
 
-            # Steps 4, 5, & 6: Re-project to calculate the timestep for UNet input
             noise_scheduler.set_timesteps(1000, device='cpu')
             normalized_tsteps = torch.round(timesteps_to.float() * 1000 / max_steps).long()
             unet_input_timestep = noise_scheduler.timesteps[normalized_tsteps]
 
-            # Store BOTH results for use in the training loop
             batch_tensor_lists['noise_level_timesteps'].append(noise_level_timestep)
             batch_tensor_lists['unet_input_timesteps'].append(unet_input_timestep)
 
-        # --- Assemble the final batch dictionary from the collected lists ---
-        if not batch_tensor_lists: continue # Skip empty batches if any
 
+        # --- Assemble the final, universal batch dictionary ---
+        if not batch_tensor_lists: continue 
+        
         final_batch = {
-            "latents": torch.stack(batch_tensor_lists['latents']),
-            "scales": torch.tensor(batch_tensor_lists['scales']).to(dtype=weight_dtype),
+            "clean_latents": torch.stack(batch_tensor_lists['clean_latents']),
             "noise": torch.stack(batch_tensor_lists['noise']),
-            # `add_time_ids` has an extra dim, so we cat instead of stack
-            "add_time_ids": torch.cat(batch_tensor_lists['add_time_ids']).to(dtype=weight_dtype),
-            # These are already stacked per-item, so we concatenate them along the batch dim
-            "cfg_text_embeddings": torch.cat(batch_tensor_lists['cfg_text_embeddings']),
-            "cfg_pooled_embeds": torch.cat(batch_tensor_lists['cfg_pooled_embeds']),
             "noise_level_timesteps": torch.cat(batch_tensor_lists['noise_level_timesteps']),
             "unet_input_timesteps": torch.cat(batch_tensor_lists['unet_input_timesteps']),
+
+            "text_embeddings_cond": torch.stack(batch_tensor_lists['text_embeddings_cond']),
+            "text_embeddings_uncond": torch.stack(batch_tensor_lists['text_embeddings_uncond']),
+            "text_embeddings_neutral": torch.stack(batch_tensor_lists['text_embeddings_neutral']),
+
+            "pooled_embeds_cond": torch.stack(batch_tensor_lists['pooled_embeds_cond']),
+            "pooled_embeds_uncond": torch.stack(batch_tensor_lists['pooled_embeds_uncond']),
+            "pooled_embeds_neutral": torch.stack(batch_tensor_lists['pooled_embeds_neutral']),
+            
+            "add_time_ids": torch.stack(batch_tensor_lists['add_time_ids']), # Stack them now
+            "guidance_scale": torch.tensor(batch_tensor_lists['guidance_scale']),
+            "scales": torch.tensor(batch_tensor_lists['scales']),
+            "is_low_cases": torch.tensor(batch_tensor_lists['is_low_cases'], dtype=torch.bool),
+            "original_sizes": torch.stack(batch_tensor_lists['original_sizes']),
         }
         
-        gs_value = config.get('guidance_scale', 1.0)
-        num_items_in_batch = final_batch['latents'].shape[0]
-        final_batch['guidance_scale'] = torch.full((num_items_in_batch,), gs_value)
-
         static_batches.append(final_batch)
 
     print("--- SDXL Data Pipeline Materialization Complete. ---")
     return static_batches
+
+def prepare_training_batch(raw_batch: dict, scheduler: Any, device: torch.device, weight_dtype: torch.dtype) -> dict:
+    """
+    Transforms a universal raw batch into the kwargfood format for training.
+    """
+    # Move to scheduler's device for add_noise, then potentially back for kwargfood
+    scheduler_device = scheduler.device
+
+    # 1. Add noise to clean latents
+    noisy_latents = scheduler.add_noise(
+        raw_batch['clean_latents'].to(scheduler_device),
+        raw_batch['noise'].to(scheduler_device),
+        raw_batch['noise_level_timesteps'].to(scheduler_device)
+    ).to(device) # Move result to the target training device (GPU)
+
+    # 2. Select appropriate text/pooled embeddings based on is_low_cases
+    num_items = raw_batch['scales'].shape[0]
+    
+    # Initialize lists to gather CFG-ready embeddings
+    cfg_text_embeddings_list = []
+    cfg_pooled_embeds_list = []
+
+    for i in range(num_items):
+        uncond_text = raw_batch['text_embeddings_uncond'][i]
+        uncond_pooled = raw_batch['pooled_embeds_uncond'][i]
+        
+        if raw_batch['is_low_cases'][i]:
+            cond_text = raw_batch['text_embeddings_neutral'][i]
+            cond_pooled = raw_batch['pooled_embeds_neutral'][i]
+        else:
+            cond_text = raw_batch['text_embeddings_cond'][i]
+            cond_pooled = raw_batch['pooled_embeds_cond'][i]
+        
+        cfg_text_embeddings_list.append(torch.stack([uncond_text, cond_text]))
+        cfg_pooled_embeds_list.append(torch.stack([uncond_pooled, cond_pooled]))
+
+    # 3. Stack for CFG and prepare kwargfood
+    kwargfood = {
+        "sample": torch.cat([noisy_latents, noisy_latents], dim=0),
+        "timestep": torch.cat([raw_batch['unet_input_timesteps'].to(device), raw_batch['unet_input_timesteps'].to(device)], dim=0),
+        "encoder_hidden_states": torch.cat(cfg_text_embeddings_list).to(device),
+        "added_cond_kwargs": {
+            "text_embeds": torch.cat(cfg_pooled_embeds_list).to(device),
+            "time_ids": torch.cat([raw_batch['add_time_ids'].to(device), raw_batch['add_time_ids'].to(device)], dim=0)
+        }
+    }
+
+    return {
+        "kwargfood": kwargfood,
+        "target_noise": raw_batch['noise'].to(device),
+        "scales": raw_batch['scales'].to(device),
+        "guidance_scale": raw_batch['guidance_scale'].to(device)
+    }
