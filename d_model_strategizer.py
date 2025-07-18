@@ -1,6 +1,8 @@
 from typing import Callable, Dict, Any, Tuple, List, Optional
 import torch
 from diffusers import UNet2DConditionModel, AutoencoderKL
+from pathlib import Path
+import json
 
 # --- Model Signature Definitions ---
 # These functions define the expected input signatures for different model architectures.
@@ -149,6 +151,8 @@ def d_model_strategizer(model_architecture: str) -> Callable[[Dict[str, Any]], T
 if __name__ == "__main__":
     print("--- Testing d_model_strategizer ---")
 
+    batch_size = 1 # Moved to global scope for all tests
+
     # Example Training Unit (simplified for stub testing)
     sample_training_unit = {
         "unit_id": "test_unit_0",
@@ -167,31 +171,29 @@ if __name__ == "__main__":
     # For SDXL UNet
     print("\nTesting SDXL UNet:")
     try:
-        # Create a dummy SDXL UNet (random weights)
-        sdxl_unet = UNet2DConditionModel(
-            sample_size=64,  # Corresponds to H/8, W/8 for 512x512 images
-            in_channels=4,
-            out_channels=4,
-            layers_per_block=2,
-            block_out_channels=(320, 640, 1280, 1280),
-            attention_head_dim=(5, 10, 20, 20),
-            cross_attention_dim=1280, # SDXL text embedding dim
-            addition_embed_type="text_time", # For added_cond_kwargs
-            addition_time_embed_dim=256, # For time_ids
-            projection_class_embeddings_input_dim=1280, # For pooled text embeddings
-        )
-        print("  SDXL UNet created successfully.")
+        # Load SDXL UNet config from canonical file
+        sdxl_unet_config_path = Path("F:/dox/ai/gemmy/sliders/canon_configs/stabilityai__stable_diffusion_xl_base_1.0/unet/config.json")
+        with open(sdxl_unet_config_path, 'r') as f:
+            sdxl_unet_config = json.load(f)
 
-        # Generate random tensors based on signature
-        batch_size = 1
-        sample_tensor = torch.randn(batch_size, 4, 64, 64, dtype=torch.float32)
+        # Create a dummy SDXL UNet using the loaded config
+        sdxl_unet = UNet2DConditionModel.from_config(sdxl_unet_config)
+        print("  SDXL UNet created successfully from canonical config.")
+
+        # Generate random tensors based on signature and loaded config
+        sample_size = sdxl_unet_config["sample_size"]
+        cross_attention_dim = sdxl_unet_config["cross_attention_dim"]
+        projection_class_embeddings_input_dim = sdxl_unet_config["projection_class_embeddings_input_dim"]
+        addition_time_embed_dim = sdxl_unet_config["addition_time_embed_dim"]
+
+        sample_tensor = torch.randn(batch_size, 4, sample_size, sample_size, dtype=torch.float32)
         timestep_tensor = torch.randint(0, 1000, (batch_size,), dtype=torch.int64)
-        encoder_hidden_states_tensor = torch.randn(batch_size, 77, 1280, dtype=torch.float32) # seq_len 77 for CLIP
-        text_embeds_tensor = torch.randn(batch_size, 1280, dtype=torch.float32)
+        encoder_hidden_states_tensor = torch.randn(batch_size, 77, cross_attention_dim, dtype=torch.float32)
+        text_embeds_tensor = torch.randn(batch_size, projection_class_embeddings_input_dim - addition_time_embed_dim * 6, dtype=torch.float32) # Adjusted based on config
         time_ids_tensor = torch.randn(batch_size, 6, dtype=torch.float32)
 
         # Test forward pass
-        _ = sdxl_unet(sample_tensor, timestep_tensor, encoder_hidden_states_tensor, 
+        _ = sdxl_unet(sample_tensor, timestep_tensor, encoder_hidden_states_tensor,
                       added_cond_kwargs={"text_embeds": text_embeds_tensor, "time_ids": time_ids_tensor})
         print("  SDXL UNet forward pass executed successfully with correct tensor shapes.")
 
@@ -203,49 +205,55 @@ if __name__ == "__main__":
     # For SD1.x UNet
     print("\nTesting SD1.x UNet:")
     try:
-        # Create a dummy SD1.x UNet (random weights)
-        sd1_unet = UNet2DConditionModel(
-            sample_size=64,  # Corresponds to H/8, W/8 for 512x512 images
-            in_channels=4,
-            out_channels=4,
-            layers_per_block=2,
-            block_out_channels=(320, 640, 1280, 1280),
-            attention_head_dim=(4, 8, 16, 16),
-            cross_attention_dim=768, # SD1.x text embedding dim
-        )
-        print("  SD1.x UNet created successfully.")
+        # Load SD1.x UNet config from canonical file
+        sd1_unet_config_path = Path("F:/dox/ai/gemmy/sliders/canon_configs/runwayml__stable_diffusion_v1_5/unet/config.json")
+        with open(sd1_unet_config_path, 'r') as f:
+            sd1_unet_config = json.load(f)
 
-        # Generate random tensors based on signature
-        sample_tensor = torch.randn(batch_size, 4, 64, 64, dtype=torch.float32)
+        # Create a dummy SD1.x UNet using the loaded config
+        sd1_unet = UNet2DConditionModel.from_config(sd1_unet_config)
+        print("  SD1.x UNet created successfully from canonical config.")
+
+        # Generate random tensors based on signature and loaded config
+        sample_size = sd1_unet_config["sample_size"]
+        cross_attention_dim = sd1_unet_config["cross_attention_dim"]
+
+        sample_tensor = torch.randn(batch_size, 4, sample_size, sample_size, dtype=torch.float32)
         timestep_tensor = torch.randint(0, 1000, (batch_size,), dtype=torch.int64)
-        encoder_hidden_states_tensor = torch.randn(batch_size, 77, 768, dtype=torch.float32) # seq_len 77 for CLIP
+        encoder_hidden_states_tensor = torch.randn(batch_size, 77, cross_attention_dim, dtype=torch.float32)
 
-        # Test forward pass (stubbed output for now)
-        # sd1_unet(sample_tensor, timestep_tensor, encoder_hidden_states_tensor)
-        print("  SD1.x UNet forward pass (stubbed) would be called with correct tensor shapes.")
+        # Test forward pass
+        _ = sd1_unet(sample_tensor, timestep_tensor, encoder_hidden_states_tensor)
+        print("  SD1.x UNet forward pass executed successfully with correct tensor shapes.")
 
     except Exception as e:
+        import traceback
         print(f"  Error creating/testing SD1.x UNet: {e}")
+        print(traceback.format_exc())
 
     # For SD1.x VAE Decoder
     print("\nTesting SD1.x VAE Decoder:")
     try:
-        # Create a dummy SD1.x VAE Decoder (random weights)
-        sd1_vae_decoder = AutoencoderKL(
-            sample_size=64, # Corresponds to H/8, W/8 for 512x512 images
-            in_channels=4,
-            out_channels=3,
-            block_out_channels=[128, 256, 512, 512],
-            layers_per_block=2,
-        )
-        print("  SD1.x VAE Decoder created successfully.")
+        # Load SD1.x VAE config from canonical file
+        sd1_vae_config_path = Path("F:/dox/ai/gemmy/sliders/canon_configs/madebyollin__sdxl_vae_fp16_fix/config.json")
+        with open(sd1_vae_config_path, 'r') as f:
+            sd1_vae_config = json.load(f)
 
-        # Generate random tensors based on signature
-        latent_sample_tensor = torch.randn(batch_size, 4, 64, 64, dtype=torch.float32)
+        # Create a dummy SD1.x VAE Decoder using the loaded config
+        sd1_vae_decoder = AutoencoderKL.from_config(sd1_vae_config)
+        print("  SD1.x VAE Decoder created successfully from canonical config.")
 
-        # Test decode pass (stubbed output for now)
-        # sd1_vae_decoder.decode(latent_sample_tensor)
-        print("  SD1.x VAE Decoder decode pass (stubbed) would be called with correct tensor shapes.")
+        # Generate random tensors based on signature and loaded config
+        sample_size = sd1_vae_config["sample_size"]
+
+        latent_sample_tensor = torch.randn(batch_size, 4, sample_size, sample_size, dtype=torch.float32)
+
+        # Test decode pass
+        _ = sd1_vae_decoder.decode(latent_sample_tensor)
+        print("  SD1.x VAE Decoder decode pass executed successfully with correct tensor shapes.")
 
     except Exception as e:
+        import traceback
         print(f"  Error creating/testing SD1.x VAE Decoder: {e}")
+        print(traceback.format_exc())
+
