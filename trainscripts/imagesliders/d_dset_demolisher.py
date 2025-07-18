@@ -236,3 +236,24 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+"""
+✦ The discovery_scanner.py and dataset_strategizer.py scripts represent the foundational, working components of our data pipeline,    
+  aligning well with the modular and functional principles outlined in d_dset_demolisher.py. discovery_scanner.py ✅ serves as a robust
+   "Discovery Generator," reliably scanning the filesystem and organizing image paths into a structured data_pool based on
+  configuration. Its clear input/output and use of pathlib make it a trustworthy component. Building upon this, dataset_strategizer.py
+  🎲 acts as our "Schedule Generator," producing a deterministic, lazy-evaluated stream of training_unit dictionaries. This script    
+  correctly integrates with discovery_scanner and employs generators for efficient memory usage, embodying the "streaming" and "lazy  
+  evaluation" ideals. While its prompt composition logic is noted as "simplified for demonstration" (⚠️), its core functionality of   
+  generating a reproducible training schedule is sound and reliable.
+
+
+  In contrast, d_model_strategizer.py 🎛️, despite containing valuable model signature definitions (✅), is currently a "non-working"
+  file in terms of providing a complete, end-to-end solution. Its primary function, _map_data_unit_to_model_inputs, is explicitly
+  "stubbed" (⚠️), indicating a significant gap in its implementation of the "Batch Assembler" and "Training Formatter" stages.
+  Furthermore, its main function, intended for testing, relies on hardcoded paths (❌) and an external AssetMaterializer component
+  that is not provided in the current context (❌). This makes d_model_strategizer.py an unreliable reference for a fully integrated
+  data flow, serving more as a conceptual outline and a collection of useful interface definitions rather than a functional piece of
+  the pipeline.
+"""
