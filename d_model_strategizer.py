@@ -190,13 +190,15 @@ if __name__ == "__main__":
         text_embeds_tensor = torch.randn(batch_size, 1280, dtype=torch.float32)
         time_ids_tensor = torch.randn(batch_size, 6, dtype=torch.float32)
 
-        # Test forward pass (stubbed output for now)
-        # sdxl_unet(sample_tensor, timestep_tensor, encoder_hidden_states_tensor, 
-        #           added_cond_kwargs={"text_embeds": text_embeds_tensor, "time_ids": time_ids_tensor})
-        print("  SDXL UNet forward pass (stubbed) would be called with correct tensor shapes.")
+        # Test forward pass
+        _ = sdxl_unet(sample_tensor, timestep_tensor, encoder_hidden_states_tensor, 
+                      added_cond_kwargs={"text_embeds": text_embeds_tensor, "time_ids": time_ids_tensor})
+        print("  SDXL UNet forward pass executed successfully with correct tensor shapes.")
 
     except Exception as e:
+        import traceback
         print(f"  Error creating/testing SDXL UNet: {e}")
+        print(traceback.format_exc())
 
     # For SD1.x UNet
     print("\nTesting SD1.x UNet:")
