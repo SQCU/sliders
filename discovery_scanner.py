@@ -1,3 +1,4 @@
+#discovery_scanner.py
 """
 This script implements the first step of the 'Discovery Generator' as outlined in the
 'd_dset_demolisher.py' critique. Its primary function is to scan the filesystem for image
