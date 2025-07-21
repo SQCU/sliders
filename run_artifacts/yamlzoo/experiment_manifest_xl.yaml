@@ -1,0 +1,104 @@
+      
+# experiment_manifest_xl.yaml
+# The single source of truth for a generative harness experiment.
+
+search_config:
+  # This new block controls the search loop itself.
+  num_trials: 5
+  top_n_results_to_show: 3
+
+environment_setup:
+  # This block dictates the heavyweight, shared components.
+  # The harness is now model-agnostic. We specify what to load here.
+  base_model_name: 'StableDiffusionXL_UNet'  # Can be 'TesterUViT' or 'StableDiffusionXL_UNet'
+  # Add any model-specific paths if loading a real model from disk
+  model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+
+data_setup:
+  # The harness uses this key to select the correct materialization function.
+  pipeline: 'sdxl_latent_dataset' 
+  # Configs for the chosen pipeline
+  config:
+    # --- Data Source Configuration ---
+    folder_main: "datasets/bracket"
+    # The subfolder names corresponding to each scale value.
+    folders: ['0', '1', '2']
+    scales: [0.15, 1, 2]
+    guidance_scale: 2.0
+    max_denoising_steps: 50 # Or 49, etc. Must be less than 1000.
+    # --- PROMPT COMPOSITION STRATEGY ---
+    # This block is the new heart of the system.
+    prompt_sources:
+      # Each source has a file and a sampling 'importance' (a logit).
+      root:
+        file: 'datasets/bracket/rootprompt.yaml'
+        importance: 5.0
+      metadata:
+        file: 'datasets/bracket/promptmetadata.json' # One metadata file for the whole dataset
+        # Importance scores for different levels within the metadata file.
+        folder_importance: 2.0
+        item_importance: 5.0
+    prompts_file: "trainscripts/imagesliders/data/prompts-xl-dilora-bracket.yaml"
+
+    # --- Pairing & Sampling Logic ---
+    # 'strict': The old way. Only images existing at ALL defined scales are used.
+    # 'relaxed': The new, flexible way.
+    pairing_strategy: 'relaxed' 
+    
+    # (Only used if strategy is 'relaxed')
+    # An image is considered valid if it exists in at least this many scale folders.
+    min_scales_required: 2 
+    # The fraction of pairs in a batch that must be "perfect" (drawn from all available
+    # scales for that image). The rest can be "partial" (drawn from a random subset).
+    # Setting this to 1.0 reproduces the old, pedantic behavior.
+    perfect_pair_ratio: 0.9 
+
+    # --- Training Plan Configuration ---
+    iterations: 300
+    batch_size: 4
+    seed: 42 # For 100% reproducible episode scheduling
+    resolution: [512,512]
+
+    # --- Caching Configuration ---
+    latent_cache_dir: "datasets/bracket/cache"
+
+trial_config:
+  # This block defines the parameters for the specific trial to be run.
+  lora_config:
+    lora_rules:
+      - name: "ATTN_and_FFN"
+        rank: 8
+        alpha: 1.0
+        target_name_contains: ['attn', 'ff.net']
+  model_config:
+    weights_dtype: 'torch.bfloat16'
+        
+  optimizer_config:
+    lr: 0.0005
+
+  training_config:
+    num_epochs: 10
+    prediction_type: 'epsilon' # 'epsilon', 'sample', or 'v_prediction'
+
+    gradient_accumulation_steps: 4
+    # Set to false to disable GNS and use standard gradient accumulation.
+    estimate_gradient_noise_scale: true 
+    gns_profile_freq: 10 # Profile every 10 optimizer steps
+    gns_ema_fast: 0.1
+    gns_ema_slow: 0.01
+
+  evaluation_config:
+    # Constraint 1: Proportional to training data size.
+    # 0.1 means "use no more than 10% of the number of training samples for evaluation".
+    proportion_of_train: 0.1
+    # Constraint 2: Proportional to total training time.
+    # 0.05 means "spend no more than 5% of the total projected training time generating eval data".
+    max_eval_time_proportion: 0.05
+    sampling_config:
+      total_timesteps: 50
+      # guidance_scale will eventually be handled by the model_util functions
+
+
+
+
+    

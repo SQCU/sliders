@@ -1,0 +1,168 @@
+# experiment_manifest_dag.yaml
+# 
+version: v5.2
+
+execution_graph:
+  # Stage 1A: Inspect the target model to determine the "bill of materials" for assets.
+  # Its output is a CONFIG that drives asset planning.
+  - dataset:
+      name: 'derive_required_assets'
+      function: 'derive_required_assets_from_model'
+      requires: [] # No dependencies
+      arguments: {} # No passthrough DAG args
+      return_config_key: 'reqassets_config'
+      return_dataset_key: False
+      config:
+        base_model_name: 'StableDiffusionXL_UNet'
+        model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+
+  # Stage 1B: The authoritative data discovery stage.
+  # It finds all valid image files and pairs them with their determined prompt recipes.
+  # Its output is the definitive stream of items to be processed.
+  - dataset:
+      name: 'discover_image_pool'
+      function: 'create_imageslider_pool_iterator' # The function that understands this specific dataset structure.
+      requires: [] # No dependencies
+      arguments: {} # No passthrough DAG args
+      return_config_key: 'imagepool_config' # Returns its own config for auditing.
+      return_dataset_key: 'sliderimage_pool' # The rich stream of {image_path, prompt_recipe, scale, ...}
+      config:
+        folder_main: "datasets/bracket"
+        folders: ['0', '1', '2']
+        scales: [0.15, 1, 2]
+        pairing_strategy: 'relaxed'
+        min_scales_required: 2
+        perfect_pair_ratio: 0.9
+        # The prompt composition logic is correctly located here, as part of data discovery.
+        prompt_sources:
+          root:
+            file: 'datasets/bracket/rootprompt.yaml'
+            importance: 5.0
+          metadata:
+            file: 'datasets/bracket/promptmetadata.json'
+            folder_importance: 2.0
+            item_importance: 5.0
+    # The output of this stage is a generator that does everything needed to feed subsequent stages.
+    # It is the single source of truth for "what to do."
+
+  # Stage 2: Create a unified worklist for all required assets.
+  # This function takes the "bill of materials" from stage 1A and the rich data stream
+  # from stage 1B and creates a single, comprehensive list of all encoding work to be done.
+  - dataset:
+      name: 'plan_all_asset_encoding'
+      function: 'create_unified_asset_worklist'
+      requires:
+        - 'derive_required_assets'
+        - 'discover_image_pool'
+      arguments:
+        assets_config: 'reqassets_config' # The "what to build" config
+        image_pool: 'sliderimage_pool'   # The "what to build from" data stream
+      return_config_key: False
+      return_dataset_key: 'unified_worklist'
+      config: {} # This function is pure; its behavior is entirely determined by its arguments.
+
+  # Stage 3: Execute the unified worklist.
+  # This is the "worker" stage that consumes the plan, runs the encoders, and saves files to cache.
+  # Its output is a manifest (a config object) detailing what was created and where it was saved.
+  - dataset:
+      name: 'execute_asset_caching'
+      function: 'execute_caching_iterator'
+      requires:
+        - 'plan_all_asset_encoding'
+      arguments:
+        assets_config: 'reqassets_config'
+        worklist: 'unified_worklist'
+      return_config_key: 'cache_manifest'
+      return_dataset_key: False
+      config:
+        # Configuration for the worker itself, not for the data.
+        cache_location_root: "./cache/"
+        # The function will create subdirectories based on asset type.
+
+  # Stage 4: Create the final, iterable dataset for training.
+  # This function consumes the cache manifest to produce a dataset of ready-to-use
+  # training items, where each item points to the correct cached assets.
+  # This is where logic ensuring scale-varied 'high and low' are batched together, by interpreting the
+  # roles defined in the original imagepool and finding the corresponding
+  # entries in the cache_manifest.
+  # this is also where CFG pairing is defined for much the same reason.
+  - dataset:
+      name: 'create_sliders_training_dataset'
+      function: 'fold_cache_manifest_into_dataset'
+      requires:
+        - 'execute_asset_caching'
+        - 'derive_required_assets' # Needs the original asset requirements to know how to pair things.
+      arguments:
+        slider_config: 'imagepool_config'   #what grouping relationships are needed to form batches!
+        slider_dataset: 'sliderimage_pool'  #the authoritative iterators we used to make cache manifest
+        cache_manifest: 'cache_manifest'    #the cache we retrieve batch elements from!
+        assets_config: 'reqassets_config' #model related data!
+      return_config_key: 'sliders_batch_resampling_config'
+      return_dataset_key: 'final_training_dataset'
+      config: {} # Pure function driven by its arguments.
+
+  # Stage 5: Create the final, infinitely sampling iterator.
+  # This is the final handle passed to the training loop.
+  - dataset:
+      name: 'create_training_iterator'
+      function: 'create_sampling_iterator'
+      requires:
+        - 'create_sliders_training_dataset'
+      arguments:
+        sliders_train_config: 'sliders_batch_resampling_config'
+        assets_config: 'reqassets_config'
+        source_dataset: 'final_training_dataset'
+      return_config_key: False
+      return_dataset_key: 'training_iterator'
+      config:
+        seed: 42
+        iterations: 300
+    
+
+# --- Global Configurations ---
+# These are not part of the DAG but configure the runner/environment.
+trial_config:
+environment_setup:
+  # This block dictates the heavyweight, shared components.
+  # The harness is now model-agnostic. We specify what to load here.
+  base_model_name: 'StableDiffusionXL_UNet'  # Can be 'TesterUViT' or 'StableDiffusionXL_UNet'
+  # Add any model-specific paths if loading a real model from disk
+  model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+  # This block defines the parameters for the specific trial to be run.
+  lora_config:
+    lora_rules:
+      - name: "ATTN_and_FFN"
+        rank: 8
+        alpha: 1.0
+        target_name_contains: ['attn', 'ff.net']
+  model_config:
+    weights_dtype: 'torch.bfloat16'
+        
+  optimizer_config:
+    lr: 0.0005
+
+  training_config:
+    num_epochs: 10
+    prediction_type: 'epsilon' # 'epsilon', 'sample', or 'v_prediction'
+
+    gradient_accumulation_steps: 4
+    # Set to false to disable GNS and use standard gradient accumulation.
+    estimate_gradient_noise_scale: true 
+    gns_profile_freq: 10 # Profile every 10 optimizer steps
+    gns_ema_fast: 0.1
+    gns_ema_slow: 0.01
+    search_config:
+    # This new block controls the search loop itself.
+    num_trials: 5
+    top_n_results_to_show: 3
+
+  evaluation_config:
+    # Constraint 1: Proportional to training data size.
+    # 0.1 means "use no more than 10% of the number of training samples for evaluation".
+    proportion_of_train: 0.1
+    # Constraint 2: Proportional to total training time.
+    # 0.05 means "spend no more than 5% of the total projected training time generating eval data".
+    max_eval_time_proportion: 0.05
+    sampling_config:
+      total_timesteps: 50
+      # guidance_scale will eventually be handled by the model_util functions

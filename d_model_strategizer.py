@@ -1,9 +1,35 @@
+#d_model_strategizer.py
+#~4.6ktok
 from typing import Callable, Dict, Any, Tuple, List, Optional
 import torch
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from pathlib import Path
 import json
 import os
+
+def get_required_inputs_for_model(model_architecture: str) -> Dict[str, Any]:
+    """
+    Inspects a model architecture and returns a configuration describing the
+    assets required to call its forward pass. This is the "bill of materials".
+    """
+    # This function uses the existing signature definitions as a source of truth.
+    if model_architecture == "SDXL_UNET":
+        sig = _get_sdxl_unet_signature()
+        return {
+            "assets": [
+                {"role": "sample", "asset_type": "latent", "consumer_signature": "sdxl_vae_encoder_v1_fp16"},
+                {"role": "timestep", "asset_type": "timestep"},
+                # This role is for the main conditional text embedding
+                {"role": "encoder_hidden_states", "asset_type": "text_embedding", "consumer_signature": "openai_clip_vit_l_14_text_encoder"},
+                # This role is for the unconditional text embedding, identified by role
+                {"role": "unconditional_encoder_hidden_states", "asset_type": "text_embedding", "consumer_signature": "openai_clip_vit_l_14_text_encoder"},
+                {"role": "text_embeds", "asset_type": "pooled_text_embedding", "consumer_signature": "openai_clip_vit_l_14_text_encoder"},
+                {"role": "time_ids", "asset_type": "time_embedding"},
+            ]
+        }
+    # Add other models like SD1.5, VAEs, etc. here.
+    else:
+        raise ValueError(f"Unknown model architecture for asset derivation: {model_architecture}")
 
 # --- Model Signature Definitions ---
 # These functions define the expected input signatures for different model architectures.
