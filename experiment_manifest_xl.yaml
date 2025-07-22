@@ -1,11 +1,5 @@
-      
 # experiment_manifest_xl.yaml
 # The single source of truth for a generative harness experiment.
-
-search_config:
-  # This new block controls the search loop itself.
-  num_trials: 5
-  top_n_results_to_show: 3
 
 environment_setup:
   # This block dictates the heavyweight, shared components.
@@ -98,7 +92,3 @@ trial_config:
       total_timesteps: 50
       # guidance_scale will eventually be handled by the model_util functions
 
-
-
-
-    

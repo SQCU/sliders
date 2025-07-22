@@ -24,8 +24,8 @@ execution_graph:
       function: 'create_imageslider_pool_iterator' # The function that understands this specific dataset structure.
       requires: [] # No dependencies
       arguments: {} # No passthrough DAG args
-      return_config_key: 'imagepool_config' # Returns its own config for auditing.
-      return_dataset_key: 'sliderimage_pool' # The rich stream of {image_path, prompt_recipe, scale, ...}
+      return_config_key: 'imagepool_config' # returns configuration metadata.
+      return_dataset_key: 'data_package' # The rich stream of {image_path, prompt_recipe, scale, ...}
       config:
         folder_main: "datasets/bracket"
         folders: ['0', '1', '2']
@@ -46,8 +46,6 @@ execution_graph:
     # It is the single source of truth for "what to do."
 
   # Stage 2: Create a unified worklist for all required assets.
-  # This function takes the "bill of materials" from stage 1A and the rich data stream
-  # from stage 1B and creates a single, comprehensive list of all encoding work to be done.
   - dataset:
       name: 'plan_all_asset_encoding'
       function: 'create_unified_asset_worklist'
@@ -56,10 +54,17 @@ execution_graph:
         - 'discover_image_pool'
       arguments:
         assets_config: 'reqassets_config' # The "what to build" config
-        image_pool: 'sliderimage_pool'   # The "what to build from" data stream
-      return_config_key: False
-      return_dataset_key: 'unified_worklist'
-      config: {} # This function is pure; its behavior is entirely determined by its arguments.
+        data_package: 'data_package'   # The "what to build from" data stream
+        # REVISION 2.1: Plumb the processing rules from the discovery stage's
+        # config output into the planner's input.
+        processing_rules_config: 'imagepool_config'
+      # REVISION 2.2: Update the return keys to match the new function's output.
+      return_config_key: 'work_resolution_map'
+      return_dataset_key: 'unified_worklist' # This key must match the function's output dict
+      # REVISION 2.3: Provide the operational config the planner needs.
+      config:
+        max_iterations: 300 # This value should be sourced from training_config for production
+        cache_location_root: "./cache/"
 
   # Stage 3: Execute the unified worklist.
   # This is the "worker" stage that consumes the plan, runs the encoders, and saves files to cache.
@@ -71,13 +76,16 @@ execution_graph:
         - 'plan_all_asset_encoding'
       arguments:
         assets_config: 'reqassets_config'
+        # REVISION 2.4: The argument name must match what the function expects,
+        # and the key must match the return_dataset_key from the previous stage.
+        # Assuming the stub expects `unified_worklist`. If it expects `worklist`, change the name.
         worklist: 'unified_worklist'
       return_config_key: 'cache_manifest'
-      return_dataset_key: False
+      return_dataset_key: False # This stage doesn't return an iterator
       config:
-        # Configuration for the worker itself, not for the data.
-        cache_location_root: "./cache/"
-        # The function will create subdirectories based on asset type.
+        # The cache_location_root is now configured in the planning stage.
+        # This config can be used for worker-specific settings (e.g., num_workers).
+        {}
 
   # Stage 4: Create the final, iterable dataset for training.
   # This function consumes the cache manifest to produce a dataset of ready-to-use
@@ -92,32 +100,16 @@ execution_graph:
       requires:
         - 'execute_asset_caching'
         - 'derive_required_assets' # Needs the original asset requirements to know how to pair things.
+        # REVISION 2.5: The assembler requires the new resolution map from the planner.
+        - 'plan_all_asset_encoding'
       arguments:
         slider_config: 'imagepool_config'   #what grouping relationships are needed to form batches!
-        slider_dataset: 'sliderimage_pool'  #the authoritative iterators we used to make cache manifest
+        slider_dataset: 'data_package'  #the authoritative iterators we used to make cache manifest
         cache_manifest: 'cache_manifest'    #the cache we retrieve batch elements from!
         assets_config: 'reqassets_config' #model related data!
       return_config_key: 'sliders_batch_resampling_config'
       return_dataset_key: 'final_training_dataset'
       config: {} # Pure function driven by its arguments.
-
-  # Stage 5: Create the final, infinitely sampling iterator.
-  # This is the final handle passed to the training loop.
-  - dataset:
-      name: 'create_training_iterator'
-      function: 'create_sampling_iterator'
-      requires:
-        - 'create_sliders_training_dataset'
-      arguments:
-        sliders_train_config: 'sliders_batch_resampling_config'
-        assets_config: 'reqassets_config'
-        source_dataset: 'final_training_dataset'
-      return_config_key: False
-      return_dataset_key: 'training_iterator'
-      config:
-        seed: 42
-        iterations: 300
-    
 
 # --- Global Configurations ---
 # These are not part of the DAG but configure the runner/environment.
@@ -142,7 +134,9 @@ environment_setup:
     lr: 0.0005
 
   training_config:
-    num_epochs: 10
+    iterations: 300
+    microbatch_size: 4 # This is now the batch size of *pairs* if CFG is true.
+    seed: 42
     prediction_type: 'epsilon' # 'epsilon', 'sample', or 'v_prediction'
 
     gradient_accumulation_steps: 4

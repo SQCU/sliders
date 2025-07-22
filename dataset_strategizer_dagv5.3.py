@@ -13,13 +13,95 @@ from discovery_scanner import discover_data_pool
 
 # --- Collection of Pure Strategizer Functions ---
 
+# In dataset_strategizer.py
+
+# --- NEW: Model Asset Registry ---
+# This declarative registry maps a model name to its required "bill of materials".
+# This is the "configuration" that drives the rest of the generic pipeline.
+# It is the single source of truth for what assets a model needs.
+
+MODEL_ASSET_REGISTRY = {
+    'StableDiffusionXL_UNet': {
+        'assets': [
+            # The UNet's 'sample' input is a latent that has had noise applied.
+            # The primitive asset we must cache is the 'latent' itself.
+            {
+                "asset_type": "latent",
+                "consumer_signature": "sdxl_vae_encoder_v1", # The tool to make this asset
+                "source_type_required": "image" # The source material needed
+            },
+            # The UNet's 'encoder_hidden_states'
+            {
+                "asset_type": "text_embedding",
+                "consumer_signature": "openai_clip_vit_l_14_text_encoder",
+                "source_type_required": "prompt"
+            },
+            # The 'text_embeds' from 'added_cond_kwargs'
+            {
+                "asset_type": "pooled_text_embedding",
+                "consumer_signature": "openai_clip_vit_l_14_text_encoder", # Same consumer, different output
+                "source_type_required": "prompt"
+            },
+            # The 'time_ids' from 'added_cond_kwargs'
+            {
+                "asset_type": "time_embedding",
+                "consumer_signature": "sdxl_time_id_synthesizer_v1",
+                "source_type_required": "image" # Depends on original image resolution
+            },
+            # The 'timestep' is algorithmically generated, not cached from a source file.
+            # For now, we can represent it as requiring an 'algorithmic' source,
+            # which signals to the planner that no file-based work is needed for this.
+            {
+                "asset_type": "timestep",
+                "consumer_signature": "noise_scheduler_sampler_v1",
+                "source_type_required": "algorithmic"
+            }
+        ]
+    },
+    'SDXL_VAE_Decoder': {
+        'assets': [
+            # The VAE Decoder's primary input is a pre-existing latent.
+            # An experiment training this model would need a cache of these.
+            {
+                "asset_type": "latent",
+                "consumer_signature": "sdxl_vae_encoder_v1",
+                "source_type_required": "image"
+            }
+        ]
+    },
+    'SDXL_VAE_Encoder': {
+        # The VAE Encoder's primary input ('x') is a raw image.
+        # It is a primitive source, not a pre-computed and cached asset.
+        # Therefore, for an experiment where this is the final consumer, the list
+        # of *required pre-cached assets* is correctly empty.
+        'assets': []
+    }
+    # To support a new model (e.g., ControlNet), one would simply add a new entry here.
+}
+
 def derive_required_assets_from_model(config: Dict, **kwargs) -> Dict:
     """
-    HONEST STUB: This function's responsibility is to inspect a model and return
-    a configuration describing the assets needed to call it.
+    Looks up the required "bill of materials" for a given model from a
+    central registry. This function is now fully unstubbed and acts as a
+    configuration dispatcher.
     """
-    print("  (STUB: This is where we would inspect the model signature for 'base_model_name')")
-    return {'reqassets_config': {'assets': []}}
+    print("  (INFO: Unstubbed logic is executing.)")
+    print("  (INFO: Deriving asset requirements from model registry...)")
+
+    model_name = config.get('base_model_name')
+    if not model_name:
+        raise ValueError("Config for 'derive_required_assets_from_model' must contain 'base_model_name'.")
+
+    # Look up the model's requirements in the registry.
+    asset_requirements = MODEL_ASSET_REGISTRY.get(model_name)
+
+    if asset_requirements is None:
+        raise ValueError(f"Unknown 'base_model_name': '{model_name}'. No entry found in MODEL_ASSET_REGISTRY.")
+
+    print(f"  (INFO: Found {len(asset_requirements.get('assets',[]))} asset requirements for '{model_name}'.)")
+
+    # Return the requirements in the standard 'reqassets_config' format.
+    return {'reqassets_config': asset_requirements}
 
 def create_imageslider_pool_iterator(config: Dict, **kwargs) -> Dict:
     """
@@ -79,6 +161,7 @@ def create_imageslider_pool_iterator(config: Dict, **kwargs) -> Dict:
         raise ValueError("No valid filenames found in create_imageslider_pool_iterator")
 
     def generator() -> Iterator[Dict]:
+        #why was this hardcoded instead of passed from config? fix in next pass.
         rng = random.Random(42)
         while True:
             selected_filename = rng.choice(valid_filenames)
@@ -92,24 +175,149 @@ def create_imageslider_pool_iterator(config: Dict, **kwargs) -> Dict:
             high_prompt_recipe = _get_composed_prompt(high_path, config['prompt_sources'], root_prompts, metadata, rng)
             low_prompt_recipe = _get_composed_prompt(low_path, config['prompt_sources'], root_prompts, metadata, rng)
 
+            # REVISION 1.1: Yield a self-describing data package with a generic 'primitives' list.
             yield {
                 "source_identifier": selected_filename,
-                "high_scale_info": {"scale": high_scale, "path": str(high_path), "prompt_recipe": high_prompt_recipe},
-                "low_scale_info": {"scale": low_scale, "path": str(low_path), "prompt_recipe": low_prompt_recipe},
+                "primitives": [
+                    {"qualifier": "high_scale", "type": "image", "data": str(high_path)},
+                    {"qualifier": "high_scale", "type": "prompt", "data": high_prompt_recipe},
+                    {"qualifier": "low_scale", "type": "image", "data": str(low_path)},
+                    {"qualifier": "low_scale", "type": "prompt", "data": low_prompt_recipe},
+                ]
             }
+    
+    # REVISION 1.2: Add the explicit processing rules to the returned config.
+    # This config now contains the 'how-to' guide for the planner.
+    output_config = config.copy() # Start with the original config
+    output_config['processing_rules'] = [
+        {"source_qualifier": "high_scale", "source_type": "image", "consumer_signature": "sdxl_vae_encoder_v1"},
+        {"source_qualifier": "low_scale",  "source_type": "image", "consumer_signature": "sdxl_vae_encoder_v1"},
+        {"source_qualifier": "high_scale", "source_type": "image", "consumer_signature": "sdxl_time_id_synthesizer_v1"},
+        {"source_qualifier": "low_scale",  "source_type": "image", "consumer_signature": "sdxl_time_id_synthesizer_v1"},
+        {"source_qualifier": "high_scale", "source_type": "prompt", "consumer_signature": "openai_clip_vit_l_14_text_encoder"},
+        {"source_qualifier": "low_scale",  "source_type": "prompt", "consumer_signature": "openai_clip_vit_l_14_text_encoder"}
+    ]
 
     return {
-        'imagepool_config': config,
-        'sliderimage_pool': generator()
+        'imagepool_config': output_config,
+        'data_package': generator()
     }
 
+
+import itertools
+import hashlib
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterator, Any, List, Set, Tuple
+
+def _generate_stable_hash(s: str) -> str:
+    """Helper to create a stable hash for cache keys."""
+    return hashlib.sha1(s.encode()).hexdigest()
+
 def create_unified_asset_worklist(config: Dict, **dependencies) -> Dict:
-    """HONEST STUB: Consumes configs and data to plan all encoding work."""
-    print("  (STUB: This is where we would iterate through the image_pool and assets_config)")
-    print("  (STUB: to create a unified list of all files to encode and assets to generate.)")
-    def empty_generator():
-        yield from ()
-    return {'unified_worklist': empty_generator()}
+    """
+    A truly generic function that plans all encoding work. It consumes a configured
+    number of items from a data source iterator, deduplicates the required encoding
+    tasks, organizes them into per-consumer queues, and returns both the work queues
+    and a resolution map for final assembly.
+
+    This is the definitive Layer 3: The Work Planning Engine.
+    """
+    print("  (INFO: Executing MASTER asset worklist planner...)")
+
+    # --- 1. Unpack all FOUR required inputs ---
+    data_package_iterator = dependencies['data_package']
+    assets_config = dependencies['assets_config']
+    # The 'how-to' guide from the discovery function (Layer 2)
+    processing_rules_config = dependencies['processing_rules_config']
+    
+    # The new configuration that governs the planner's own behavior
+    # This comes from the 'config' block of this stage in the manifest.
+    max_iterations = config.get('max_iterations', 100) # Default to 100 if not specified
+    cache_root = Path(config.get("cache_location_root", "./cache/"))
+
+    # Extract the necessary data from the configs
+    required_consumers = {
+        asset['consumer_signature']: asset['asset_type'] 
+        for asset in assets_config.get('assets', [])
+    }
+    processing_rules = processing_rules_config.get('processing_rules', [])
+
+    # --- 2. Initialize Internal State ---
+    
+    # The final, optimized work queues, keyed by consumer. This is for Layer 4.
+    work_queues: Dict[str, List[Dict]] = defaultdict(list)
+    
+    # A set to track unique work items for deduplication. The value is a hash
+    # representing a unique encoding task.
+    seen_work_items: Set[str] = set()
+
+    # The Rosetta Stone for Layer 5. A list where each entry corresponds to a
+    # training step and maps its abstract needs to a concrete cache path hash.
+    work_resolution_map: List[Dict[Tuple[str, str], str]] = []
+
+    print(f"  (INFO: Planning to draw {max_iterations} samples from the data iterator.)")
+
+    # --- 3. Main Loop: Consume, Plan, Deduplicate, and Map ---
+
+    # Use itertools.islice to safely draw N items from a potentially infinite iterator
+    for data_item in itertools.islice(data_package_iterator, max_iterations):
+        source_id = data_item['source_identifier']
+        
+        # This dictionary will map the needs for THIS specific training step.
+        current_step_resolution: Dict[Tuple[str, str], str] = {}
+
+        # Join the primitives from this data item with the processing rules
+        for primitive in data_item.get('primitives', []):
+            for rule in processing_rules:
+                # Check if this rule applies to this primitive
+                if (rule['source_qualifier'] == primitive['qualifier'] and 
+                    rule['source_type'] == primitive['type']):
+                    
+                    consumer_sig = rule['consumer_signature']
+
+                    # Check if the model actually needs the asset this consumer produces
+                    if consumer_sig in required_consumers:
+                        asset_type = required_consumers[consumer_sig]
+
+                        # A. Generate a unique, deterministic identifier for this specific work task.
+                        # This becomes the key for deduplication and the value in the resolution map.
+                        unique_work_id = _generate_stable_hash(f"{source_id}_{primitive['qualifier']}_{asset_type}")
+                        
+                        # B. Deduplication: The core optimization.
+                        if unique_work_id not in seen_work_items:
+                            # This is the first time we've seen this exact task. Plan it.
+                            seen_work_items.add(unique_work_id)
+                            
+                            output_path = cache_root / asset_type / f"{unique_work_id}.pt"
+
+                            work_item = {
+                                "source_primitive": primitive['data'],
+                                "asset_type": asset_type,
+                                "consumer_signature": consumer_sig,
+                                "output_cache_path": str(output_path),
+                                # Add the unique ID for the executor to use when building the manifest
+                                "work_id": unique_work_id,
+                            }
+                            work_queues[consumer_sig].append(work_item)
+
+                        # C. Mapping: Always update the map for the current training step.
+                        # This maps the abstract need (e.g., "high_scale latent") to the
+                        # concrete ID of the work that will produce it.
+                        resolution_key = (primitive['qualifier'], asset_type)
+                        current_step_resolution[resolution_key] = unique_work_id
+        
+        work_resolution_map.append(current_step_resolution)
+
+    print(f"  (INFO: Planning complete. Total unique work items: {len(seen_work_items)}.)")
+    print(f"  (INFO: Work queues generated for consumers: {list(work_queues.keys())})")
+
+    # --- 4. Return the Complete Master Plan ---
+    # The output contract is now two keys, for two different downstream consumers.
+    return {
+        'unified_worklist': dict(work_queues), # For the Asset Execution Engine (Layer 4)
+        'work_resolution_map': work_resolution_map # For the Training Dataset Assembly (Layer 5)
+    }
 
 def execute_caching_iterator(config: Dict, **dependencies) -> Dict:
     """HONEST STUB: Consumes a worklist and produces a cache manifest."""
@@ -208,7 +416,7 @@ def call_from_path(manifest_path: Path) -> Dict[str, Any]:
 
                 print(f"  - Executing function: '{stage['function']}'...")
                 stage_outputs = fn(stage['config'], **kwargs)
-                
+
                 if stage.get('return_config_key'):
                     key = stage['return_config_key']
                     execution_results[key] = stage_outputs[key]
@@ -241,8 +449,8 @@ def main():
         for key, value in final_results.items():
             value_type = "iterator" if hasattr(value, '__next__') else type(value).__name__
             print(f"  - '{key}' (type: {value_type})")
-        print("\n--- Demonstrating a REAL iterator ('sliderimage_pool') ---")
-        real_iterator = final_results['sliderimage_pool']
+        print("\n--- Demonstrating a REAL iterator ('data_package') ---")
+        real_iterator = final_results['data_package']
         for i, item in enumerate(real_iterator):
             if i >= 3: break
             print(f"  Item {i+1}: {item}")
@@ -251,6 +459,8 @@ def main():
         if final_iterator:
             items = list(final_iterator)
             print(f"  Final iterator yielded {len(items)} items. (Correctly 0 due to upstream stubs)")
+        else:
+            print(f"  Final iterator enigmatically, evaluated as falsy. final_results.get('training_iterator'):{final_results.get('training_iterator')}")
     except Exception as e:
         import traceback
         print(f"\n[ERROR] An error occurred during DAG execution: {e}")
