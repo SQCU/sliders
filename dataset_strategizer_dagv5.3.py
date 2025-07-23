@@ -6,7 +6,7 @@ from collections import defaultdict
 import os
 import random
 import hashlib
-from typing import Iterator, Callable, Dict, Any, List, Tuple, Set
+from typing import Iterator, Callable, Dict, Any
 
 # CORRECTED IMPORT: We now import the core function directly, not the path-based helper.
 from discovery_scanner import discover_data_pool
@@ -208,7 +208,7 @@ import itertools
 import hashlib
 from collections import defaultdict
 from pathlib import Path
-# Semantic layer 3!
+from typing import Dict, Iterator, Any, List, Set, Tuple
 
 def _generate_stable_hash(s: str) -> str:
     """Helper to create a stable hash for cache keys."""
@@ -319,156 +319,11 @@ def create_unified_asset_worklist(config: Dict, **dependencies) -> Dict:
         'work_resolution_map': work_resolution_map # For the Training Dataset Assembly (Layer 5)
     }
 
-# This is a new, formalized registry required by Semantic Layer 4.
-# It lives alongside MODEL_ASSET_REGISTRY.
-# In a real system, this would be more extensive.
-CONSUMER_REGISTRY = {
-    'sdxl_vae_encoder_v1': {
-        "model_path": "path/to/sdxl_vae_encoder_v1.safetensors",
-        "dtype": torch.bfloat16,
-        "method_to_call": "encode"
-    },
-    'openai_clip_vit_l_14_text_encoder': {
-        "model_path": "path/to/openai_clip_vit_l_14.safetensors",
-        "dtype": torch.bfloat16,
-        "method_to_call": "forward"
-    },
-    'sdxl_time_id_synthesizer_v1': {
-        "model_path": "path/to/time_synth_model.safetensors",
-        "dtype": torch.float32, # Example of a specific exception
-        "method_to_call": "forward"
-    }
-}
-
-# --- Layer 4, Step 2: Per-Consumer Setup ---
-def _setup_consumer(consumer_signature: str) -> Tuple[Any, Dict[str, Any]]:
-    """
-    Looks up consumer specs, loads the model to CPU, applies housekeeping,
-    and moves it to the accelerator.
-    """
-    print(f"  [L4] Setting up consumer: '{consumer_signature}'...")
-    if consumer_signature not in CONSUMER_REGISTRY:
-        raise ValueError(f"Consumer '{consumer_signature}' not found in CONSUMER_REGISTRY.")
-    
-    specs = CONSUMER_REGISTRY[consumer_signature]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # (STUB: This is where we would load a real model from specs['model_path'])
-    # For now, we create a dummy model.
-    model = torch.nn.Linear(10, 10) # Dummy placeholder model
-
-    model.eval()
-    model.to(dtype=specs['dtype'])
-    
-    # (STUB: This is where we could set requires_grad(False) on all parameters)
-    print("  [L4] (STUB: Gradients would be explicitly disabled here.)")
-    
-    model.to(device)
-    print(f"  [L4] Model loaded to '{device}' with dtype '{specs['dtype']}'.")
-    
-    return model, specs
-
-# --- Layer 4, Step 3.A & 3.B: Calibration Preparation ---
-def _prepare_calibration(work_queue: List[Dict]) -> List[Dict]:
-    """Isolates a small, representative sample of data for calibration."""
-    print("  [L4] Preparing a representative sample for throughput calibration...")
-    # (STUB: A more advanced version might sample diverse data shapes if present)
-    calibration_sample_size = min(len(work_queue), 32)
-    return work_queue[:calibration_sample_size]
-
-# --- Layer 4, Step 3.C: External, Stubbed Calibration Function ---
-def find_optimal_batch_size(model: Any, calibration_data: List[Dict], consumer_specs: Dict) -> int:
-    """
-    STUB FUNCTION: This represents a complex, external function that would
-    proactively find the best batch size for maximum throughput.
-    """
-    print("  [L4] (STUB: Beginning proactive throughput calibration...)")
-    print("  [L4] (STUB: This is where we would run a search (cold run, warm run, binary search)...")
-    print("  [L4] (STUB: ...to find the optimal batch size without causing VRAM OOM or slowdowns.)")
-    # For this minimal implementation, we return a safe, hardcoded batch size.
-    safe_batch_size = 16
-    print(f"  [L4] (STUB: Calibration complete. Using safe batch size: {safe_batch_size})")
-    return safe_batch_size
-
-# --- Layer 4, Step 4: Batched Data Processing ---
-def _process_work_queue(
-    work_queue: List[Dict], 
-    model: Any, 
-    batch_size: int, 
-    device: str,
-    cache_manifest: Dict[str, str]
-) -> None:
-    """
-    Iterates through a work queue in batches, executes the model, and
-    updates the cache manifest.
-    """
-    for i in range(0, len(work_queue), batch_size):
-        batch_items = work_queue[i:i + batch_size]
-        print(f"  [L4] Processing batch {i//batch_size + 1} / {len(work_queue)//batch_size + 1} (size: {len(batch_items)})")
-
-        # (STUB: This is where async data loading and transfer would be orchestrated)
-        print("  [L4]   (STUB: Collating batch data for transfer to device...)")
-        
-        # For MVP, we just create dummy tensors.
-        # In a real implementation, this would involve loading images, tokenizing text, etc.
-        input_tensors = [torch.randn(10, dtype=model.dtype) for _ in batch_items]
-        input_batch = torch.stack(input_tensors).to(device)
-
-        # Execute the model's forward pass
-        output_batch = model(input_batch)
-
-        # Retrieve results and update manifest
-        output_cpu = output_batch.cpu()
-        for item_idx, work_item in enumerate(batch_items):
-            work_id = work_item['work_id']
-            output_path = work_item['output_cache_path']
-            
-            # (STUB: This is where we would save the actual tensor to disk)
-            print(f"  [L4]   (STUB: Saving asset to '{output_path}')")
-            
-            # The one real side effect: updating the manifest dictionary.
-            cache_manifest[work_id] = output_path    
-
-# --- Layer 4, Step 1: Main Entry Point ---
 def execute_caching_iterator(config: Dict, **dependencies) -> Dict:
-    """
-    The main entry point for the Asset Execution Engine. It orchestrates
-    the loading, calibration, and execution for each consumer queue.
-    """
-    print("\n  [L4] --- Asset Execution Engine Initiated ---")
-    unified_worklist = dependencies['unified_worklist']
-    cache_manifest = {}
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    for consumer_signature, work_queue in unified_worklist.items():
-        if not work_queue:
-            print(f"  [L4] Skipping consumer '{consumer_signature}': empty work queue.")
-            continue
-
-        model, specs = _setup_consumer(consumer_signature)
-
-        # (STUB: The optimized SDPA backend context would be applied here)
-        # with torch.backends.cuda.sdp_kernel(...):
-        with torch.inference_mode():
-            calibration_data = _prepare_calibration(work_queue)
-            optimal_batch_size = find_optimal_batch_size(model, calibration_data, specs)
-            
-            _process_work_queue(
-                work_queue=work_queue,
-                model=model,
-                batch_size=optimal_batch_size,
-                device=device,
-                cache_manifest=cache_manifest
-            )
-
-        # --- Layer 4, Step 5: Per-Consumer Teardown ---
-        print(f"  [L4] Tearing down consumer: '{consumer_signature}'...")
-        del model
-        if device == "cuda":
-            torch.cuda.empty_cache()
-
-    print("  [L4] --- Asset Execution Engine Complete ---\n")
-    return {'cache_manifest': cache_manifest}
+    """HONEST STUB: Consumes a worklist and produces a cache manifest."""
+    print("  (STUB: This is where we would consume the 'unified_worklist', run encoders,)")
+    print("  (STUB: and save tensors to the cache_location_root.)")
+    return {'cache_manifest': {'description': 'Stubbed cache manifest.', 'assets': {}}}
 
 def fold_cache_manifest_into_dataset(config: Dict, **dependencies) -> Dict:
     """
