@@ -1,0 +1,132 @@
+# experiment_manifest_dag.yaml
+# 
+version: v5.4
+# experiment_manifest_refactored.yaml
+# ARCH-FIX: This manifest adheres to the principle "Configuration flows down".
+# Each stage has its own 'config' block and declares its data dependencies via 'inputs'.
+
+execution_graph:
+  - stage_name: "get_asset_spec"
+    function: "get_required_asset_spec"
+    config:
+      base_model_name: "StableDiffusionXL_UNet"
+    outputs:
+      - "required_assets_spec"
+
+  - stage_name: "discover_data"
+    function: "discover_source_data_stream"
+    config:
+      # Config specific to Layer 2
+      folder_main: "datasets/bracket"
+      folders: ['0', '1', '2']
+      scales: [0, 1, 2]
+      file_extensions: [".png", ".jpg"]
+      min_scales_required: 2
+      pairing_strategy: "relaxed"
+      seed: 42
+      prompt_sources:
+        root:
+          file: 'datasets/bracket/rootprompt.yaml'
+          importance: 5.0
+        metadata:
+          file: 'datasets/bracket/promptmetadata.json'
+          folder_importance: 2.0
+          item_importance: 5.0
+    outputs:
+      - "source_data_stream"
+
+  - stage_name: "plan_workload"
+    function: "plan_asset_workload"
+    inputs:
+      required_assets_spec: "required_assets_spec"
+      source_data_stream: "source_data_stream"
+    config:
+      # Config specific to Layer 3
+      max_training_items: 200
+    outputs:
+      - "abstract_work_plan"
+      - "assembly_resolution_map"
+
+  - stage_name: "execute_caching"
+    function: "execute_asset_caching"
+    inputs:
+      abstract_work_plan: "abstract_work_plan"
+    config:
+      # Config specific to Layer 4
+      cache_location_root: "./cache_refactored/"
+      # ARCH-FIX: This map is the bridge between abstract interfaces and concrete tools.
+      # This is the ONLY place this knowledge lives.
+      consumer_implementation_map:
+        image_to_denoise_inputs_encoder: "denoise_input_encoder_v1"
+        text_to_embedding_encoder: "text_encoder_v1"
+        image_to_time_id_synthesizer: "time_id_synthesizer_v1"
+        scale_tensor_synthesizer: "scale_tensor_synthesizer_v1" #<-- this is the new one!
+      cache_files:
+        noisy_latent: "./datasets/bracket/latents.safetensors"
+        timestep_for_unet: "./datasets/bracket/latents.safetensors"
+        text_embedding: "./datasets/bracket/text_embeds.safetensors"
+        pooled_text_embedding: "./datasets/bracket/text_embeds.safetensors"
+        time_embedding: "./datasets/bracket/time_embeds.safetensors"
+    outputs: [ "asset_cache_manifest" ]
+
+  - stage_name: "assemble_dataset"
+    function: "assemble_training_dataset"
+    inputs:
+      assembly_resolution_map: "assembly_resolution_map"
+      asset_cache_manifest: "asset_cache_manifest"
+    config:
+      # Config specific to Layer 5 (e.g., batching, pairing logic)
+      batch_size: 4
+      cfg_pairing_enabled: true
+    outputs:
+      - "final_training_dataset"
+
+# --- Global Configurations ---
+# These are not part of the DAG but configure the runner/environment.
+trial_config:
+environment_setup:
+  # This block dictates the heavyweight, shared components.
+  # The harness is now model-agnostic. We specify what to load here.
+  base_model_name: 'StableDiffusionXL_UNet'  # Can be 'TesterUViT' or 'StableDiffusionXL_UNet'
+  # Add any model-specific paths if loading a real model from disk
+  model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+  # This block defines the parameters for the specific trial to be run.
+  lora_config:
+    lora_rules:
+      - name: "ATTN_and_FFN"
+        rank: 8
+        alpha: 1.0
+        target_name_contains: ['attn', 'ff.net']
+  model_config:
+    weights_dtype: 'torch.bfloat16'
+        
+  optimizer_config:
+    lr: 0.0005
+
+  training_config:
+    iterations: 300
+    microbatch_size: 4 # This is now the batch size of *pairs* if CFG is true.
+    seed: 42
+    prediction_type: 'epsilon' # 'epsilon', 'sample', or 'v_prediction'
+
+    gradient_accumulation_steps: 4
+    # Set to false to disable GNS and use standard gradient accumulation.
+    estimate_gradient_noise_scale: true 
+    gns_profile_freq: 10 # Profile every 10 optimizer steps
+    gns_ema_fast: 0.1
+    gns_ema_slow: 0.01
+    search_config:
+    # This new block controls the search loop itself.
+    num_trials: 5
+    top_n_results_to_show: 3
+
+  evaluation_config:
+    # Constraint 1: Proportional to training data size.
+    # 0.1 means "use no more than 10% of the number of training samples for evaluation".
+    proportion_of_train: 0.1
+    # Constraint 2: Proportional to total training time.
+    # 0.05 means "spend no more than 5% of the total projected training time generating eval data".
+    max_eval_time_proportion: 0.05
+    sampling_config:
+      total_timesteps: 50
+      # guidance_scale will eventually be handled by the model_util functions
