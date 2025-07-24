@@ -1,7 +1,7 @@
-# FFW8: dataset_strategizer_dagv5.4.py
+# FFW8: dataset_strategizer_dagv5.5.py
 # This version is a complete architectural refactor to enforce strict layer separation
 # as per the "Semantic Layer Specifications" and the provided critique.
-# python dataset_strategizer_dagv5.4.py >> dset_strat_dagv5.4.txt 2>&1
+# python dataset_strategizer_dagv5.5.py >> dset_strat_dagv5.5.txt 2>&1
 
 import yaml
 from pathlib import Path
@@ -23,44 +23,111 @@ from discovery_scanner import discover_data_pool
 # the tools used to satisfy these interfaces can be changed in a separate
 # configuration without touching this registry.
 
-MODEL_INTERFACE_REGISTRY = {
+# --- Layer 1: Data Consumer Registry (Interface Contract Definition) ---
+# ARCH-FIX (v5.5): This version completely decouples the registry from implementation by
+# replacing the hardcoded 'asset_interface' name with a declarative 'capability_requirements'
+# block. This registry now only describes WHAT a consumer needs and the abstract PROPERTIES
+# of the process that creates it, not a named reference to the process itself.
+# This design is now truly agnostic to the consumer's domain (e.g., image generation vs. text evaluation).
+
+DATA_CONSUMER_REGISTRY = {
+    # --- USE CASE 1: Image Generation Model ---
     'StableDiffusionXL_UNet': {
         'required_assets': [
-            {"asset_type": "noisy_latent", "asset_interface": "image_to_denoise_inputs_encoder", "source_types_required": ["image", "prng_seed"]},
-            {"asset_type": "timestep_for_unet", "asset_interface": "image_to_denoise_inputs_encoder", "source_types_required": ["image", "prng_seed"]},
-            {"asset_type": "text_embedding", "asset_interface": "text_to_embedding_encoder", "source_types_required": ["prompt"]},
-            {"asset_type": "pooled_text_embedding", "asset_interface": "text_to_embedding_encoder", "source_types_required": ["prompt"]},
-            {"asset_type": "time_embedding", "asset_interface": "image_to_time_id_synthesizer", "source_types_required": ["image"]},
-            {"asset_type": "scales_tensor", "asset_interface": "scale_tensor_synthesizer", "source_types_required": ["scale_metadata"]}
+            # Note: The 'capability_requirements' block is identical for both assets
+            # produced by the same underlying capability. This is intentional and explicit.
+            {
+                "asset_type": "noisy_latent",
+                "capability_requirements": {
+                    "processing_category": "image_denoising_prep",
+                    "input_types": ["image", "prng_seed"],
+                    "output_types": ["noisy_latent", "timestep_for_unet"]
+                }
+            },
+            {
+                "asset_type": "timestep_for_unet",
+                "capability_requirements": {
+                    "processing_category": "image_denoising_prep",
+                    "input_types": ["image", "prng_seed"],
+                    "output_types": ["noisy_latent", "timestep_for_unet"]
+                }
+            },
+            {
+                "asset_type": "text_embedding",
+                "capability_requirements": {
+                    "processing_category": "text_encoding",
+                    "input_types": ["prompt"],
+                    "output_types": ["text_embedding", "pooled_text_embedding"]
+                }
+            },
+            {
+                "asset_type": "pooled_text_embedding",
+                "capability_requirements": {
+                    "processing_category": "text_encoding",
+                    "input_types": ["prompt"],
+                    "output_types": ["text_embedding", "pooled_text_embedding"]
+                }
+            },
+            {
+                "asset_type": "time_embedding",
+                "capability_requirements": {
+                    "processing_category": "temporal_encoding",
+                    "input_types": ["image"],
+                    "output_types": ["time_embedding"]
+                }
+            },
+            {
+                "asset_type": "scales_tensor",
+                "capability_requirements": {
+                    "processing_category": "metadata_synthesis",
+                    "input_types": ["scale_metadata"],
+                    "output_types": ["scales_tensor"]
+                }
+            }
         ]
     },
-    'SDXL_VAE_Decoder': {
+
+    # --- USE CASE 2 (Fictional): Text Evaluation Script (Our "The Mask" Contrast Case) ---
+    'TheMask_Eval_Consumer': {
         'required_assets': [
             {
-                "asset_type": "latent",
-                "asset_interface": "image_to_latent_encoder",
-                "source_type_required": "image"
+                "asset_type": "masked_corpus_chunk",
+                "capability_requirements": {
+                    "processing_category": "the_mask_language_objective",
+                    "input_types": ["raw_text"],
+                    "output_types": ["masked_corpus_chunk", "original_text_target"]
+                }
+            },
+            {
+                "asset_type": "original_text_target",
+                "capability_requirements": {
+                    "processing_category": "the_mask_language_objective",
+                    "input_types": ["raw_text"],
+                    "output_types": ["masked_corpus_chunk", "original_text_target"]
+                }
             }
         ]
     }
+    # To add a new data consumer, a developer would simply add a new entry here.
+    # The rest of the DAG is responsible for fulfilling the declared capabilities.
 }
 
 def get_required_asset_spec(own_config: Dict, **kwargs) -> Dict[str, Any]:
     """
-    LAYER 1: Looks up the required asset INTERFACES for a model.
+    LAYER 1: Looks up the required asset CAPABILITIES for a data consumer.
     This function is a pure configuration dispatcher. It does not know or care
-    how the assets will be made, only what is required.
+    how the assets will be made, only what capabilities are required.
     """
     print("[LAYER 1] Looking up required asset specification...")
-    model_name = own_config.get('base_model_name')
-    if not model_name:
-        raise ValueError("L1 Config must contain 'base_model_name'.")
+    consumer_name = own_config.get('data_consumer_name')
+    if not consumer_name:
+        raise ValueError("L1 Config must contain 'data_consumer_name'.")
 
-    asset_spec = MODEL_INTERFACE_REGISTRY.get(model_name)
+    asset_spec = DATA_CONSUMER_REGISTRY.get(consumer_name)
     if asset_spec is None:
-        raise ValueError(f"Unknown model '{model_name}' in MODEL_INTERFACE_REGISTRY.")
+        raise ValueError(f"Unknown data consumer '{consumer_name}' in DATA_CONSUMER_REGISTRY.")
 
-    print(f"  - Found {len(asset_spec['required_assets'])} required assets for '{model_name}'.")
+    print(f"  - Found {len(asset_spec['required_assets'])} required assets for consumer '{consumer_name}'.")
     return {'required_assets_spec': asset_spec}
 
 
@@ -161,32 +228,47 @@ def discover_source_data_stream(own_config: Dict, **kwargs) -> Dict[str, Any]:
     # The output is PURE DATA, not configuration, with the key expected by the DAG.
     return {'source_data_stream': generator()}
 
-# --- Layer 3: Work Planning Engine ---
+# --- Layer 3: Work Planning Engine (v5.5 - Final Revision) ---
 
 def plan_asset_workload(own_config: Dict, **upstream_data) -> Dict[str, Any]:
+    """
+    LAYER 3 (v5.5): Plans a generic workload and produces an explicit set of
+    assembly instructions, fully decoupling it from Layer 5.
+    """
     print("[LAYER 3] Planning abstract asset workload...")
     asset_spec = upstream_data['required_assets_spec']
     data_iterator = upstream_data['source_data_stream']
     max_items_to_plan = own_config.get('max_training_items', 100)
 
-    work_items_by_interface: Dict[str, List[Dict]] = defaultdict(list)
+    work_specifications: List[Dict] = []
+    # ARCH-FIX: This is the new, explicit data contract.
+    assembly_instructions: List[Dict] = []
     seen_work_ids: Set[str] = set()
-    assembly_resolution_map: List[Dict[Any, Any]] = []
 
-    reqs_by_interface = defaultdict(list)
+    reqs_by_capability = defaultdict(list)
     for req in asset_spec.get('required_assets', []):
-        reqs_by_interface[req['asset_interface']].append(req)
+        capability = req['capability_requirements']
 
-    for data_item in itertools.islice(data_iterator, max_items_to_plan):
-        source_id = data_item['source_identifier']
-        current_item_resolution_map: Dict[Any, Any] = {}
+        # BUGFIX: Recursively make the capability structure hashable by converting
+        # internal lists to sorted tuples, ensuring a stable and valid key.
+        cap_key = tuple(sorted(
+            (k, tuple(sorted(v)) if isinstance(v, list) else v)
+            for k, v in capability.items()
+        ))
+        
+        reqs_by_capability[cap_key].append(req)
+
+    for i, data_item in enumerate(itertools.islice(data_iterator, max_items_to_plan)):
+        # This temporary map is now a pure implementation detail of L3.
+        current_item_resolution_map: Dict[Tuple[str, str], str] = {}
         primitives_by_type = defaultdict(list)
-        for p in data_item.get('primitives', []): primitives_by_type[p['type']].append(p)
+        for p in data_item.get('primitives', []):
+            primitives_by_type[p['type']].append(p)
 
-        # BUGFIX: This loop is now beautifully simple. It treats ALL interfaces the same.
-        # No more `if interface == 'identity'`
-        for interface, req_assets in reqs_by_interface.items():
-            all_source_types = sorted(list(set(st for req in req_assets for st in req['source_types_required'])))
+        for cap_key, req_assets in reqs_by_capability.items():
+            capability = dict(cap_key)
+            all_source_types = sorted(capability['input_types'])
+            
             candidate_primitives_per_type = [primitives_by_type[st] for st in all_source_types]
             if not all(candidate_primitives_per_type): continue
 
@@ -196,27 +278,42 @@ def plan_asset_workload(own_config: Dict, **upstream_data) -> Dict[str, Any]:
                     if 'data_value' in p: return str(p['data_value'])
                     if 'data_content' in p: return str(p['data_content'])
                     return ""
+
                 input_ids = "".join(get_primitive_data_as_string(p) for p in primitive_bundle)
-                work_id = hashlib.sha1(f"{interface}-{input_ids}".encode()).hexdigest()
+                work_id = hashlib.sha1(f"{capability['processing_category']}-{input_ids}".encode()).hexdigest()
 
                 if work_id not in seen_work_ids:
                     seen_work_ids.add(work_id)
-                    work_item = { "work_id": work_id, "source_primitives": primitive_bundle }
-                    work_items_by_interface[interface].append(work_item)
-                
+                    work_specifications.append({
+                        "work_id": work_id,
+                        "required_capabilities": capability,
+                        "input_data": {p['type']: p.get('data_path') or p.get('data_value') or p.get('data_content') for p in primitive_bundle},
+                        "expected_outputs": capability['output_types']
+                    })
+
                 for req in req_assets:
-                    req_source_types = set(req['source_types_required'])
-                    primary_primitive = next((p for p in primitive_bundle if p['type'] in req_source_types and p['qualifier'] != 'global'), None)
+                    primary_primitive = next((p for p in primitive_bundle if p['type'] in req['capability_requirements']['input_types'] and p['qualifier'] != 'global'), None)
                     if primary_primitive:
                         assembly_key = (primary_primitive['qualifier'], req['asset_type'])
-                        # The instruction is ALWAYS a work_id.
                         current_item_resolution_map[assembly_key] = work_id
+        
+        # ARCH-FIX: Transform the internal resolution map into the public assembly_instructions contract.
+        item_assets_to_assemble = []
+        for (qualifier, asset_type), work_id in current_item_resolution_map.items():
+            item_assets_to_assemble.append({
+                "final_asset_key": f"{qualifier}_{asset_type}",
+                "lookup_work_id": work_id,
+                "lookup_asset_type": asset_type
+            })
+        assembly_instructions.append({
+            "sample_id": i,
+            "assets_to_assemble": item_assets_to_assemble
+        })
 
-        assembly_resolution_map.append(current_item_resolution_map)
-    
-    print(f"  - Planning complete. Unique work items: {len(seen_work_ids)}. Items planned: {len(assembly_resolution_map)}.")
-    return {'abstract_work_plan': dict(work_items_by_interface), 'assembly_resolution_map': assembly_resolution_map}
 
+    print(f"  - Planning complete. Unique work specs: {len(work_specifications)}. Items planned: {len(assembly_instructions)}.")
+    # ARCH-FIX: The output contract is now clean, explicit, and fully decoupled.
+    return {'work_specifications': work_specifications, 'assembly_instructions': assembly_instructions}
 
 
 # --- Layer 4: Asset Execution Engine (Corrected) ---
@@ -236,51 +333,104 @@ ASSET_CONSUMER_FUNCTIONS = {
     "scale_tensor_synthesizer_v1": scale_tensor_synthesizer_v1
 }
 
-def execute_asset_caching(own_config, **upstream_data):
-    print("[LAYER 4] Executing asset caching (STUBBED)...")
-    work_plan = upstream_data['abstract_work_plan']
-    consumer_map = own_config.get("consumer_implementation_map", {})
+# This helper function is the core of the new decoupled logic.
+def find_matching_capability(required_caps: Dict, capability_map: Dict) -> Dict:
+    """Matches a work spec's requirements to an available implementation."""
+    req_category = required_caps.get('processing_category')
+    req_inputs = set(required_caps.get('input_types', []))
+    req_outputs = set(required_caps.get('output_types', []))
+
+    for impl_spec in capability_map.values():
+        if impl_spec.get('processing_category') != req_category:
+            continue
+        
+        # An implementation is valid if it can handle all required inputs
+        # and produce all expected outputs. (It can handle more than required).
+        available_inputs = set(impl_spec.get('input_types', []))
+        available_outputs = set(impl_spec.get('output_types', []))
+
+        if req_inputs.issubset(available_inputs) and req_outputs.issubset(available_outputs):
+            return impl_spec
+    return None
+
+def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
+    """
+    LAYER 4 (v5.5): Executes a generic list of work specifications by dynamically
+    matching them to concrete consumer functions based on capability requirements.
+    """
+    print("[LAYER 4] Executing asset caching...")
+    work_specs = upstream_data['work_specifications']
+    # ARCH-FIX: Use the new, decoupled capability map from the config.
+    capability_map = own_config.get("capability_implementation_map", {})
     cache_files = own_config.get("cache_files", {})
     cache_manifest: Dict[Tuple[str, str], Tuple[str, str]] = {}
-    print(f"  - Received work plan for interfaces: {list(work_plan.keys())}")
-    for interface, work_items in work_plan.items():
-        if interface not in consumer_map: print(f"  - WARNING: No implementation for interface '{interface}'."); continue
-        consumer_name = consumer_map[interface]
+    print(f"  - Received {len(work_specs)} generic work specifications.")
+
+    # ARCH-FIX: Loop over generic specs, not a plan keyed by interface names.
+    for spec in work_specs:
+        work_id = spec['work_id']
+        required = spec['required_capabilities']
+        
+        implementation = find_matching_capability(required, capability_map)
+        if not implementation:
+            print(f"  - WARNING: No implementation found for capability '{required.get('processing_category')}' with inputs {required.get('input_types')}."); continue
+
+        consumer_name = implementation['consumer_function']
         consumer_func = ASSET_CONSUMER_FUNCTIONS.get(consumer_name)
-        if not consumer_func: print(f"  - WARNING: Consumer function '{consumer_name}' not found."); continue
-        print(f"  - Processing {len(work_items)} items for '{interface}' with '{consumer_name}'")
-        for item in work_items:
-            work_id = item['work_id']
-            kwargs = {p['type']: p.get('data_path') or p.get('data_value') or p.get('data_content') for p in item['source_primitives']}
-            output_assets = consumer_func(**kwargs)
-            for asset_type, tensor_data in output_assets.items():
+        if not consumer_func:
+            print(f"  - WARNING: Consumer function '{consumer_name}' not found."); continue
+
+        # The core execution logic remains the same, but is now invoked generically.
+        output_assets = consumer_func(**spec['input_data'])
+        
+        for asset_type, tensor_data in output_assets.items():
+            # Only cache assets that were actually expected by this work spec.
+            if asset_type in spec['expected_outputs']:
                 target_cache_file = cache_files.get(asset_type, "default_cache.safetensors")
                 manifest_key = (work_id, asset_type)
                 location_in_file = (target_cache_file, f"{work_id}_{asset_type}")
                 cache_manifest[manifest_key] = location_in_file
+
     print(f"  - Caching complete. Generated manifest with {len(cache_manifest)} asset locations.")
     return {'asset_cache_manifest': cache_manifest}
 
 
-# --- Layer 5: Training Dataset Assembly (Reverted to simpler, uniform logic) ---
+# --- Layer 5: Training Dataset Assembly (v5.5) ---
 def assemble_training_dataset(own_config: Dict, **upstream_data) -> Dict[str, Any]:
-    print("[LAYER 5] Assembling final training dataset (STUBBED)...")
-    resolution_map = upstream_data['assembly_resolution_map']
+    """
+    LAYER 5 (v5.5): Assembles final data consumer batches by following an explicit
+    list of instructions. It is now fully decoupled from the planning logic of Layer 3.
+    """
+    print("[LAYER 5] Assembling final data batches...")
+    # ARCH-FIX: Consume the new, explicit and decoupled data contract.
+    assembly_instructions = upstream_data['assembly_instructions']
     cache_manifest = upstream_data['asset_cache_manifest']
-    print(f"  - Received resolution map for {len(resolution_map)} items and manifest for {len(cache_manifest)} assets.")
+    print(f"  - Received instructions for {len(assembly_instructions)} items and manifest for {len(cache_manifest)} assets.")
+
     def final_dataset_generator() -> Iterator[Dict]:
-        for i, item_map in enumerate(resolution_map):
-            training_batch = {"sample_id": i}; all_assets_found = True
-            # BUGFIX: The logic is simple again. It only knows how to look up work_ids.
-            for (qualifier, asset_type), work_id in item_map.items():
+        for i, item_instruction in enumerate(assembly_instructions):
+            # ARCH-FIX: The assembly logic is now a simple, direct loop over a list of instructions.
+            # It no longer needs to know about tuple keys or other L3 implementation details.
+            batch = {"sample_id": i}
+            all_assets_found = True
+
+            for asset_req in item_instruction.get('assets_to_assemble', []):
+                final_key = asset_req['final_asset_key']
+                work_id = asset_req['lookup_work_id']
+                asset_type = asset_req['lookup_asset_type']
+                
                 manifest_key = (work_id, asset_type)
                 if manifest_key in cache_manifest:
                     filepath, key_in_file = cache_manifest[manifest_key]
-                    training_batch[f"{qualifier}_{asset_type}"] = f"loc:{filepath}|key:{key_in_file}"
+                    batch[final_key] = f"loc:{filepath}|key:{key_in_file}"
                 else:
                     print(f"  - WARNING: Missing cached asset for work_id '{work_id}' (asset: {asset_type}).")
-                    all_assets_found = False; break
-            if all_assets_found: yield training_batch
+                    all_assets_found = False
+                    break
+            
+            if all_assets_found:
+                yield batch
+
     print("  - Assembly complete. Returning final dataset iterator.")
     return {'final_training_dataset': final_dataset_generator()}
 
@@ -356,7 +506,7 @@ def execute_dag_from_manifest(manifest_path: Path) -> Dict[str, Any]:
 def main():
     # ARCH-FIX: Point to the new, architecturally correct manifest.
     project_root = Path(os.getcwd())
-    manifest_path = project_root / "run_artifacts" / "yamlzoo" / "experiment_manifest_dagv5.4.yaml"
+    manifest_path = project_root / "run_artifacts" / "yamlzoo" / "experiment_manifest_dagv5.5.yaml"
     print(f"--- Executing Refactored DAG from: {manifest_path} ---")
     try:
         final_results = execute_dag_from_manifest(manifest_path)
