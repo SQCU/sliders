@@ -420,12 +420,14 @@ def sdxl_vae_image_preprocessor(item: Dict) -> Dict[str, torch.Tensor]:
     #image_path = item['image_path']
     image_path = item['input_data']['image']
     image = Image.open(image_path).convert("RGB")
+    target_dtype = item.get('dtype', torch.bfloat16)
     # ... (all the necessary resizing, normalization, etc.) ...
     w, h = image.size
     w, h = map(lambda x: x - x % 32, (w, h))
     image = image.resize((w, h))
     image_tensor = transforms.ToTensor()(image)
     image_tensor = image_tensor * 2.0 - 1.0
+    image_tensor = image_tensor.to(dtype=target_dtype)
     return {"image": image_tensor}
 
 # --- For Fictitious Text Encoding ---
