@@ -2,7 +2,7 @@
 # ARCH-FIX: This manifest adheres to the principle "Configuration flows down".
 # Each stage has its own 'config' block and declares its data dependencies via 'inputs'.
 
-version: v5.5
+version: v5.6
 
 execution_graph:
   - stage_name: "get_asset_spec"
@@ -126,10 +126,11 @@ execution_graph:
       capability_implementation_map: #F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors
         real_vae_encoder:
           model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
-          config_path: "./canon_configs/sdxl_vae.json"
+          config_path: "./canon_configs/madebyollin__sdxl_vae_fp16_fix/config.json"
           device: "cuda"
           processing_category: "image_to_latent_encoding"
           consumer_function: "real_image_to_latent_encoder_v1"
+          vae_key_prefix: 'first_stage_model.'
           input_types: ["image", "model_path", "config_path", "device", "dtype", "vae_key_prefix"]
           output_types: ["latent"]
       cache_files:

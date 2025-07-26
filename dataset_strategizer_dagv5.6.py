@@ -1,7 +1,7 @@
-# FFW8: dataset_strategizer_dagv5.5.py
+# FFW8: dataset_strategizer_dagv5.6.py
 # This version is a complete architectural refactor to enforce strict layer separation
 # as per the "Semantic Layer Specifications" and the provided critique.
-# python dataset_strategizer_dagv5.5.py >> dset_strat_dagv5.5.txt 2>&1
+# python dataset_strategizer_dagv5.6.py >> dset_strat_dagv5.6.txt 2>&1
 
 import yaml
 from pathlib import Path
@@ -14,6 +14,7 @@ from typing import Iterator, Callable, Dict, Any, List, Tuple, Set
 
 # ARCH-FIX: Import discovery_scanner, assuming it's a clean, Layer-2 compliant module.
 from discovery_scanner import discover_data_pool
+import multiprocessing as mp # <--- ADD THIS IMPORT AT THE TOP
 
 # --- Layer 1: Model Asset Registry (Interface Contract Definition) ---
 # ARCH-FIX: VIOLATION 1 & 3 FIXED.
@@ -368,41 +369,48 @@ def find_matching_capability(required_caps: Dict, capability_map: Dict) -> Dict:
 
 def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
     """
-    LAYER 4 (v5.5): Executes a generic list of work specifications by dynamically
-    matching them to concrete consumer functions based on capability requirements.
+    LAYER 4 (v5.8): Executes asset caching by delegating blocks of work to
+    specialized consumer functions, all of which conform to a unified iterator-
+    based contract.
     """
     print("[LAYER 4] Executing asset caching...")
     work_specs = upstream_data['work_specifications']
-    # ARCH-FIX: Use the new, decoupled capability map from the config.
     capability_map = own_config.get("capability_implementation_map", {})
     cache_files = own_config.get("cache_files", {})
     cache_manifest: Dict[Tuple[str, str], Tuple[str, str]] = {}
     print(f"  - Received {len(work_specs)} generic work specifications.")
 
-    # ARCH-FIX: Loop over generic specs, not a plan keyed by interface names.
+    # Group work by the target consumer function
+    work_by_consumer = defaultdict(list)
     for spec in work_specs:
-        work_id = spec['work_id']
-        required = spec['required_capabilities']
-        
-        implementation = find_matching_capability(required, capability_map)
-        if not implementation:
-            print(f"  - WARNING: No implementation found for capability '{required.get('processing_category')}' with inputs {required.get('input_types')}."); continue
-
-        consumer_name = implementation['consumer_function']
+        implementation = find_matching_capability(spec['required_capabilities'], capability_map)
+        if implementation:
+            consumer_name = implementation['consumer_function']
+            work_by_consumer[consumer_name].append(spec)
+    
+    # Process each block of work. There is only one path now.
+    for consumer_name, specs_for_consumer in work_by_consumer.items():
         consumer_func = ASSET_CONSUMER_FUNCTIONS.get(consumer_name)
         if not consumer_func:
             print(f"  - WARNING: Consumer function '{consumer_name}' not found."); continue
 
-        # The core execution logic remains the same, but is now invoked generically.
-        output_assets = consumer_func(**spec['input_data'])
+        print(f"  - Delegating block of {len(specs_for_consumer)} items to '{consumer_name}'...")
         
-        for asset_type, tensor_data in output_assets.items():
-            # Only cache assets that were actually expected by this work spec.
-            if asset_type in spec['expected_outputs']:
+        # Find the static implementation config from the first spec in the group.
+        implementation_config = find_matching_capability(specs_for_consumer[0]['required_capabilities'], capability_map)
+        
+        # The UNIVERSAL CONTRACT: pass the iterator and the static config.
+        kwargs_for_consumer = {**implementation_config, "data_iterator": iter(specs_for_consumer)}
+        
+        # ALL functions MUST now return a dictionary mapping work_id -> produced assets.
+        results_by_work_id = consumer_func(**kwargs_for_consumer)
+
+        # Populate the manifest from the returned dictionary.
+        for work_id, assets in results_by_work_id.items():
+            for asset_type, tensor_data in assets.items():
                 target_cache_file = cache_files.get(asset_type, "default_cache.safetensors")
-                manifest_key = (work_id, asset_type)
                 location_in_file = (target_cache_file, f"{work_id}_{asset_type}")
-                cache_manifest[manifest_key] = location_in_file
+                cache_manifest[(work_id, asset_type)] = location_in_file
 
     print(f"  - Caching complete. Generated manifest with {len(cache_manifest)} asset locations.")
     return {'asset_cache_manifest': cache_manifest}
@@ -524,7 +532,7 @@ def execute_dag_from_manifest(manifest_path: Path) -> Dict[str, Any]:
 def main():
     # ARCH-FIX: Point to the new, architecturally correct manifest.
     project_root = Path(os.getcwd())
-    manifest_path = project_root / "run_artifacts" / "yamlzoo" / "experiment_manifest_dagv5.5.yaml"
+    manifest_path = project_root / "run_artifacts" / "yamlzoo" / "experiment_manifest_dagv5.6.yaml"
     print(f"--- Executing Refactored DAG from: {manifest_path} ---")
     try:
         final_results = execute_dag_from_manifest(manifest_path)
@@ -548,6 +556,15 @@ def main():
         traceback.print_exc()
 
 if __name__ == "__main__":
+    # Set the start method to 'spawn' for CUDA safety and cross-platform consistency.
+    # This must be done once, at the very beginning of the main execution block.
+    # A try/except block is used for robustness in environments where the context
+    # might already be set (e.g., in some interactive shells or test runners).
+    try:
+        mp.set_start_method('spawn')
+    except RuntimeError:
+        pass # Context already set, which is fine.
+    
     # To run this, you will need:
     # 1. The `experiment_manifest_refactored.yaml` file in the same directory.
     # 2. A `discovery_scanner.py` file with a `discover_data_pool` function.
