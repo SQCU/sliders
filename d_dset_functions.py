@@ -12,6 +12,7 @@ from PIL import Image
 from torchvision import transforms
 import json
 import time
+import itertools
 
 
 """
@@ -151,6 +152,7 @@ def tensorize_and_collate_iterator(
             print(f"  - WARNING: Skipping item during tensorization: {e}")
             continue
 
+      
 def _loader_worker_process(
     cpu_queue: mp.Queue,
     raw_data_iterator: Iterator[Dict],
@@ -162,6 +164,11 @@ def _loader_worker_process(
     TensorDicts into a queue for the main process to transfer.
     It can dynamically change the batch size by reading from a queue.
     """
+    # --- THE FIX ---
+    # The iterator is now created ONCE, outside the main loop.
+    # This ensures it maintains its state and can be fully consumed.
+    tensorized_iterator = tensorize_and_collate_iterator(raw_data_iterator, preprocessing_fn)
+    
     current_bs = 1
     buffer = []
     while True:
@@ -172,8 +179,10 @@ def _loader_worker_process(
             pass
 
         try:
-            # This is where the raw data is pulled and preprocessed into tensors
-            item_td = next(tensorize_and_collate_iterator(raw_data_iterator, preprocessing_fn))
+            # --- THE FIX ---
+            # We now call next() on the single, persistent iterator created above.
+            # This correctly draws down the data source one item at a time.
+            item_td = next(tensorized_iterator)
             buffer.append(item_td)
 
             if len(buffer) >= current_bs:
@@ -183,11 +192,12 @@ def _loader_worker_process(
                 buffer = []
 
         except StopIteration:
+            # This block is now reachable. It will execute once the tensorized_iterator is exhausted.
             # Handle the last partial batch
             if buffer:
                 cpu_queue.put(torch.stack(buffer, dim=0))
             cpu_queue.put(None) # End-of-stream sentinel
-            break
+            break # Exit the while True loop and terminate the process.
 
 def _gpu_transfer_process(cpu_queue: mp.Queue, gpu_queue: mp.Queue, device: torch.device):
     """
@@ -294,74 +304,98 @@ class PipelinedTensorDictLoader:
         self.gpu_worker.join()
 
 
-def advise_next_batch_size(
-    calibration_kwargs: Dict
-) -> Tuple[int, Dict]:
+def advise_next_batch_size(calibration_kwargs: Dict) -> Tuple[int, Dict]:
     """
-    Passively advises the next batch size based on the results of the last loop.
-    This is a stateless calculator; all state is passed in via calibration_kwargs.
+    [V2 - INTELLIGENT] Implements exponential upsearch and binary downsearch to
+    find the optimal batch size, as per the specification. This function is
+    pure and stateless, operating only on its input dictionary.
     """
-    # Unpack state from the kwargs dictionary
-    history: List[Dict] = calibration_kwargs.get("history", [])
-    config: Dict = calibration_kwargs["config"] # VRAM budget, safety margins, etc.
-    last_bs: int = calibration_kwargs.get("last_bs", 0)
-    start_time: float = calibration_kwargs.get("start_time")
+    config = calibration_kwargs.get("config", {})
+    history = calibration_kwargs.get("history", [])
+    latest_run = calibration_kwargs.get("latest_run_metrics", {})
+    device = config.get("device", "cuda") # Assumes cuda if not specified
 
-    # --- 1. Calculate results from the PREVIOUS loop ---
-    if start_time is not None:
-        duration = time.time() - start_time
-        throughput = last_bs / duration if duration > 0 else 0
-        vram_peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
-        torch.cuda.reset_max_memory_allocated() # Reset for next measurement
-
-        history.append({
-            "bs": last_bs,
-            "duration": duration,
-            "throughput": throughput,
-            "vram_peak_gb": vram_peak_gb
-        })
-        print(f"  [Advisor] Last Loop (BS={last_bs}): Throughput={throughput:.2f} items/s, VRAM Peak={vram_peak_gb:.2f}GB")
-
-    # --- 2. Decide the NEXT batch size ---
-    if not history: # First run
-        next_bs = config.get("initial_batch_size", 1)
+    # --- Configuration ---
+    if torch.cuda.is_available():
+        total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
     else:
-        last_run = history[-1]
+        total_vram_gb = 16.0 # Mock VRAM for CPU testing
+    
+    vram_safety_ratio = config.get("vram_safety_ratio", 0.8)
+    vram_budget_gb = config.get("vram_budget_gb", total_vram_gb * vram_safety_ratio)
+    max_iterations = config.get("max_search_iterations", 20)
+    
+    # --- State Update ---
+    if latest_run and "bs" in latest_run:
+        # Calculate throughput and add to history
+        bs, duration, vram_peak = latest_run["bs"], latest_run["duration"], latest_run["vram_peak_gb"]
+        items_per_second = bs / duration if duration > 0 else float('inf')
         
-        # --- VRAM Safety Check ---
-        # A simple linear projection for marginal VRAM cost
-        if len(history) > 1:
-            prev_run = history[-2]
-            marginal_vram = (last_run['vram_peak_gb'] - prev_run['vram_peak_gb']) / (last_run['bs'] - prev_run['bs'])
-        else: # Estimate from first run
-            marginal_vram = last_run['vram_peak_gb'] / last_run['bs']
-
-        # Exponential warmup
-        next_bs = last_run['bs'] * 2
-
-        projected_vram = last_run['vram_peak_gb'] + marginal_vram * (next_bs - last_run['bs'])
-        if projected_vram > config["vram_safety_budget_gb"]:
-            print(f"  [Advisor] Exponential jump to {next_bs} too risky. Switching to linear scan.")
-            next_bs = last_run['bs'] + 1 # Switch to linear increments
+        # Determine current phase from history, default to 'upsearch'
+        current_phase = history[-1].get("phase", "upsearch") if history else "upsearch"
         
-        # --- Throughput Check ---
-        # Stop if throughput is degrading
-        if len(history) > 1 and last_run['throughput'] < history[-2]['throughput'] * 0.98:
-            print(f"  [Advisor] Throughput degraded. Converging to previous best.")
-            best_run = max(history[:-1], key=lambda x: x['throughput'])
-            next_bs = best_run['bs']
+        new_entry = {
+            "bs": bs, "duration": duration, "vram_peak_gb": vram_peak,
+            "items_per_second": items_per_second, "phase": current_phase
+        }
+        history.append(new_entry)
+        print(f"  [Batch Advisor] Logged BS={bs}: {items_per_second:.2f} items/s, VRAM Peak: {vram_peak:.2f}GB")
+
+    # --- Decision Logic ---
+    if len(history) >= max_iterations:
+        final_bs = max(filter(lambda h: h["vram_peak_gb"] <= vram_budget_gb, history), key=lambda h: h["items_per_second"])["bs"]
+        print(f"  [Batch Advisor] Max iterations reached. Converged to BS={final_bs}")
+        history[-1]["phase"] = "converged"
+        return final_bs, calibration_kwargs
+
+    # Check for memory overflow
+    if history and history[-1]["vram_peak_gb"] > vram_budget_gb:
+        print(f"  [Batch Advisor] VRAM limit exceeded at BS={history[-1]['bs']}. Starting downsearch.")
+        history[-1]["phase"] = "downsearch_init"
+        # Transition to downsearch, next logic block will handle it
+    
+    # Check for throughput regression during upsearch
+    upsearch_history = [h for h in history if h["phase"] == "upsearch"]
+    if len(upsearch_history) > 1:
+        current_throughput = upsearch_history[-1]["items_per_second"]
+        worst_throughput_so_far = min(h["items_per_second"] for h in upsearch_history[:-1])
+        if current_throughput < worst_throughput_so_far:
+            print(f"  [Batch Advisor] Throughput regression at BS={upsearch_history[-1]['bs']}. Starting downsearch.")
+            history[-1]["phase"] = "downsearch_init"
+            # Transition to downsearch
+
+    # --- Determine Next Batch Size ---
+    last_phase = history[-1].get("phase", "upsearch") if history else "upsearch"
+
+    if last_phase == "converged":
+        return history[-1]["bs"], calibration_kwargs
+
+    if "downsearch" in last_phase:
+        # --- Binary Downsearch Logic ---
+        good_runs = [h for h in history if h["vram_peak_gb"] <= vram_budget_gb and "downsearch" not in h.get("tag","")]
+        bad_runs = [h for h in history if h["vram_peak_gb"] > vram_budget_gb or "downsearch_init" in h.get("phase")]
+        
+        low_bs = max([h["bs"] for h in good_runs]) if good_runs else 0
+        high_bs = min([h["bs"] for h in bad_runs]) if bad_runs else history[-1]["bs"]
+
+        if high_bs - low_bs <= 1:
+            next_bs = low_bs if low_bs > 0 else 1
+            print(f"  [Batch Advisor] Downsearch converged. Optimal BS: {next_bs}")
+            history[-1]["phase"] = "converged"
         else:
-             # Re-check VRAM for the selected next_bs
-            projected_vram = last_run['vram_peak_gb'] + marginal_vram * (next_bs - last_run['bs'])
-            if projected_vram > config["vram_safety_budget_gb"]:
-                 print(f"  [Advisor] Linear step to {next_bs} too risky. Converging to current BS.")
-                 next_bs = last_run['bs']
+            next_bs = low_bs + (high_bs - low_bs) // 2
+            print(f"  [Batch Advisor] Phase: downsearch, testing BS={next_bs} (Range: {low_bs}-{high_bs})")
+            history[-1]["phase"] = "downsearch"
 
-    # --- 3. Return advice and state for the NEXT loop ---
-    calibration_kwargs["history"] = history
-    calibration_kwargs["last_bs"] = next_bs
-    calibration_kwargs["start_time"] = time.time() # Start the timer for the upcoming loop
-
+    else: # --- Exponential Upsearch Logic ---
+        if not history:
+            next_bs = 1
+            print("  [Batch Advisor] First call. Starting with BS=1.")
+        else:
+            next_bs = history[-1]["bs"] * 2
+            print(f"  [Batch Advisor] Phase: upsearch, testing BS={next_bs}")
+        history.append({"phase": "upsearch", "bs": next_bs}) # Tentative entry
+        
     return next_bs, calibration_kwargs
 
 def scale_tensor_synthesizer_v1(**kwargs) -> dict:
@@ -511,9 +545,16 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
     vae.load_state_dict(working_state_dict) # This will now succeed
     vae.to(device=device, dtype=torch_dtype)
     
+    
+    # Use itertools.tee to create two independent iterators from the original one.
+    # We will consume one to get the IDs and pass the other to the loader.
+    id_iterator, loader_iterator = itertools.tee(work_iterator)
+    # 1. Immediately consume the first iterator to get our list of work_ids.
+    work_ids = [spec['work_id'] for spec in id_iterator]
+
     # 2. Initialize the pipeline and advisor tools
     loader = PipelinedTensorDictLoader(
-        raw_data_iterator=work_iterator,
+        raw_data_iterator=loader_iterator,
         preprocessing_fn=sdxl_vae_image_preprocessor, # Pass the correct preprocessor
         device=device,
         initial_bs=1
@@ -522,25 +563,38 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
         "config": {"vram_safety_budget_gb": 20.0, "initial_batch_size": 1},
         "history": []
     }
+    # Just before the `while True:` loop
+    calibration_state["latest_run_metrics"] = {}
     all_results = []
 
     # 3. Run the internal processing loop
     while True:
         try:
+            # 1. ADVISE FIRST, using metrics from the previous loop.
             next_bs, calibration_state = advise_next_batch_size(calibration_state)
             loader.set_batch_size(next_bs)
-
-            # The interface is now even simpler
+            # 2. Start timer and get next batch
+            start_time = time.time()
             on_device_batch = loader.get_next_batch()
 
+            # 3. The actual model computation
             with torch.no_grad():
-                # The actual model computation
                 posterior = vae.encode(on_device_batch['image']).latent_dist
                 latents = posterior.sample() * vae.config.scaling_factor
             
+            # 4. CAPTURE METRICS NOW and store for the *next* loop's advisor call
             torch.cuda.synchronize() # Crucial for accurate timing
+            duration = time.time() - start_time
+            vram_peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
+            torch.cuda.reset_max_memory_allocated() # Reset for next measurement
+
+            calibration_state["latest_run_metrics"] = {
+            "bs": next_bs, # Use the batch size we just ran
+            "duration": duration,
+            "vram_peak_gb": vram_peak_gb
+            }
+
             all_results.append(latents.cpu())
-            #loader.release_buffer(buffer_key)
 
         except StopIteration:
             print("[VAE Encoder] Finished processing all images.")
@@ -551,7 +605,12 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
     # 4. Collate results and return in the format expected by the DAG
     final_latents = torch.cat(all_results, dim=0)
     print(f"--- [VAE Encoder] Complete. Produced final latent tensor of shape: {final_latents.shape} ---")
-    return {"latent": final_latents}
+    # This part now works because we have the list of work_ids to remap our data to the expected format.
+    results_by_work_id = {}
+    for i, work_id in enumerate(work_ids):
+        results_by_work_id[work_id] = {"latent": final_latents[i]}
+        
+    return results_by_work_id
     
 
 
@@ -566,9 +625,15 @@ def fictitious_sdxl_text_encoder(**kwargs) -> dict:
     text_encoder_model = kwargs['text_encoder_model'] # A dummy model
     device = kwargs['device']
 
+    # Use itertools.tee to create two independent iterators from the original one.
+    # We will consume one to get the IDs and pass the other to the loader.
+    id_iterator, loader_iterator = itertools.tee(work_iterator)
+    # 1. Immediately consume the first iterator to get our list of work_ids.
+    work_ids = [spec['work_id'] for spec in id_iterator]
+
     # 2. Initialize the pipeline and advisor tools
     loader = PipelinedTensorDictLoader(
-        raw_data_iterator=work_iterator,
+        raw_data_iterator=loader_iterator,
         preprocessing_fn=sdxl_text_preprocessor, # SWAP to the text preprocessor
         device=device,
         initial_bs=4 # Text models often handle larger batches
@@ -606,4 +671,11 @@ def fictitious_sdxl_text_encoder(**kwargs) -> dict:
     final_embeds = torch.cat(all_embeds, dim=0)
     final_pooled = torch.cat(all_pooled, dim=0)
     print(f"--- [Text Encoder] Complete. Produced final tensors of shapes: {final_embeds.shape}, {final_pooled.shape} ---")
+
+    # This part now works because we have the list of work_ids.
+    results_by_work_id = {}
+    for i, work_id in enumerate(work_ids):
+        results_by_work_id[work_id] = {"text_embedding": final_embeds[i], "pooled_text_embedding": final_pooled[i]}
+        
+    return results_by_work_id
     return {"text_embedding": final_embeds, "pooled_text_embedding": final_pooled}
