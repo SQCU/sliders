@@ -1,0 +1,108 @@
+      
+# validation_manifest.yaml
+version: v0.0
+
+execution_graph:
+  - stage_name: "discover_source_images"
+    function: "discover_source_data_stream"
+    config:
+      # Configuration to find the original images
+      folder_main: "datasets/validation_set"
+      folders: ['']
+      file_extensions: [".png", ".jpg"]
+      min_scales_required: 1 # We only need the base image
+      pairing_strategy: "relaxed"
+      prompt_sources: # Minimal prompt config as it's not needed for VAE
+        root: { file: 'datasets/bracket/rootprompt.yaml', importance: 1.0 }
+        metadata: { file: 'datasets/bracket/promptmetadata.json', folder_importance: 0, item_importance: 0 }
+    outputs:
+      source_data_stream: "original_image_stream"
+
+  # === STAGE 1: ENCODE IMAGES TO LATENTS ===
+  - stage_name: 'get_vae_encoder_spec'
+    function: 'get_required_asset_spec'
+    config:
+      data_consumer_name: "SDXL_VAE_Decoder" # Using this just to get the 'latent' requirement
+    outputs:
+      required_assets_spec: "encoder_asset_spec"
+
+  - stage_name: "plan_encoding_workload"
+    function: "plan_asset_workload"
+    inputs:
+      required_assets_spec: "encoder_asset_spec"
+      source_data_stream: "original_image_stream"
+    config:
+      max_training_items: 100 # Number of images to validate
+    outputs:
+      work_specifications: "encoder_work_specs"
+      assembly_instructions: "encoder_assembly_instructions" # Unused but produced
+
+  - stage_name: "execute_encoding"
+    function: "execute_asset_caching"
+    inputs:
+      work_specifications: "encoder_work_specs"
+    config:
+      capability_implementation_map:
+        real_vae_encoder_v1:
+          processing_category: "image_to_latent_encoding"
+          input_types: ["image"]
+          output_types: ["latent"]
+          consumer_function: "real_image_to_latent_encoder"
+          model_path: "./models/molKeunMix_deepblueV2EPS.safetensors"
+          config_path: "./canon_configs/vae_config.json"
+          device: "cuda"
+          dtype: "bfloat16"
+      cache_files:
+        latent: "./validation/cached_latents.safetensors"
+    outputs:
+      asset_cache_manifest: "encoded_latent_manifest"
+
+  # === STAGE 2: DECODE LATENTS TO IMAGES ===
+  # NOTE: This stage requires a planner that can read a manifest.
+  # As a workaround with the current code, one might need to pass the manifest
+  # into the consumer function and resolve paths inside it.
+  - stage_name: "execute_decoding"
+    function: "execute_asset_caching"
+    inputs:
+      # This reuses the specs, assuming a new consumer can be matched.
+      # A better system would have a new planning stage here.
+      work_specifications: "encoder_work_specs"
+      # This input would need to be handled by the DAG runner and passed to the consumer
+      # encoded_latent_manifest: "encoded_latent_manifest" 
+    config:
+      capability_implementation_map:
+        latent_to_image_decoder_v1:
+          processing_category: "latent_to_image_decoding"
+          input_types: ["latent"] 
+          output_types: ["decoded_image"]
+          consumer_function: "real_latent_to_image_decoder"
+          model_path: "./models/molKeunMix_deepblueV2EPS.safetensors"
+          config_path: "./configs/vae_config.json"
+          device: "cuda"
+          dtype: "bfloat16"
+      cache_files:
+        decoded_image: "./validation/decoded_images.safetensors"
+    outputs:
+      asset_cache_manifest: "decoded_images_manifest"
+
+  # === STAGE 3: COMPUTE VALIDATION METRICS ===
+  - stage_name: 'compute_validation'
+    function: 'compute_validation_metrics'
+    config:
+      device: "cuda"
+      lpips_net: "vgg"
+      fid_feature_dim: 64
+      # Define success thresholds
+      validation_thresholds:
+        lpips_excellent: 0.05
+        lpips_good: 0.15
+        fid_excellent: 5.0
+        fid_good: 15.0
+    inputs:
+      # Assumes the DAG runner can provide these two streams to the function
+      original_data_stream: "original_image_stream"
+      reconstructed_data_iterator: "decoded_images_manifest"
+    outputs:
+      validation_results: "final_validation_metrics"
+
+    
