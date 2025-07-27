@@ -518,7 +518,6 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
             # 2. Start timer and get next batch
             start_time = time.time()
             on_device_batch = loader.get_next_batch()
-            last_bs = on_device_batch.shape[0]
 
             # 3. The actual model computation
             with torch.no_grad():
@@ -531,7 +530,7 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
             vram_peak_gb = torch.cuda.max_memory_reserved() / (1024**3)
 
             calibration_state["latest_run_metrics"] = {
-            "bs": last_bs, # Use the batch size we actually ran
+            "bs": on_device_batch.shape[0], # Use the batch size we actually ran
             "duration": duration,
             "vram_peak_gb": vram_peak_gb
             }
@@ -642,7 +641,6 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
             # 2. TIME & FETCH: Start the timer and get the batch.
             start_time = time.time()
             on_device_batch = loader.get_next_batch()
-            last_bs = on_device_batch.shape[0]
 
             # 3. COMPUTE: The core model inference.
             with torch.no_grad():
@@ -660,7 +658,7 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
 
             # 5. RECORD: Store metrics for the next advisor call.
             calibration_state["latest_run_metrics"] = {
-                "bs": last_bs,
+                "bs": on_device_batch.shape[0],
                 "duration": duration,
                 "vram_peak_gb": vram_peak_gb
             }
@@ -676,7 +674,7 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
             print(f"  [Batch Advisor] CUDA OOM detected at BS={next_bs}. Forcing downsearch.")
             torch.cuda.empty_cache()
             # Log the failure so the advisor knows this batch size is too large.
-            calibration_state["latest_run_metrics"] = {"bs": next_bs, "duration": float('inf'), "vram_peak_gb": float('inf')}
+            calibration_state["latest_run_metrics"] = {"bs": on_device_batch.shape[0], "duration": float('inf'), "vram_peak_gb": float('inf')}
             continue # Proceed to the next advisor call.
 
     loader.close()
@@ -802,7 +800,6 @@ def real_latent_to_image_decoder(**kwargs) -> dict:
             loader.set_batch_size(next_bs)
             start_time = time.time()
             on_device_batch = loader.get_next_batch()
-            last_bs = on_device_batch.shape[0]
             
             with torch.no_grad():
                 # The core decoding operation
@@ -816,7 +813,7 @@ def real_latent_to_image_decoder(**kwargs) -> dict:
             vram_peak_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
 
             calibration_state["latest_run_metrics"] = {
-                "bs": last_bs, "duration": duration, "vram_peak_gb": vram_peak_gb
+                "bs": on_device_batch.shape[0], "duration": duration, "vram_peak_gb": vram_peak_gb
             }
             all_results.append(images.cpu())
 
@@ -826,7 +823,7 @@ def real_latent_to_image_decoder(**kwargs) -> dict:
         except torch.cuda.OutOfMemoryError:
             print(f"  [Batch Advisor] CUDA OOM detected at BS={next_bs}. Forcing downsearch.")
             torch.cuda.empty_cache()
-            calibration_state["latest_run_metrics"] = {"bs": next_bs, "duration": float('inf'), "vram_peak_gb": float('inf')}
+            calibration_state["latest_run_metrics"] = {"bs": on_device_batch.shape[0], "duration": float('inf'), "vram_peak_gb": float('inf')}
             continue
             
     loader.close()
@@ -930,9 +927,7 @@ def real_denoise_input_encoder(**kwargs) -> dict:
             # CALIB2. TIME & FETCH
             start_time = time.time()
             on_device_batch = loader.get_next_batch()
-            batch_size = on_device_batch['image'].shape[0]
-            last_bs = on_device_batch.shape[0]
-            
+            batch_size = on_device_batch['image'].shape[0]            
 
             with torch.no_grad():
                 latents = vae.encode(on_device_batch['image']).latent_dist.sample() * vae.config.scaling_factor
@@ -959,7 +954,7 @@ def real_denoise_input_encoder(**kwargs) -> dict:
 
             # CALIB5. RECORD
             calibration_state["latest_run_metrics"] = {
-                "bs": last_bs, "duration": duration, "vram_peak_gb": vram_peak_gb
+                "bs": on_device_batch.shape[0], "duration": duration, "vram_peak_gb": vram_peak_gb
             }
 
             all_noisy_latents.append(noisy_latents.cpu())
@@ -970,7 +965,7 @@ def real_denoise_input_encoder(**kwargs) -> dict:
         except torch.cuda.OutOfMemoryError:
             print(f"  [Batch Advisor] CUDA OOM detected at BS={next_bs}. Forcing downsearch.")
             torch.cuda.empty_cache()
-            calibration_state["latest_run_metrics"] = {"bs": next_bs, "duration": float('inf'), "vram_peak_gb": float('inf')}
+            calibration_state["latest_run_metrics"] = {"bs": on_device_batch.shape[0], "duration": float('inf'), "vram_peak_gb": float('inf')}
             continue
     
     loader.close()
