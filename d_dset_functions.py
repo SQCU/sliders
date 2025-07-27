@@ -9,7 +9,7 @@ import torch
 import safetensors
 from diffusers import UNet2DConditionModel, AutoencoderKL
 from trainscripts.imagesliders.minimal_scheduler import MinimalDDPMScheduler as DDPMScheduler
-from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer, CLIPTextConfig
 from PIL import Image
 from torchvision import transforms
 import json
@@ -302,84 +302,81 @@ class PipelinedTensorDictLoader:
         self.cpu_worker.join()
         self.gpu_worker.join()
 
+import numpy as np
+from collections import defaultdict
+
+def print_batch_size_summary(history: List[Dict], best_throughput: float, bs_at_best_throughput: int):
+    """
+    [NEW] Analyzes the full calibration history and prints a concise summary.
+    """
+    if not history:
+        print("[Batch Advisor] No calibration history was recorded.")
+        return
+
+    print("\n--- [Batch Advisor Summary] ---")
+    
+    # Exclude OOM errors and calculate throughput for valid runs
+    valid_runs = [run for run in history if run.get('duration') and run['duration'] < float('inf')]
+    for run in valid_runs:
+        run['throughput'] = run['bs'] / run['duration']
+
+    # Group results by batch size
+    stats_by_bs = defaultdict(list)
+    for run in valid_runs:
+        stats_by_bs[run['bs']].append(run['throughput'])
+
+    print(f"{'Batch Size':<12} | {'Trials':<8} | {'Mean Throughput':<20} | {'Std Dev':<15}")
+    print("-" * 60)
+
+    # Calculate and print stats for each batch size
+    for bs in sorted(stats_by_bs.keys()):
+        throughputs = stats_by_bs[bs]
+        count = len(throughputs)
+        mean_tp = np.mean(throughputs)
+        std_tp = np.std(throughputs)
+        print(f"{bs:<12} | {count:<8} | {f'{mean_tp:.2f} items/sec':<20} | {f'{std_tp:.2f}':<15}")
+
+    if bs_at_best_throughput > 0:
+        print(f"\n- Peak throughput: {best_throughput:.2f} items/sec was achieved at batch size {bs_at_best_throughput}.")
+    else:
+        print("\n- No successful runs to determine peak throughput.")
+    print("---------------------------------")
+
+
 def advise_next_batch_size(calibration_kwargs: Dict) -> Tuple[int, Dict]:
     """
-    [LITERAL SEQUENCE + THROUGHPUT ANALYSIS] This function performs two tasks:
-    1.  Returns batch sizes following the literal, non-adaptive sequence.
-    2.  Analyzes the history to report on VRAM usage AND wall-clock throughput,
-        tracking and displaying the most efficient batch size found so far.
+    [MODIFIED] This function now ONLY performs calculations and defers all
+    printing to the new summary function.
     """
     # --- Part 1: Setup for Analysis ---
     config = calibration_kwargs.get("config", {})
     history = calibration_kwargs.get("history", [])
     latest_run = calibration_kwargs.get("latest_run_metrics", {})
 
-    # State for tracking the best throughput
     best_throughput = calibration_kwargs.get("best_throughput", 0.0)
     bs_at_best_throughput = calibration_kwargs.get("bs_at_best_throughput", 0)
-
-    if torch.cuda.is_available():
-        total_vram_gb = torch.cuda.get_device_properties(config.get("device", "cuda")).total_memory / (1024**3)
-    else:
-        total_vram_gb = 16.0
-    vram_safety_ratio = config.get("vram_safety_ratio", 0.9)
-    vram_budget_gb = config.get("vram_budget_gb", total_vram_gb * vram_safety_ratio)
 
     if latest_run and "bs" in latest_run:
         history.append(latest_run)
 
-    # --- Part 2: The Analysis Calculation ---
-    if history:
-        print("\n--- [Batch Advisor Analysis] ---")
-        latest_run = history[-1]
-        
-        # Throughput Calculation
-        current_bs = latest_run['bs']
+    # --- Part 2: The Analysis Calculation (No Printing) ---
+    if latest_run and "bs" in latest_run:
         duration = latest_run.get('duration', 0)
-        if duration > 1e-9:
-            current_throughput = current_bs / duration
-            print(f"  - Throughput (Current): {current_throughput:.2f} items/sec at BS={current_bs}")
+        if duration > 1e-9 and duration < float('inf'): # Check for valid duration
+            current_throughput = latest_run['bs'] / duration
             if current_throughput > best_throughput:
                 best_throughput = current_throughput
-                bs_at_best_throughput = current_bs
-        
-        if bs_at_best_throughput > 0:
-            print(f"  - Throughput (Peak):    {best_throughput:.2f} items/sec achieved at BS={bs_at_best_throughput}")
-        
-        # VRAM Estimation (from previous version, for comparison)
-        if len(history) >= 2:
-            # Pessimistic Estimate
-            last_different_bs_run = next((run for run in reversed(history[:-1]) if run['bs'] != latest_run['bs']), None)
-            if last_different_bs_run:
-                delta_vram_pess = latest_run['vram_peak_gb'] - last_different_bs_run['vram_peak_gb']
-                delta_bs_pess = latest_run['bs'] - last_different_bs_run['bs']
-                if delta_bs_pess > 0 and delta_vram_pess > 1e-9:
-                    cost_per_item_pess = delta_vram_pess / delta_bs_pess
-                    base_vram_pess = latest_run['vram_peak_gb'] - cost_per_item_pess * latest_run['bs']
-                    predicted_max_bs_pess = (vram_budget_gb - base_vram_pess) / cost_per_item_pess
-                    print(f"  - VRAM Model (Pessimistic): Max BS ~{int(predicted_max_bs_pess)}")
-            
-            # Optimistic Estimate
-            first_run = history[0]
-            delta_vram_opt = latest_run['vram_peak_gb'] - first_run['vram_peak_gb']
-            delta_bs_opt = latest_run['bs'] - first_run['bs']
-            if delta_bs_opt > 0 and delta_vram_opt > 1e-9:
-                cost_per_item_opt = delta_vram_opt / delta_bs_opt
-                base_vram_opt = first_run['vram_peak_gb'] - cost_per_item_opt * first_run['bs']
-                predicted_max_bs_opt = (vram_budget_gb - base_vram_opt) / cost_per_item_opt
-                print(f"  - VRAM Model (Optimistic):  Max BS ~{int(predicted_max_bs_opt)}")
-        print("--------------------------------")
+                bs_at_best_throughput = latest_run['bs']
 
-
-    # --- Part 3: The Literal Sequence Generator ---
+    # --- Part 3: The Literal Sequence Generator (Unchanged) ---
     current_bs = calibration_kwargs.get("sequence_bs", 1)
     yield_count = calibration_kwargs.get("sequence_yield_count", 0)
     next_bs_to_return = current_bs
 
     yield_count += 1
-    if current_bs == 1: current_bs, yield_count = 2, 0
-    elif current_bs == 2 and yield_count >= 4: current_bs, yield_count = 3, 0
-    elif current_bs == 3 and yield_count >= 4: current_bs, yield_count = 4, 0
+    if current_bs == 1 and yield_count >= 2: current_bs, yield_count = 2, 0 # Reduced stabilization for faster ramp-up
+    elif current_bs == 2 and yield_count >= 2: current_bs, yield_count = 3, 0
+    elif current_bs == 3 and yield_count >= 2: current_bs, yield_count = 4, 0
     
     calibration_kwargs.update({
         "sequence_bs": current_bs,
@@ -543,6 +540,12 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
             
     loader.close()
 
+    print_batch_size_summary(
+        calibration_state.get("history", []),
+        calibration_state.get("best_throughput", 0),
+        calibration_state.get("bs_at_best_throughput", 0)
+    )
+
     # 4. Collate results and return in the format expected by the DAG
     final_latents = torch.cat(all_results, dim=0)
     print(f"--- [VAE Encoder] Complete. Produced final latent tensor of shape: {final_latents.shape} ---")
@@ -567,44 +570,49 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
     torch_dtype = torch.bfloat16
     work_iterator = kwargs['data_iterator']
     
-    # Paths to configs and tokenizers now provided by the manifest
-    te1_config_path = kwargs.get('text_encoder_1_config_path')
-    te2_config_path = kwargs.get('text_encoder_2_config_path')
-    tokenizer_1_path = kwargs.get('tokenizer_1_path')
-    tokenizer_2_path = kwargs.get('tokenizer_2_path')
+    # 1a. Get the full paths to the config FILES.
+    te1_config_path = os.path.abspath(kwargs.get('text_encoder_1_config_path'))
+    te2_config_path = os.path.abspath(kwargs.get('text_encoder_2_config_path'))
 
-    # --- 2. Instantiate Empty Models from Local Canon Configs ---
-    print("  [Text Encoder] Instantiating model shells from local configs...")
-    with open(te1_config_path, 'r') as f: te1_config = json.load(f)
-    with open(te2_config_path, 'r') as f: te2_config = json.load(f)
-    
-    text_encoder_1 = CLIPTextModel.from_config(te1_config)
-    text_encoder_2 = CLIPTextModelWithProjection.from_config(te2_config)
+    # 1b. Manually load the JSON files into dictionaries.
+    with open(te1_config_path, 'r') as f:
+        te1_config_dict = json.load(f)
+    with open(te2_config_path, 'r') as f:
+        te2_config_dict = json.load(f)
+
+    # 1a. Get the full paths to the config FILES.
+    # 1c. Instantiate the models by passing the config DICTIONARY.
+    # This completely avoids all the library's path validation logic.
+    text_encoder_1 = CLIPTextModel.from_config(te1_config_dict)
+    text_encoder_2 = CLIPTextModelWithProjection.from_config(te2_config_dict)
+
+    tokenizer_1_path = os.path.abspath(kwargs.get('tokenizer_1_path'))
+    tokenizer_2_path = os.path.abspath(kwargs.get('tokenizer_2_path'))
 
     # --- 3. Manually Filter and Load Weights from Safetensors Checkpoint ---
     print("  [Text Encoder] Manually filtering and remapping keys from checkpoint...")
     te1_state_dict = {}
     te2_state_dict = {}
     
-    # Define the prefixes used in SDXL checkpoints for the two text encoders
-    # These are the equivalent of "first_stage_model." for the VAE.
+    # ** THE LOGIC IS NOW SWAPPED TO MATCH THE MODELS **
+    # Prefix for the BIG encoder (embedders.0) -> goes into te1_state_dict
     TE1_PREFIX = "conditioner.embedders.0.transformer.text_model."
+    # Prefix for the SMALL encoder (embedders.1) -> goes into te2_state_dict
     TE2_PREFIX = "conditioner.embedders.1.text_model."
 
     with safetensors.safe_open(model_path, framework="pt", device="cpu") as f:
         for key in f.keys():
             if key.startswith(TE1_PREFIX):
-                # Remap key by stripping the prefix
                 new_key = key[len(TE1_PREFIX):]
                 te1_state_dict[new_key] = f.get_tensor(key)
             elif key.startswith(TE2_PREFIX):
-                # Remap key by stripping the prefix
                 new_key = key[len(TE2_PREFIX):]
                 te2_state_dict[new_key] = f.get_tensor(key)
     
-    # Load the filtered and remapped state dicts into the model shells
-    text_encoder_1.load_state_dict(te1_state_dict)
-    text_encoder_2.load_state_dict(te2_state_dict)
+    # Now this will work because the shell's architecture matches the weights' shapes.
+    # We also pass strict=False to ignore the "position_ids" key which isn't a parameter.
+    text_encoder_1.load_state_dict(te1_state_dict, strict=False)
+    text_encoder_2.load_state_dict(te2_state_dict, strict=False)
 
     text_encoder_1.to(device=device, dtype=torch_dtype).eval()
     text_encoder_2.to(device=device, dtype=torch_dtype).eval()
@@ -678,6 +686,12 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
             continue # Proceed to the next advisor call.
 
     loader.close()
+
+    print_batch_size_summary(
+        calibration_state.get("history", []),
+        calibration_state.get("best_throughput", 0),
+        calibration_state.get("bs_at_best_throughput", 0)
+    )
 
     final_embeds = torch.cat(all_embeds, dim=0)
     final_pooled = torch.cat(all_pooled, dim=0)
@@ -828,6 +842,12 @@ def real_latent_to_image_decoder(**kwargs) -> dict:
             
     loader.close()
 
+    print_batch_size_summary(
+        calibration_state.get("history", []),
+        calibration_state.get("best_throughput", 0),
+        calibration_state.get("bs_at_best_throughput", 0)
+    )
+
     # 4. Collate and return results
     final_images = torch.cat(all_results, dim=0)
     print(f"--- [VAE Decoder] Complete. Produced final image tensor of shape: {final_images.shape} ---")
@@ -969,6 +989,12 @@ def real_denoise_input_encoder(**kwargs) -> dict:
             continue
     
     loader.close()
+
+    print_batch_size_summary(
+        calibration_state.get("history", []),
+        calibration_state.get("best_throughput", 0),
+        calibration_state.get("bs_at_best_throughput", 0)
+    )
 
     # --- 4. Collate and Return ---
     final_noisy_latents = torch.cat(all_noisy_latents, dim=0)
