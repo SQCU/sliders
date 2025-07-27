@@ -10,11 +10,23 @@ class MinimalDDPMScheduler:
     A functional, from-scratch DDPM scheduler that is clear and supports
     multiple prediction targets, as requested for serious research.
     """
-    def __init__(self, num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012, device='cpu'):
+    def __init__(self, 
+        num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012, 
+        beta_schedule="linear", # <-- New parameter
+        device='cpu'):
         self.num_train_timesteps = num_train_timesteps
         self.device = device
         self.init_noise_sigma = torch.tensor(1.0).to(torch.bfloat16)
         
+        # ** THE FIX **: Implement the beta_schedule logic.
+        if beta_schedule == "linear":
+            self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
+        elif beta_schedule == "scaled_linear":
+            # This schedule is specific to latent diffusion models.
+            self.betas = torch.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=torch.float32) ** 2
+        else:
+            raise NotImplementedError(f"beta_schedule '{beta_schedule}' is not implemented for MinimalDDPMScheduler.")
+
         # The core of the schedule: a linear beta schedule
         self.betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
         self.alphas = 1.0 - self.betas
@@ -90,8 +102,13 @@ class MinimalDDPMScheduler:
     def _get_pred_original_sample(self, model_output, timestep, sample, prediction_type="epsilon"):
             """Helper to derive the predicted x_0 from the model output."""
             if prediction_type == "epsilon":
-                return self._gather(self.sqrt_recip_alphas_cumprod, timestep) * sample - \
-                    self._gather(self.sqrt_recipm1_alphas_cumprod, timestep) * model_output
+                return (
+                    (sample - (self._gather(self.sqrt_recip_alphas_cumprod, timestep) * model_output)) /
+                    self._gather(self.sqrt_recipm1_alphas_cumprod, timestep))
+            elif self.config.prediction_type == "x_0":
+                pred_original_sample = model_output
+            elif self.config.prediction_type == "v_prediction":
+                pred_original_sample = (self._gather(self.sqrt_recipm1_alphas_cumprod, timestep) * sample) - (self._gather(self.sqrt_recip_alphas_cumprod, timestep) * model_output)
             else:
                 raise NotImplementedError(f"Prediction type {prediction_type} not implemented for getting x_0")
 
@@ -105,6 +122,7 @@ class MinimalDDPMScheduler:
         timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
         self.timesteps = torch.from_numpy(timesteps).to(device)
 
+# obsolete btw
     def step(self, model_output: torch.Tensor, timestep: int, sample: torch.Tensor, prediction_type="epsilon") -> torch.Tensor:
         """
         The core of the sampling loop. Predicts the sample at the previous timestep, x_{t-1}.

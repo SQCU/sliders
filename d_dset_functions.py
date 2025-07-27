@@ -8,11 +8,14 @@ import os
 import torch
 import safetensors
 from diffusers import UNet2DConditionModel, AutoencoderKL
+from trainscripts.imagesliders.minimal_scheduler import MinimalDDPMScheduler as DDPMScheduler
+from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from PIL import Image
 from torchvision import transforms
 import json
 import time
 import itertools
+
 
 
 """
@@ -41,66 +44,62 @@ novel data processing tasks purely through declarative configuration.
 # This is the definitive, structure-aware translator that handles all known
 # differences between the A1111/Kohya and Diffusers VAE naming conventions.
 
-def translate_a1111_to_diffusers_vae(key: str) -> str:
-    """Translates a single VAE key."""
+def _translate_vae_key_str(key: str) -> str:
+    """[INTERNAL HELPER] Translates a single VAE key string."""
     if not key.startswith("first_stage_model."):
         return key
     
     new_key = key[len("first_stage_model."):]
 
-    # --- Pass 1: Handle the reversed decoder block indices ---
+    # Pass 1: Reversed decoder block indices (logic is unchanged)
     if "decoder.up." in new_key:
-        # Matches decoder.up.0.block.0... or decoder.up.0.upsample...
         match = re.search(r"decoder\.up\.(\d+)\.(block|upsample)", new_key)
         if match:
-            block_index = int(match.group(1))
-            block_type = match.group(2)
-            
-            # Reverse the index (3 -> 0, 2 -> 1, 1 -> 2, 0 -> 3)
+            block_index, block_type = int(match.group(1)), match.group(2)
             new_block_index = 3 - block_index
-            
             if block_type == "block":
-                # decoder.up.3.block.0 -> decoder.up_blocks.0.resnets.0
                 new_key = new_key.replace(f"decoder.up.{block_index}.block", f"decoder.up_blocks.{new_block_index}.resnets")
             elif block_type == "upsample":
-                # decoder.up.3.upsample -> decoder.up_blocks.0.upsamplers.0
                 new_key = new_key.replace(f"decoder.up.{block_index}.upsample", f"decoder.up_blocks.{new_block_index}.upsamplers.0")
     
-    # --- Pass 2: Handle general structural and name changes ---
+    # Pass 2: General structural and name changes (logic is unchanged)
     replacements = {
-        # Structure
-        "encoder.down.": "encoder.down_blocks.",
-        "decoder.down.": "decoder.down_blocks.",
-        "encoder.mid.block_1": "encoder.mid_block.resnets.0",
-        "encoder.mid.block_2": "encoder.mid_block.resnets.1",
-        "decoder.mid.block_1": "decoder.mid_block.resnets.0",
-        "decoder.mid.block_2": "decoder.mid_block.resnets.1",
-        "encoder.mid.attn_1": "encoder.mid_block.attentions.0",
-        "decoder.mid.attn_1": "decoder.mid_block.attentions.0",
-        ".downsample.": ".downsamplers.0.",
-
-        # Naming
-        ".block.": ".resnets.", # Must be after other block replacements
-        "nin_shortcut": "conv_shortcut",
-        "norm_out": "conv_norm_out",
+        "encoder.down.": "encoder.down_blocks.", "decoder.down.": "decoder.down_blocks.",
+        "encoder.mid.block_1": "encoder.mid_block.resnets.0", "encoder.mid.block_2": "encoder.mid_block.resnets.1",
+        "decoder.mid.block_1": "decoder.mid_block.resnets.0", "decoder.mid.block_2": "decoder.mid_block.resnets.1",
+        "encoder.mid.attn_1": "encoder.mid_block.attentions.0", "decoder.mid.attn_1": "decoder.mid_block.attentions.0",
+        ".downsample.": ".downsamplers.0.", ".block.": ".resnets.",
+        "nin_shortcut": "conv_shortcut", "norm_out": "conv_norm_out",
     }
-    for old, new in replacements.items():
-        new_key = new_key.replace(old, new)
+    for old, new in replacements.items(): new_key = new_key.replace(old, new)
         
-    # --- Pass 3: Handle the fine-grained attention block keys ---
-    # This must be done last, after the main structure is in place.
+    # Pass 3: Fine-grained attention block keys (logic is unchanged)
     if "attentions" in new_key:
-        attn_replacements = {
-            ".norm.": ".group_norm.",
-            ".q.": ".to_q.",
-            ".k.": ".to_k.",
-            ".v.": ".to_v.",
-            ".proj_out.": ".to_out.0.",
-        }
-        for old, new in attn_replacements.items():
-            new_key = new_key.replace(old, new)
+        attn_replacements = {".norm.": ".group_norm.", ".q.": ".to_q.", ".k.": ".to_k.", ".v.": ".to_v.", ".proj_out.": ".to_out.0."}
+        for old, new in attn_replacements.items(): new_key = new_key.replace(old, new)
             
     return new_key
+
+def translate_a1111_vae_to_diffusers(raw_state_dict: dict) -> dict:
+    """
+    [REFACTORED] Translates a full VAE state_dict from A1111/Kohya format to
+    the Diffusers format. It performs both key remapping and the necessary
+    tensor reshaping for attention blocks.
+    """
+    translated_state_dict = {}
+    for old_key, tensor in raw_state_dict.items():
+        # 1. Translate the key string using the internal helper.
+        new_key = _translate_vae_key_str(old_key)
+
+        # 2. **THE FIX**: Reshape the tensor if it's an attention weight.
+        # This logic is now centralized here.
+        if "attentions." in new_key and new_key.endswith(".weight"):
+            if len(tensor.shape) == 4:
+                # Squeeze the 4D Conv2d weight into a 2D Linear weight.
+                tensor = tensor.squeeze()
+
+        translated_state_dict[new_key] = tensor
+    return translated_state_dict
 
 # --- 3. Format Inference Logic ---
 def infer_vae_sdxl_state_dict_format(keys: set) -> str:
@@ -306,140 +305,101 @@ class PipelinedTensorDictLoader:
 
 def advise_next_batch_size(calibration_kwargs: Dict) -> Tuple[int, Dict]:
     """
-    [V2 - INTELLIGENT] Implements exponential upsearch and binary downsearch to
-    find the optimal batch size, as per the specification. This function is
-    pure and stateless, operating only on its input dictionary.
+    [V2.1 - ROBUST] Implements exponential upsearch and binary downsearch.
+    This version corrects a KeyError by ensuring history only contains complete
+    run metrics, avoiding tentative states.
     """
     config = calibration_kwargs.get("config", {})
     history = calibration_kwargs.get("history", [])
     latest_run = calibration_kwargs.get("latest_run_metrics", {})
-    device = config.get("device", "cuda") # Assumes cuda if not specified
+    device = config.get("device", "cuda")
 
     # --- Configuration ---
     if torch.cuda.is_available():
         total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
     else:
-        total_vram_gb = 16.0 # Mock VRAM for CPU testing
-    
+        total_vram_gb = 16.0 # Mock VRAM for CPU/non-cuda testing
     vram_safety_ratio = config.get("vram_safety_ratio", 0.8)
     vram_budget_gb = config.get("vram_budget_gb", total_vram_gb * vram_safety_ratio)
     max_iterations = config.get("max_search_iterations", 20)
-    
-    # --- State Update ---
+
+    # --- Phase 1: State Update (Process last run's results) ---
+    # This block is the core of the fix. It only adds complete records to history.
     if latest_run and "bs" in latest_run:
-        # Calculate throughput and add to history
         bs, duration, vram_peak = latest_run["bs"], latest_run["duration"], latest_run["vram_peak_gb"]
         items_per_second = bs / duration if duration > 0 else float('inf')
         
-        # Determine current phase from history, default to 'upsearch'
-        current_phase = history[-1].get("phase", "upsearch") if history else "upsearch"
-        
+        phase = "upsearch"
+        if history and "downsearch" in history[-1].get("phase", "upsearch"):
+             phase = "downsearch"
+
         new_entry = {
             "bs": bs, "duration": duration, "vram_peak_gb": vram_peak,
-            "items_per_second": items_per_second, "phase": current_phase
+            "items_per_second": items_per_second, "phase": phase
         }
         history.append(new_entry)
         print(f"  [Batch Advisor] Logged BS={bs}: {items_per_second:.2f} items/s, VRAM Peak: {vram_peak:.2f}GB")
 
-    # --- Decision Logic ---
+    # --- Phase 2: Decision Logic (Based on updated history) ---
+    if not history:
+        print("  [Batch Advisor] First call. Starting with BS=1.")
+        return 1, calibration_kwargs
+
+    last_entry = history[-1]
+
+    # Check for terminal conditions
+    if last_entry.get("phase") == "converged":
+        return last_entry["bs"], calibration_kwargs
     if len(history) >= max_iterations:
-        final_bs = max(filter(lambda h: h["vram_peak_gb"] <= vram_budget_gb, history), key=lambda h: h["items_per_second"])["bs"]
+        valid_runs = [h for h in history if h["vram_peak_gb"] <= vram_budget_gb]
+        if not valid_runs:
+             print("[Batch Advisor] WARNING: No successful run within VRAM budget. Defaulting to BS=1.")
+             return 1, calibration_kwargs
+        final_bs = max(valid_runs, key=lambda h: h["items_per_second"])["bs"]
         print(f"  [Batch Advisor] Max iterations reached. Converged to BS={final_bs}")
-        history[-1]["phase"] = "converged"
+        last_entry["phase"] = "converged"
         return final_bs, calibration_kwargs
 
-    # Check for memory overflow
-    if history and history[-1]["vram_peak_gb"] > vram_budget_gb:
-        print(f"  [Batch Advisor] VRAM limit exceeded at BS={history[-1]['bs']}. Starting downsearch.")
-        history[-1]["phase"] = "downsearch_init"
-        # Transition to downsearch, next logic block will handle it
-    
-    # Check for throughput regression during upsearch
-    upsearch_history = [h for h in history if h["phase"] == "upsearch"]
-    if len(upsearch_history) > 1:
-        current_throughput = upsearch_history[-1]["items_per_second"]
-        worst_throughput_so_far = min(h["items_per_second"] for h in upsearch_history[:-1])
-        if current_throughput < worst_throughput_so_far:
-            print(f"  [Batch Advisor] Throughput regression at BS={upsearch_history[-1]['bs']}. Starting downsearch.")
-            history[-1]["phase"] = "downsearch_init"
-            # Transition to downsearch
+    # Check for transitions from upsearch to downsearch
+    is_upsearching = "downsearch" not in last_entry.get("phase")
+    if is_upsearching:
+        if last_entry["vram_peak_gb"] > vram_budget_gb:
+            print(f"  [Batch Advisor] VRAM limit exceeded at BS={last_entry['bs']}. Starting downsearch.")
+            last_entry["phase"] = "downsearch_init"
+        else:
+            upsearch_history = [h for h in history if "downsearch" not in h.get("phase")]
+            if len(upsearch_history) > 1:
+                current_throughput = upsearch_history[-1]["items_per_second"]
+                worst_throughput_so_far = min(h["items_per_second"] for h in upsearch_history[:-1])
+                if current_throughput < worst_throughput_so_far:
+                    print(f"  [Batch Advisor] Throughput regression at BS={last_entry['bs']}. Starting downsearch.")
+                    last_entry["phase"] = "downsearch_init"
 
-    # --- Determine Next Batch Size ---
-    last_phase = history[-1].get("phase", "upsearch") if history else "upsearch"
+    # --- Phase 3: Determine Next Batch Size ---
+    current_phase = last_entry.get("phase")
 
-    if last_phase == "converged":
-        return history[-1]["bs"], calibration_kwargs
-
-    if "downsearch" in last_phase:
-        # --- Binary Downsearch Logic ---
-        good_runs = [h for h in history if h["vram_peak_gb"] <= vram_budget_gb and "downsearch" not in h.get("tag","")]
-        bad_runs = [h for h in history if h["vram_peak_gb"] > vram_budget_gb or "downsearch_init" in h.get("phase")]
+    if "downsearch" in current_phase:
+        good_runs = [h for h in history if h["vram_peak_gb"] <= vram_budget_gb]
+        bad_runs = [h for h in history if h["vram_peak_gb"] > vram_budget_gb]
         
         low_bs = max([h["bs"] for h in good_runs]) if good_runs else 0
-        high_bs = min([h["bs"] for h in bad_runs]) if bad_runs else history[-1]["bs"]
+        high_bs = min([h["bs"] for h in bad_runs]) if bad_runs else last_entry["bs"]
 
         if high_bs - low_bs <= 1:
             next_bs = low_bs if low_bs > 0 else 1
             print(f"  [Batch Advisor] Downsearch converged. Optimal BS: {next_bs}")
-            history[-1]["phase"] = "converged"
+            last_entry["phase"] = "converged"
         else:
             next_bs = low_bs + (high_bs - low_bs) // 2
-            print(f"  [Batch Advisor] Phase: downsearch, testing BS={next_bs} (Range: {low_bs}-{high_bs})")
-            history[-1]["phase"] = "downsearch"
-
-    else: # --- Exponential Upsearch Logic ---
-        if not history:
-            next_bs = 1
-            print("  [Batch Advisor] First call. Starting with BS=1.")
-        else:
-            next_bs = history[-1]["bs"] * 2
-            print(f"  [Batch Advisor] Phase: upsearch, testing BS={next_bs}")
-        history.append({"phase": "upsearch", "bs": next_bs}) # Tentative entry
-        
-    return next_bs, calibration_kwargs
-
-def scale_tensor_synthesizer_v1(**kwargs) -> dict:
-    """
-    [COMPLIANT] A simple function that now accepts an iterator and processes
-    each item, returning a dict of results keyed by work_id.
-    """
-    data_iterator = kwargs['data_iterator']
-    results = {}
-    
-    for spec in data_iterator:
-        work_id = spec['work_id']
-        scale_metadata = spec['input_data']['scale_metadata']
-        # The core logic is tiny, but it's now wrapped to be compliant.
-        results[work_id] = {"scales_tensor": scale_metadata}
-        
-    return results
-
-def dummy_denoise_input_encoder(**kwargs) -> dict:
-    """[COMPLIANT] STUB that now iterates and returns results by work_id."""
-    results = {}
-    for spec in kwargs['data_iterator']:
-        results[spec['work_id']] = {
-            "noisy_latent": "stub_latent", 
-            "timestep_for_unet": "stub_timestep"
-        }
-    return results
-
-def dummy_text_encoder(**kwargs) -> dict:
-    """[COMPLIANT] STUB that now iterates and returns results by work_id."""
-    results = {}
-    for spec in kwargs['data_iterator']:
-        results[spec['work_id']] = {
-            "text_embedding": "stub_text_embed", 
-            "pooled_text_embedding": "stub_pooled_embed"
-        }
-    return results
-
-def dummy_time_id_synthesizer(**kwargs) -> dict:
-    """[COMPLIANT] STUB that now iterates and returns results by work_id."""
-    results = {}
-    for spec in kwargs['data_iterator']:
-        results[spec['work_id']] = {"time_embedding": "stub_time_embed"}
-    return results
+            if next_bs >= high_bs: next_bs = high_bs - 1
+            if next_bs <= low_bs: next_bs = low_bs + 1
+            if next_bs == 0: next_bs = 1
+            print(f"  [Batch Advisor] Phase: downsearch, testing BS={next_bs} (Range: [{low_bs}, {high_bs}])")
+        return next_bs, calibration_kwargs
+    else: # Exponential Upsearch
+        next_bs = last_entry["bs"] * 2
+        print(f"  [Batch Advisor] Phase: upsearch, testing BS={next_bs}")
+        return next_bs, calibration_kwargs
 
 # ==============================================================================
 # ==           EXAMPLE PREPROCESSORS (LOGIC BELONGS TO THE USER)            ==
@@ -499,52 +459,33 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
             if key.startswith("first_stage_model."):
                 raw_vae_keys[key] = f.get_tensor(key)
 
-    # --- 2. Infer format and apply mapping EXPLICITLY ---
-    # key we look for is vae-specific so we use an infer_vae... fn
-    inferred_format = infer_vae_sdxl_state_dict_format(raw_vae_keys)
+    # --- 2. Infer format and apply MAPPING AND RESHAPING EXPLICITLY ---
+    inferred_format = infer_vae_sdxl_state_dict_format(set(raw_vae_keys.keys()))
+    working_state_dict = {}
     
-    # MANDATORY LOG PRINT
     print("\n" + "="*80)
     print("== [MODEL LOADER] Key Format Inference Report")
     print(f"==  - Model Path: {os.path.basename(model_path)}")
     print(f"==  - Inferred Format: '{inferred_format}'")
-    
+
     if inferred_format == "A1111_KOHYA":
-        print("==  - Action: Applying 'A1111_KOHYA_TO_DIFFUSERS' key transformation.")
-        # --- Apply the NEW, smart translation function ---
-        working_state_dict = {
-        translate_a1111_to_diffusers_vae(key): tensor 
-        for key, tensor in raw_vae_keys.items()
-    }
+        print("==  - Action: Applying full 'A1111_KOHYA_TO_DIFFUSERS' state_dict transformation.")
+        # ** THE REFACTOR **: A single, clean call to the new, powerful translator.
+        working_state_dict = translate_a1111_vae_to_diffusers(raw_vae_keys)
     elif inferred_format == "Diffusers":
         print("==  - Action: No key transformation needed. Loading keys as-is.")
+        working_state_dict = raw_vae_keys # Already filtered for VAE keys
     else:
         print("==  - WARNING: Unknown format. Attempting to load keys as-is. This may fail.")
+        working_state_dict = raw_vae_keys
     print("="*80 + "\n")
-
-    # --- Reshape attention tensors ---
-    # Iterate over a copy of the keys to allow modification
-    for key in list(working_state_dict.keys()):
-        # Target the specific projection weights in the attention blocks
-        if "attentions." in key and key.endswith(".weight"):
-            tensor = working_state_dict[key]
-            if len(tensor.shape) == 4:
-                # Squeeze the 4D Conv2d weight into a 2D Linear weight
-                new_tensor = tensor.squeeze()
-                working_state_dict[key] = new_tensor
-                # the only mandatory log prints we got are about the necessity of applying a string remapping at all...
-                #print(f"  [RESHAPE] Correcting tensor shape for '{key}': {tensor.shape} -> {new_tensor.shape}")
 
     # --- 3. Load the model with the corrected state dict ---
     with open(config_path, 'r') as f:
         vae_config = json.load(f)
     vae = AutoencoderKL.from_config(vae_config)
-    vae.eval()
-    for param in vae.parameters():
-        param.requires_grad = False
-    vae.load_state_dict(working_state_dict) # This will now succeed
-    vae.to(device=device, dtype=torch_dtype)
-    
+    vae.load_state_dict(working_state_dict, strict=True) # This will now succeed
+    vae.to(device=device, dtype=torch_dtype).eval()
     
     # Use itertools.tee to create two independent iterators from the original one.
     # We will consume one to get the IDs and pass the other to the loader.
@@ -612,70 +553,503 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
         
     return results_by_work_id
     
-
-
-def fictitious_sdxl_text_encoder(**kwargs) -> dict:
+# --- UNSTUBBED REPLACEMENT for dummy_text_encoder ---
+# Note: Renaming fictitious_sdxl_text_encoder to a more generic name
+def real_sdxl_text_encoder(**kwargs) -> dict:
     """
-    A STUBBED asset-producing function demonstrating how the *exact same* pipeline
-    can encode text by simply swapping the preprocessor.
+    [REAL - v3 CORRECTED] Encodes prompts by loading text encoders from a
+    single checkpoint using the established, fine-grained, manual-loading
+    pattern to avoid loading the entire pipeline.
     """
-    print("\n--- [Text Encoder] Starting high-performance batch encoding. ---")
-    # 1. Unpack arguments
+    # --- 1. Standard Kwarg Setup ---
+    model_path = kwargs.get('model_path')
+    device = kwargs.get('device', 'cpu')
+    torch_dtype = torch.bfloat16
     work_iterator = kwargs['data_iterator']
-    text_encoder_model = kwargs['text_encoder_model'] # A dummy model
-    device = kwargs['device']
+    
+    # Paths to configs and tokenizers now provided by the manifest
+    te1_config_path = kwargs.get('text_encoder_1_config_path')
+    te2_config_path = kwargs.get('text_encoder_2_config_path')
+    tokenizer_1_path = kwargs.get('tokenizer_1_path')
+    tokenizer_2_path = kwargs.get('tokenizer_2_path')
 
-    # Use itertools.tee to create two independent iterators from the original one.
-    # We will consume one to get the IDs and pass the other to the loader.
+    # --- 2. Instantiate Empty Models from Local Canon Configs ---
+    print("  [Text Encoder] Instantiating model shells from local configs...")
+    with open(te1_config_path, 'r') as f: te1_config = json.load(f)
+    with open(te2_config_path, 'r') as f: te2_config = json.load(f)
+    
+    text_encoder_1 = CLIPTextModel.from_config(te1_config)
+    text_encoder_2 = CLIPTextModelWithProjection.from_config(te2_config)
+
+    # --- 3. Manually Filter and Load Weights from Safetensors Checkpoint ---
+    print("  [Text Encoder] Manually filtering and remapping keys from checkpoint...")
+    te1_state_dict = {}
+    te2_state_dict = {}
+    
+    # Define the prefixes used in SDXL checkpoints for the two text encoders
+    # These are the equivalent of "first_stage_model." for the VAE.
+    TE1_PREFIX = "conditioner.embedders.0.transformer.text_model."
+    TE2_PREFIX = "conditioner.embedders.1.text_model."
+
+    with safetensors.safe_open(model_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if key.startswith(TE1_PREFIX):
+                # Remap key by stripping the prefix
+                new_key = key[len(TE1_PREFIX):]
+                te1_state_dict[new_key] = f.get_tensor(key)
+            elif key.startswith(TE2_PREFIX):
+                # Remap key by stripping the prefix
+                new_key = key[len(TE2_PREFIX):]
+                te2_state_dict[new_key] = f.get_tensor(key)
+    
+    # Load the filtered and remapped state dicts into the model shells
+    text_encoder_1.load_state_dict(te1_state_dict)
+    text_encoder_2.load_state_dict(te2_state_dict)
+
+    text_encoder_1.to(device=device, dtype=torch_dtype).eval()
+    text_encoder_2.to(device=device, dtype=torch_dtype).eval()
+    print("  [Text Encoder] Weights loaded successfully into shells.")
+
+    # --- 4. Load Tokenizers ---
+    tokenizer_1 = CLIPTokenizer.from_pretrained(tokenizer_1_path)
+    tokenizer_2 = CLIPTokenizer.from_pretrained(tokenizer_2_path)
+    
+    # --- 5. The Rest of the Pipeline (unchanged) ---
+    def text_preprocessor(item: Dict) -> Dict[str, torch.Tensor]:
+        prompt = item['input_data']['prompt']
+        tokens_1 = tokenizer_1(prompt, padding="max_length", max_length=tokenizer_1.model_max_length, truncation=True, return_tensors="pt").input_ids
+        tokens_2 = tokenizer_2(prompt, padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True, return_tensors="pt").input_ids
+        return {"tokens_1": tokens_1.squeeze(), "tokens_2": tokens_2.squeeze()}
+
     id_iterator, loader_iterator = itertools.tee(work_iterator)
-    # 1. Immediately consume the first iterator to get our list of work_ids.
     work_ids = [spec['work_id'] for spec in id_iterator]
-
-    # 2. Initialize the pipeline and advisor tools
-    loader = PipelinedTensorDictLoader(
-        raw_data_iterator=loader_iterator,
-        preprocessing_fn=sdxl_text_preprocessor, # SWAP to the text preprocessor
-        device=device,
-        initial_bs=4 # Text models often handle larger batches
-    )
+    loader = PipelinedTensorDictLoader(loader_iterator, text_preprocessor, device)
+    
+    # --- Add this: Initialize the calibration state ---
     calibration_state = {
-        "config": {"vram_safety_budget_gb": 16.0, "initial_batch_size": 4},
-        "history": []
+        "config": {"device": device, "vram_safety_ratio": 0.8},
+        "history": [],
+        "latest_run_metrics": {}
     }
     all_embeds, all_pooled = [], []
-
-    # 3. Run the internal processing loop (code is identical to the VAE one)
     while True:
         try:
+            # 1. ADVISE: Get the next batch size to try.
             next_bs, calibration_state = advise_next_batch_size(calibration_state)
             loader.set_batch_size(next_bs)
 
+            # 2. TIME & FETCH: Start the timer and get the batch.
+            start_time = time.time()
             on_device_batch = loader.get_next_batch()
 
+            # 3. COMPUTE: The core model inference.
             with torch.no_grad():
-                # Dummy model computation
-                embeds, pooled = text_encoder_model(on_device_batch['input_ids'])
+                prompt_embeds_1 = text_encoder_1(on_device_batch['tokens_1'], output_hidden_states=True).hidden_states[-2]
+                encoder_2_output = text_encoder_2(on_device_batch['tokens_2'], output_hidden_states=True)
+                prompt_embeds_2 = encoder_2_output.hidden_states[-2]
+                pooled_prompt_embeds = encoder_2_output.text_embeds
+            
+            final_prompt_embeds = torch.cat((prompt_embeds_1, prompt_embeds_2), dim=-1)
 
-            torch.cuda.synchronize()
-            all_embeds.append(embeds.cpu())
-            all_pooled.append(pooled.cpu())
-            #loader.release_buffer(buffer_key)
+            # 4. MEASURE: Get timing and memory stats.
+            torch.cuda.synchronize(device)
+            duration = time.time() - start_time
+            vram_peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+            torch.cuda.reset_peak_memory_stats(device)
+
+            # 5. RECORD: Store metrics for the next advisor call.
+            calibration_state["latest_run_metrics"] = {
+                "bs": next_bs,
+                "duration": duration,
+                "vram_peak_gb": vram_peak_gb
+            }
+
+            # 6. STORE RESULTS: Append to CPU lists.
+            all_embeds.append(final_prompt_embeds.cpu())
+            all_pooled.append(pooled_prompt_embeds.cpu())
 
         except StopIteration:
             print("[Text Encoder] Finished processing all prompts.")
             break
+        except torch.cuda.OutOfMemoryError:
+            print(f"  [Batch Advisor] CUDA OOM detected at BS={next_bs}. Forcing downsearch.")
+            torch.cuda.empty_cache()
+            # Log the failure so the advisor knows this batch size is too large.
+            calibration_state["latest_run_metrics"] = {"bs": next_bs, "duration": float('inf'), "vram_peak_gb": float('inf')}
+            continue # Proceed to the next advisor call.
+
+    loader.close()
+    
+    final_embeds = torch.cat(all_embeds, dim=0)
+    final_pooled = torch.cat(all_pooled, dim=0)
+    
+    results_by_work_id = {
+        work_id: {"text_embedding": final_embeds[i], "pooled_text_embedding": final_pooled[i]}
+        for i, work_id in enumerate(work_ids)
+    }
+    return results_by_work_id
+
+
+# --- UNSTUBBED REPLACEMENT for dummy_time_id_synthesizer ---
+def real_time_id_synthesizer(**kwargs) -> dict:
+    """
+    [REAL] Creates SDXL time embeddings based on image dimensions.
+    """
+    results = {}
+    for spec in kwargs['data_iterator']:
+        work_id = spec['work_id']
+        # In a real scenario, we'd get real dimensions. Here we use defaults.
+        original_size = (1024, 1024)
+        crops_coords_top_left = (0, 0)
+        target_size = (1024, 1024)
+        
+        # SDXL time embedding logic
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        add_time_ids = torch.tensor([add_time_ids], dtype=torch.bfloat16)
+        results[spec['work_id']] = {"time_embedding": add_time_ids.squeeze()}
+    return results
+
+
+# --- TENSOR-COMPLIANT REPLACEMENT for scale_tensor_synthesizer_v1 ---
+def scale_tensor_synthesizer_v1(**kwargs) -> dict:
+    """
+    [COMPLIANT] A simple function that now returns a torch.Tensor.
+    """
+    data_iterator = kwargs['data_iterator']
+    results = {}
+
+    for spec in data_iterator:
+        work_id = spec['work_id']
+        scale_metadata = spec['input_data']['scale_metadata']
+        # The core logic is tiny, but it's now wrapped to be compliant.
+        results[work_id] = {"scales_tensor": torch.tensor(scale_metadata)}
+
+    return results
+
+
+# NEW FUNCTION PER CLAUDE SPEC
+def real_latent_to_image_decoder(**kwargs) -> dict:
+    """
+    Decodes latent tensors back into images using a VAE. Follows the same
+    high-performance, batch-calibrating pattern as the encoder.
+    """
+    # --- Standard setup from kwargs ---
+    model_path = kwargs.get('model_path')
+    config_path = kwargs.get('config_path')
+    device = kwargs.get('device', 'cpu')
+    dtype_str = kwargs.get('dtype', 'bfloat16')
+    work_iterator = kwargs['data_iterator']
+    torch_dtype = torch.float32 if dtype_str == 'float32' else torch.bfloat16
+
+    # VAE LOADING
+    # --- 1. Load the raw state dictionary and all its keys ---
+    raw_vae_keys = {}
+    with safetensors.safe_open(model_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if key.startswith("first_stage_model."):
+                raw_vae_keys[key] = f.get_tensor(key)
+
+    # --- 2. Infer format and apply MAPPING AND RESHAPING EXPLICITLY ---
+    inferred_format = infer_vae_sdxl_state_dict_format(set(raw_vae_keys.keys()))
+    working_state_dict = {}
+    
+    print("\n" + "="*80)
+    print("== [MODEL LOADER] Key Format Inference Report")
+    print(f"==  - Model Path: {os.path.basename(model_path)}")
+    print(f"==  - Inferred Format: '{inferred_format}'")
+
+    if inferred_format == "A1111_KOHYA":
+        print("==  - Action: Applying full 'A1111_KOHYA_TO_DIFFUSERS' state_dict transformation.")
+        # ** THE REFACTOR **: A single, clean call to the new, powerful translator.
+        working_state_dict = translate_a1111_vae_to_diffusers(raw_vae_keys)
+    elif inferred_format == "Diffusers":
+        print("==  - Action: No key transformation needed. Loading keys as-is.")
+        working_state_dict = raw_vae_keys # Already filtered for VAE keys
+    else:
+        print("==  - WARNING: Unknown format. Attempting to load keys as-is. This may fail.")
+        working_state_dict = raw_vae_keys
+    print("="*80 + "\n")
+
+    # --- 3. Load the model with the corrected state dict ---
+    with open(config_path, 'r') as f:
+        vae_config = json.load(f)
+    vae = AutoencoderKL.from_config(vae_config)
+    vae.load_state_dict(working_state_dict, strict=True) # This will now succeed
+    vae.to(device=device, dtype=torch_dtype).eval()
+
+    # --- 2. Setup Pipeline for decoding ---
+    id_iterator, loader_iterator = itertools.tee(work_iterator)
+    work_ids = [spec['work_id'] for spec in id_iterator]
+
+    loader = PipelinedTensorDictLoader(
+        raw_data_iterator=loader_iterator,
+        preprocessing_fn=sdxl_vae_latent_preprocessor, # Use latent preprocessor
+        device=device,
+        initial_bs=1
+    )
+    calibration_state = {
+        "config": {"vram_safety_ratio": 0.8, "device": device},
+        "history": [],
+        "latest_run_metrics": {}
+    }
+    all_results = []
+    
+    # 3. Run the internal processing loop
+    while True:
+        try:
+            next_bs, calibration_state = advise_next_batch_size(calibration_state)
+            loader.set_batch_size(next_bs)
+            start_time = time.time()
+            on_device_batch = loader.get_next_batch()
+            
+            with torch.no_grad():
+                # The core decoding operation
+                latents = on_device_batch['latent']
+                images = vae.decode(latents / vae.config.scaling_factor).sample
+                # Denormalize from [-1, 1] to [0, 1] for metrics/saving
+                images = (images / 2 + 0.5).clamp(0, 1)
+
+            torch.cuda.synchronize(device)
+            duration = time.time() - start_time
+            vram_peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+            torch.cuda.reset_peak_memory_stats(device)
+
+            calibration_state["latest_run_metrics"] = {
+                "bs": next_bs, "duration": duration, "vram_peak_gb": vram_peak_gb
+            }
+            all_results.append(images.cpu())
+
+        except StopIteration:
+            print("[VAE Decoder] Finished processing all latents.")
+            break
+        except torch.cuda.OutOfMemoryError:
+            print(f"  [Batch Advisor] CUDA OOM detected at BS={next_bs}. Forcing downsearch.")
+            torch.cuda.empty_cache()
+            calibration_state["latest_run_metrics"] = {"bs": next_bs, "duration": float('inf'), "vram_peak_gb": float('inf')}
+            continue
             
     loader.close()
 
     # 4. Collate and return results
-    final_embeds = torch.cat(all_embeds, dim=0)
-    final_pooled = torch.cat(all_pooled, dim=0)
-    print(f"--- [Text Encoder] Complete. Produced final tensors of shapes: {final_embeds.shape}, {final_pooled.shape} ---")
-
-    # This part now works because we have the list of work_ids.
-    results_by_work_id = {}
-    for i, work_id in enumerate(work_ids):
-        results_by_work_id[work_id] = {"text_embedding": final_embeds[i], "pooled_text_embedding": final_pooled[i]}
-        
+    final_images = torch.cat(all_results, dim=0)
+    print(f"--- [VAE Decoder] Complete. Produced final image tensor of shape: {final_images.shape} ---")
+    results_by_work_id = {
+        work_id: {"decoded_image": final_images[i]}
+        for i, work_id in enumerate(work_ids)
+    }
     return results_by_work_id
-    return {"text_embedding": final_embeds, "pooled_text_embedding": final_pooled}
+
+
+def real_denoise_input_encoder(**kwargs) -> dict:
+    """
+    [REAL - CORRECTED] Encodes images to latents, selects timesteps, and adds noise.
+    This version corrects the kwarg access to conform to the established
+    interface contract used by other working functions.
+    """
+    # --- Standard setup from kwargs ---
+    # ** THE FIX **: Use the standard keys provided by the DAG, not custom ones.
+    model_path = kwargs.get('model_path')
+    config_path = kwargs.get('config_path')
+    device = kwargs.get('device', 'cpu')
+    torch_dtype = torch.bfloat16 # Hardcoding for simplicity, can be passed in kwargs
+    work_iterator = kwargs['data_iterator']
+    
+    # Get both the full schedule length and the coarse steps for sampling
+    num_train_timesteps = kwargs.get('num_train_timesteps', 1000)
+    max_denoising_steps = kwargs.get('max_denoising_steps', 50) # The coarse schedule
+
+
+    # VAE LOADING
+    # --- 1. Load the raw state dictionary and all its keys ---
+    raw_vae_keys = {}
+    with safetensors.safe_open(model_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if key.startswith("first_stage_model."):
+                raw_vae_keys[key] = f.get_tensor(key)
+
+    # --- 2. Infer format and apply MAPPING AND RESHAPING EXPLICITLY ---
+    inferred_format = infer_vae_sdxl_state_dict_format(set(raw_vae_keys.keys()))
+    working_state_dict = {}
+    
+    print("\n" + "="*80)
+    print("== [MODEL LOADER] Key Format Inference Report")
+    print(f"==  - Model Path: {os.path.basename(model_path)}")
+    print(f"==  - Inferred Format: '{inferred_format}'")
+
+    if inferred_format == "A1111_KOHYA":
+        print("==  - Action: Applying full 'A1111_KOHYA_TO_DIFFUSERS' state_dict transformation.")
+        # ** THE REFACTOR **: A single, clean call to the new, powerful translator.
+        working_state_dict = translate_a1111_vae_to_diffusers(raw_vae_keys)
+    elif inferred_format == "Diffusers":
+        print("==  - Action: No key transformation needed. Loading keys as-is.")
+        working_state_dict = raw_vae_keys # Already filtered for VAE keys
+    else:
+        print("==  - WARNING: Unknown format. Attempting to load keys as-is. This may fail.")
+        working_state_dict = raw_vae_keys
+    print("="*80 + "\n")
+
+    # --- 3. Load the model with the corrected state dict ---
+    with open(config_path, 'r') as f:
+        vae_config = json.load(f)
+    vae = AutoencoderKL.from_config(vae_config)
+    vae.load_state_dict(working_state_dict, strict=True) # This will now succeed
+    vae.to(device=device, dtype=torch_dtype).eval()
+    
+    # --- 2. Initialize Noise Scheduler ---
+    # The scheduler is ALWAYS initialized with the full 1000 steps to define the beta curve.
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=num_train_timesteps,
+        beta_start=0.00085, beta_end=0.012,
+        beta_schedule="scaled_linear", device=device
+    )
+
+    # --- 3. Run Pipeline ---
+    id_iterator, loader_iterator = itertools.tee(work_iterator)
+    work_ids = [spec['work_id'] for spec in id_iterator]
+
+    loader = PipelinedTensorDictLoader(
+        raw_data_iterator=loader_iterator,
+        preprocessing_fn=sdxl_vae_image_preprocessor,
+        device=device
+    )
+    # Initialize the calibration state, just like in the other functions
+    calibration_state = {
+        "config": {"device": device, "vram_safety_ratio": 0.8},
+        "history": [],
+        "latest_run_metrics": {}
+    }
+    all_noisy_latents, all_timesteps_for_unet = [], []
+    
+    while True:
+        try:
+            # CALIB1. ADVISE & SET
+            next_bs, calibration_state = advise_next_batch_size(calibration_state)
+            loader.set_batch_size(next_bs)
+
+            # CALIB2. TIME & FETCH
+            start_time = time.time()
+            on_device_batch = loader.get_next_batch()
+            batch_size = on_device_batch['image'].shape[0]
+
+            with torch.no_grad():
+                latents = vae.encode(on_device_batch['image']).latent_dist.sample() * vae.config.scaling_factor
+
+            noise = torch.randn_like(latents)
+            # TSTEPS1. Set the scheduler to the coarse, inference-like steps.
+            noise_scheduler.set_timesteps(max_denoising_steps, device=device)
+            # TSTEPS2. Importance-sample by picking a random INDEX from the coarse steps.
+            # This samples from a distribution of e.g., 50 steps like [981, 961, ...].
+            indices = torch.randint(0, max_denoising_steps, (batch_size,), device=device)
+            # TSTEPS3. Get the actual timestep VALUE from the sampled index.
+            # This is the value used for adding noise AND for the UNet.
+            timesteps = noise_scheduler.timesteps[indices]
+            # TSTEPS4. Add noise using the sampled timestep value.
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            # TSTEPS5. The timestep for the UNet IS the sampled timestep. No complex projection needed.
+            # The UNet was trained on values from 0-999, and `timesteps` contains exactly that.
+            unet_timesteps = timesteps
+            
+            # CALIB4. MEASURE
+            torch.cuda.synchronize(device)
+            duration = time.time() - start_time
+            vram_peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+            torch.cuda.reset_peak_memory_stats(device)
+
+            # CALIB5. RECORD
+            calibration_state["latest_run_metrics"] = {
+                "bs": next_bs, "duration": duration, "vram_peak_gb": vram_peak_gb
+            }
+
+            all_noisy_latents.append(noisy_latents.cpu())
+            all_timesteps_for_unet.append(unet_timesteps.cpu())
+        except StopIteration:
+            print("[Denoise Encoder] Finished processing all images.")
+            break
+        except torch.cuda.OutOfMemoryError:
+            print(f"  [Batch Advisor] CUDA OOM detected at BS={next_bs}. Forcing downsearch.")
+            torch.cuda.empty_cache()
+            calibration_state["latest_run_metrics"] = {"bs": next_bs, "duration": float('inf'), "vram_peak_gb": float('inf')}
+            continue
+    
+    loader.close()
+
+    # --- 4. Collate and Return ---
+    final_noisy_latents = torch.cat(all_noisy_latents, dim=0)
+    final_timesteps = torch.cat(all_timesteps_for_unet, dim=0)
+
+    results_by_work_id = {
+        work_id: {"noisy_latent": final_noisy_latents[i], "timestep_for_unet": final_timesteps[i]}
+        for i, work_id in enumerate(work_ids)
+    }
+    return results_by_work_id
+
+# NEW FUNCTION PER CLAUDE SPEC
+def compute_validation_metrics(**kwargs) -> dict:
+    """
+    Computes LPIPS and FID between original and reconstructed images.
+    Consumes two synchronized data streams.
+    """
+    # --- Config ---
+    device = kwargs.get('device', 'cuda')
+    lpips_net = kwargs.get('lpips_net', 'vgg') # 'vgg' or 'alex'
+    fid_feature_dim = kwargs.get('fid_feature_dim', 64) # 64, 192, 768, 2048
+    
+    # --- Iterators (passed by the DAG runner) ---
+    original_images_iterator = kwargs['original_data_stream']
+    reconstructed_data_iterator = kwargs['reconstructed_data_iterator']
+
+    # --- Metric Initialization ---
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type=lpips_net, normalize=True).to(device) # normalize expects [0,1]
+    fid_metric = FrechetInceptionDistance(feature=fid_feature_dim, normalize=True).to(device) # normalize expects [0,1]
+    print(f"--- [Validator] Metrics (LPIPS-{lpips_net}, FID-{fid_feature_dim}) initialized on {device}. ---")
+
+    # --- Processing Loop ---
+    # This assumes the two iterators are aligned, which the DAG must guarantee
+    # by using the same source data stream and planning logic.
+    sample_count = 0
+    for original_spec, recon_spec in zip(original_images_iterator, reconstructed_data_iterator):
+        try:
+            # 1. Load original image and preprocess
+            original_path = original_spec['input_data']['image']
+            original_img = Image.open(original_path).convert("RGB")
+            # NOTE: Preprocessing MUST match here. We assume a simple ToTensor for [0,1] range.
+            preprocess = transforms.Compose([transforms.Resize((512, 512)), transforms.ToTensor()])
+            original_tensor = preprocess(original_img).unsqueeze(0).to(device)
+
+            # 2. Load reconstructed image tensor
+            recon_tensor = recon_spec['input_data']['decoded_image'].unsqueeze(0).to(device)
+            # Ensure tensors are 4D [B, C, H, W] and compatible shapes
+            if original_tensor.shape != recon_tensor.shape:
+                recon_tensor = torch.nn.functional.interpolate(recon_tensor, size=original_tensor.shape[2:])
+
+            # 3. Update metrics
+            lpips_metric.update(original_tensor, recon_tensor)
+            fid_metric.update(original_tensor, real=True)
+            fid_metric.update(recon_tensor, real=False)
+            
+            sample_count += 1
+            if sample_count % 50 == 0:
+                print(f"  [Validator] Processed {sample_count} image pairs...")
+
+        except Exception as e:
+            print(f"  - WARNING: Skipping validation pair due to error: {e}")
+            continue
+
+    # --- Final Computation ---
+    final_lpips = lpips_metric.compute().item()
+    final_fid = fid_metric.compute().item()
+    
+    print("--- [Validator] Metric Computation Complete ---")
+    print(f"  - Total Samples: {sample_count}")
+    print(f"  - Mean LPIPS:    {final_lpips:.4f}")
+    print(f"  - FID Score:     {final_fid:.4f}")
+
+    # Per spec, return a dictionary suitable for logging
+    results = {
+        "validation_metrics": {
+           "lpips_mean": final_lpips,
+           "fid_score": final_fid,
+           "sample_count": sample_count,
+        }
+    }
+    return results
