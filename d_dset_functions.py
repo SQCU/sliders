@@ -302,108 +302,93 @@ class PipelinedTensorDictLoader:
         self.cpu_worker.join()
         self.gpu_worker.join()
 
-
 def advise_next_batch_size(calibration_kwargs: Dict) -> Tuple[int, Dict]:
     """
-    [V2.1 - ROBUST] Implements exponential upsearch and binary downsearch.
-    This version corrects a KeyError by ensuring history only contains complete
-    run metrics, avoiding tentative states.
+    [LITERAL SEQUENCE + THROUGHPUT ANALYSIS] This function performs two tasks:
+    1.  Returns batch sizes following the literal, non-adaptive sequence.
+    2.  Analyzes the history to report on VRAM usage AND wall-clock throughput,
+        tracking and displaying the most efficient batch size found so far.
     """
+    # --- Part 1: Setup for Analysis ---
     config = calibration_kwargs.get("config", {})
     history = calibration_kwargs.get("history", [])
     latest_run = calibration_kwargs.get("latest_run_metrics", {})
-    device = config.get("device", "cuda")
 
-    # --- Configuration ---
+    # State for tracking the best throughput
+    best_throughput = calibration_kwargs.get("best_throughput", 0.0)
+    bs_at_best_throughput = calibration_kwargs.get("bs_at_best_throughput", 0)
+
     if torch.cuda.is_available():
-        total_vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+        total_vram_gb = torch.cuda.get_device_properties(config.get("device", "cuda")).total_memory / (1024**3)
     else:
-        total_vram_gb = 16.0 # Mock VRAM for CPU/non-cuda testing
-    vram_safety_ratio = config.get("vram_safety_ratio", 0.8)
+        total_vram_gb = 16.0
+    vram_safety_ratio = config.get("vram_safety_ratio", 0.9)
     vram_budget_gb = config.get("vram_budget_gb", total_vram_gb * vram_safety_ratio)
-    max_iterations = config.get("max_search_iterations", 20)
 
-    # --- Phase 1: State Update (Process last run's results) ---
-    # This block is the core of the fix. It only adds complete records to history.
     if latest_run and "bs" in latest_run:
-        bs, duration, vram_peak = latest_run["bs"], latest_run["duration"], latest_run["vram_peak_gb"]
-        items_per_second = bs / duration if duration > 0 else float('inf')
+        history.append(latest_run)
+
+    # --- Part 2: The Analysis Calculation ---
+    if history:
+        print("\n--- [Batch Advisor Analysis] ---")
+        latest_run = history[-1]
         
-        phase = "upsearch"
-        if history and "downsearch" in history[-1].get("phase", "upsearch"):
-             phase = "downsearch"
-
-        new_entry = {
-            "bs": bs, "duration": duration, "vram_peak_gb": vram_peak,
-            "items_per_second": items_per_second, "phase": phase
-        }
-        history.append(new_entry)
-        print(f"  [Batch Advisor] Logged BS={bs}: {items_per_second:.2f} items/s, VRAM Peak: {vram_peak:.2f}GB")
-
-    # --- Phase 2: Decision Logic (Based on updated history) ---
-    if not history:
-        print("  [Batch Advisor] First call. Starting with BS=1.")
-        return 1, calibration_kwargs
-
-    last_entry = history[-1]
-
-    # Check for terminal conditions
-    if last_entry.get("phase") == "converged":
-        return last_entry["bs"], calibration_kwargs
-    if len(history) >= max_iterations:
-        valid_runs = [h for h in history if h["vram_peak_gb"] <= vram_budget_gb]
-        if not valid_runs:
-             print("[Batch Advisor] WARNING: No successful run within VRAM budget. Defaulting to BS=1.")
-             return 1, calibration_kwargs
-        final_bs = max(valid_runs, key=lambda h: h["items_per_second"])["bs"]
-        print(f"  [Batch Advisor] Max iterations reached. Converged to BS={final_bs}")
-        last_entry["phase"] = "converged"
-        return final_bs, calibration_kwargs
-
-    # Check for transitions from upsearch to downsearch
-    is_upsearching = "downsearch" not in last_entry.get("phase")
-    if is_upsearching:
-        if last_entry["vram_peak_gb"] > vram_budget_gb:
-            print(f"  [Batch Advisor] VRAM limit exceeded at BS={last_entry['bs']}. Starting downsearch.")
-            last_entry["phase"] = "downsearch_init"
-        else:
-            upsearch_history = [h for h in history if "downsearch" not in h.get("phase")]
-            if len(upsearch_history) > 1:
-                current_throughput = upsearch_history[-1]["items_per_second"]
-                worst_throughput_so_far = min(h["items_per_second"] for h in upsearch_history[:-1])
-                if current_throughput < worst_throughput_so_far:
-                    print(f"  [Batch Advisor] Throughput regression at BS={last_entry['bs']}. Starting downsearch.")
-                    last_entry["phase"] = "downsearch_init"
-
-    # --- Phase 3: Determine Next Batch Size ---
-    current_phase = last_entry.get("phase")
-
-    if "downsearch" in current_phase:
-        good_runs = [h for h in history if h["vram_peak_gb"] <= vram_budget_gb]
-        bad_runs = [h for h in history if h["vram_peak_gb"] > vram_budget_gb]
+        # Throughput Calculation
+        current_bs = latest_run['bs']
+        duration = latest_run.get('duration', 0)
+        if duration > 1e-9:
+            current_throughput = current_bs / duration
+            print(f"  - Throughput (Current): {current_throughput:.2f} items/sec at BS={current_bs}")
+            if current_throughput > best_throughput:
+                best_throughput = current_throughput
+                bs_at_best_throughput = current_bs
         
-        low_bs = max([h["bs"] for h in good_runs]) if good_runs else 0
-        high_bs = min([h["bs"] for h in bad_runs]) if bad_runs else last_entry["bs"]
+        if bs_at_best_throughput > 0:
+            print(f"  - Throughput (Peak):    {best_throughput:.2f} items/sec achieved at BS={bs_at_best_throughput}")
+        
+        # VRAM Estimation (from previous version, for comparison)
+        if len(history) >= 2:
+            # Pessimistic Estimate
+            last_different_bs_run = next((run for run in reversed(history[:-1]) if run['bs'] != latest_run['bs']), None)
+            if last_different_bs_run:
+                delta_vram_pess = latest_run['vram_peak_gb'] - last_different_bs_run['vram_peak_gb']
+                delta_bs_pess = latest_run['bs'] - last_different_bs_run['bs']
+                if delta_bs_pess > 0 and delta_vram_pess > 1e-9:
+                    cost_per_item_pess = delta_vram_pess / delta_bs_pess
+                    base_vram_pess = latest_run['vram_peak_gb'] - cost_per_item_pess * latest_run['bs']
+                    predicted_max_bs_pess = (vram_budget_gb - base_vram_pess) / cost_per_item_pess
+                    print(f"  - VRAM Model (Pessimistic): Max BS ~{int(predicted_max_bs_pess)}")
+            
+            # Optimistic Estimate
+            first_run = history[0]
+            delta_vram_opt = latest_run['vram_peak_gb'] - first_run['vram_peak_gb']
+            delta_bs_opt = latest_run['bs'] - first_run['bs']
+            if delta_bs_opt > 0 and delta_vram_opt > 1e-9:
+                cost_per_item_opt = delta_vram_opt / delta_bs_opt
+                base_vram_opt = first_run['vram_peak_gb'] - cost_per_item_opt * first_run['bs']
+                predicted_max_bs_opt = (vram_budget_gb - base_vram_opt) / cost_per_item_opt
+                print(f"  - VRAM Model (Optimistic):  Max BS ~{int(predicted_max_bs_opt)}")
+        print("--------------------------------")
 
-        if high_bs - low_bs <= 1:
-            next_bs = low_bs if low_bs > 0 else 1
-            print(f"  [Batch Advisor] Downsearch converged. Optimal BS: {next_bs}")
-            last_entry["phase"] = "converged"
-        else:
-            next_bs = low_bs + (high_bs - low_bs) // 2
-            if next_bs >= high_bs: next_bs = high_bs - 1
-            if next_bs <= low_bs: next_bs = low_bs + 1
-            if next_bs == 0: next_bs = 1
-            print(f"  [Batch Advisor] Phase: downsearch, testing BS={next_bs} (Range: [{low_bs}, {high_bs}])")
-        return next_bs, calibration_kwargs
-    else: # Exponential Upsearch
-        next_bs = last_entry["bs"] * 2
-        print(f"  [Batch Advisor] Phase: upsearch, testing BS={next_bs}")
-        return next_bs, calibration_kwargs
 
-# ==============================================================================
-# ==           EXAMPLE PREPROCESSORS (LOGIC BELONGS TO THE USER)            ==
-# ==============================================================================
+    # --- Part 3: The Literal Sequence Generator ---
+    current_bs = calibration_kwargs.get("sequence_bs", 1)
+    yield_count = calibration_kwargs.get("sequence_yield_count", 0)
+    next_bs_to_return = current_bs
+
+    yield_count += 1
+    if current_bs == 1: current_bs, yield_count = 2, 0
+    elif current_bs == 2 and yield_count >= 4: current_bs, yield_count = 3, 0
+    elif current_bs == 3 and yield_count >= 4: current_bs, yield_count = 4, 0
+    
+    calibration_kwargs.update({
+        "sequence_bs": current_bs,
+        "sequence_yield_count": yield_count,
+        "history": history,
+        "best_throughput": best_throughput,
+        "bs_at_best_throughput": bs_at_best_throughput
+    })
+    return next_bs_to_return, calibration_kwargs
 
 # --- For Image VAE Encoding ---
 from PIL import Image
@@ -423,6 +408,22 @@ def sdxl_vae_image_preprocessor(item: Dict) -> Dict[str, torch.Tensor]:
     image_tensor = image_tensor * 2.0 - 1.0
     image_tensor = image_tensor.to(dtype=target_dtype)
     return {"image": image_tensor}
+
+def sdxl_vae_latent_preprocessor(item: Dict) -> Dict[str, torch.Tensor]:
+    """
+    Takes a data item and loads the latent tensor from its safetensor file.
+    Assumes the work spec's input_data contains a path to a safetensors file
+    and the key for the tensor within it.
+    """
+    latent_cache_path = item['input_data']['latent_file']
+    latent_key = item['input_data']['latent_key']
+    
+    # safe_open is more memory efficient for loading a single tensor from a large file
+    with safetensors.safe_open(latent_cache_path, framework="pt", device="cpu") as f:
+        latent_tensor = f.get_tensor(latent_key)
+        
+    return {"latent": latent_tensor.to(dtype=item.get('dtype', torch.bfloat16))}
+
 
 # --- For Fictitious Text Encoding ---
 def dummy_prompt_recipe_parser(recipe: str) -> str:
@@ -517,6 +518,7 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
             # 2. Start timer and get next batch
             start_time = time.time()
             on_device_batch = loader.get_next_batch()
+            last_bs = on_device_batch.shape[0]
 
             # 3. The actual model computation
             with torch.no_grad():
@@ -524,13 +526,12 @@ def real_image_to_latent_encoder(**kwargs) -> dict:
                 latents = posterior.sample() * vae.config.scaling_factor
             
             # 4. CAPTURE METRICS NOW and store for the *next* loop's advisor call
-            torch.cuda.synchronize() # Crucial for accurate timing
+            #torch.cuda.synchronize() # Crucial for accurate timing
             duration = time.time() - start_time
-            vram_peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
-            torch.cuda.reset_max_memory_allocated() # Reset for next measurement
+            vram_peak_gb = torch.cuda.max_memory_reserved() / (1024**3)
 
             calibration_state["latest_run_metrics"] = {
-            "bs": next_bs, # Use the batch size we just ran
+            "bs": last_bs, # Use the batch size we actually ran
             "duration": duration,
             "vram_peak_gb": vram_peak_gb
             }
@@ -641,6 +642,7 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
             # 2. TIME & FETCH: Start the timer and get the batch.
             start_time = time.time()
             on_device_batch = loader.get_next_batch()
+            last_bs = on_device_batch.shape[0]
 
             # 3. COMPUTE: The core model inference.
             with torch.no_grad():
@@ -654,12 +656,11 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
             # 4. MEASURE: Get timing and memory stats.
             torch.cuda.synchronize(device)
             duration = time.time() - start_time
-            vram_peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
-            torch.cuda.reset_peak_memory_stats(device)
+            vram_peak_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
 
             # 5. RECORD: Store metrics for the next advisor call.
             calibration_state["latest_run_metrics"] = {
-                "bs": next_bs,
+                "bs": last_bs,
                 "duration": duration,
                 "vram_peak_gb": vram_peak_gb
             }
@@ -679,7 +680,7 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
             continue # Proceed to the next advisor call.
 
     loader.close()
-    
+
     final_embeds = torch.cat(all_embeds, dim=0)
     final_pooled = torch.cat(all_pooled, dim=0)
     
@@ -801,6 +802,7 @@ def real_latent_to_image_decoder(**kwargs) -> dict:
             loader.set_batch_size(next_bs)
             start_time = time.time()
             on_device_batch = loader.get_next_batch()
+            last_bs = on_device_batch.shape[0]
             
             with torch.no_grad():
                 # The core decoding operation
@@ -811,11 +813,10 @@ def real_latent_to_image_decoder(**kwargs) -> dict:
 
             torch.cuda.synchronize(device)
             duration = time.time() - start_time
-            vram_peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
-            torch.cuda.reset_peak_memory_stats(device)
+            vram_peak_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
 
             calibration_state["latest_run_metrics"] = {
-                "bs": next_bs, "duration": duration, "vram_peak_gb": vram_peak_gb
+                "bs": last_bs, "duration": duration, "vram_peak_gb": vram_peak_gb
             }
             all_results.append(images.cpu())
 
@@ -930,6 +931,8 @@ def real_denoise_input_encoder(**kwargs) -> dict:
             start_time = time.time()
             on_device_batch = loader.get_next_batch()
             batch_size = on_device_batch['image'].shape[0]
+            last_bs = on_device_batch.shape[0]
+            
 
             with torch.no_grad():
                 latents = vae.encode(on_device_batch['image']).latent_dist.sample() * vae.config.scaling_factor
@@ -952,12 +955,11 @@ def real_denoise_input_encoder(**kwargs) -> dict:
             # CALIB4. MEASURE
             torch.cuda.synchronize(device)
             duration = time.time() - start_time
-            vram_peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
-            torch.cuda.reset_peak_memory_stats(device)
+            vram_peak_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
 
             # CALIB5. RECORD
             calibration_state["latest_run_metrics"] = {
-                "bs": next_bs, "duration": duration, "vram_peak_gb": vram_peak_gb
+                "bs": last_bs, "duration": duration, "vram_peak_gb": vram_peak_gb
             }
 
             all_noisy_latents.append(noisy_latents.cpu())

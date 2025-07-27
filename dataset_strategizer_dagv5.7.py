@@ -340,7 +340,9 @@ from d_dset_functions import (
     scale_tensor_synthesizer_v1,
     real_image_to_latent_encoder,
     real_latent_to_image_decoder,
+    real_latent_to_image_decoder,
     compute_validation_metrics,
+    
 )
 
 ASSET_CONSUMER_FUNCTIONS = {
@@ -348,7 +350,8 @@ ASSET_CONSUMER_FUNCTIONS = {
     "text_encoder_v1": real_sdxl_text_encoder,
     "time_id_synthesizer_v1": real_time_id_synthesizer,
     "scale_tensor_synthesizer_v1": scale_tensor_synthesizer_v1,
-    "real_image_to_latent_encoder_v1": real_image_to_latent_encoder
+    "real_image_to_latent_encoder_v1": real_image_to_latent_encoder,
+    "real_latent_to_image_decoder": real_latent_to_image_decoder,
 }
 
 
@@ -500,6 +503,7 @@ STRATEGIZER_FUNCTION_MAP = {
     "plan_asset_workload": plan_asset_workload,
     "execute_asset_caching": execute_asset_caching,
     "assemble_training_dataset": assemble_training_dataset,
+    "compute_validation_metrics": compute_validation_metrics,
 }
 
 def execute_dag_from_manifest(manifest_path: Path) -> Dict[str, Any]:

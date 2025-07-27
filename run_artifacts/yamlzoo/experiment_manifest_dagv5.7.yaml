@@ -74,6 +74,8 @@ execution_graph:
           num_train_timesteps: 1000
           # The number of steps to sample from, for inference-like importance sampling.
           max_denoising_steps: 50
+          vram_safety_ratio: 0.8 # e.g., use 90% of total VRAM
+          stabilization_samples: 4 # Run each new batch size 3 times before trusting the VRAM reading
         text_encode_1:
           processing_category: "text_encoding"
           consumer_function: "text_encoder_v1"
@@ -86,6 +88,8 @@ execution_graph:
           # Point to the local directories downloaded by the new script.
           tokenizer_1_path: "./canon_configs/stabilityai__stable_diffusion_xl_base_1_0/tokenizer"
           tokenizer_2_path: "./canon_configs/stabilityai__stable_diffusion_xl_base_1_0/tokenizer_2"
+          vram_safety_ratio: 0.8 # e.g., use 90% of total VRAM
+          stabilization_samples: 4 # Run each new batch size 3 times before trusting the VRAM reading
         time_encode_1:
           processing_category: "temporal_encoding"
           consumer_function: "time_id_synthesizer_v1"
@@ -152,6 +156,8 @@ execution_graph:
           vae_key_prefix: 'first_stage_model.'
           input_types: ["image", "model_path", "config_path", "device", "dtype", "vae_key_prefix"]
           output_types: ["latent"]
+          vram_safety_ratio: 0.8 # e.g., use 90% of total VRAM
+          stabilization_samples: 4 # Run each new batch size 3 times before trusting the VRAM reading
       cache_files:
         latent: "./cache_decoupled/real_latents.safetensors"
     outputs:
