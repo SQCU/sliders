@@ -1,3 +1,4 @@
+#download_configs.py
 from huggingface_hub import snapshot_download
 import os
 
@@ -21,22 +22,21 @@ os.makedirs(CANON_CONFIGS_DIR, exist_ok=True)
 print("--- Yoinking Canon Configs and Tokenizers (Corrected Method) ---")
 
 for repo_id, patterns in CONFIG_MODELS.items():
-    repo_dir_name = repo_id.replace("/", "__")
+    # --- ** THE HUGGING FACE COMPATIBILITY FIX IS HERE ** ---
+    # We preemptively replace hyphens with underscores to match the library's
+    # internal, silent path-mangling logic. This ensures the paths we use
+    # in our YAML match the paths the library will actually try to access.
+    repo_dir_name = repo_id.replace("/", "__").replace("-", "_")
     target_dir = os.path.join(CANON_CONFIGS_DIR, repo_dir_name)
-    
-    # No need to create the target_dir beforehand, snapshot_download will do it.
+
     print(f"\nProcessing repo: {repo_id} -> {target_dir}")
 
     try:
-        # --- ** THE FIX IS HERE ** ---
-        # Call snapshot_download ONCE per repo, giving it the full list of patterns.
-        # This is the idiomatic and correct way to use the function.
         snapshot_download(
             repo_id=repo_id,
-            allow_patterns=patterns,       # Pass the entire list of files and globs
+            allow_patterns=patterns,
             local_dir=target_dir,
             local_dir_use_symlinks=False,
-            # It's also good practice to ignore other files that might match
             ignore_patterns=["*.md", ".gitattributes"],
         )
         print(f"  ... Success. All assets for {repo_id} downloaded.")

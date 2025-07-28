@@ -15,8 +15,7 @@ from torchvision import transforms
 import json
 import time
 import itertools
-
-
+import functools
 
 """
 A note from gemini 2.5:
@@ -394,7 +393,11 @@ from torchvision import transforms
 def sdxl_vae_image_preprocessor(item: Dict) -> Dict[str, torch.Tensor]:
     """Takes a data item, loads the image, and prepares it for the VAE."""
     #image_path = item['image_path']
-    image_path = item['input_data']['image']
+    #image_path = item['input_data']['image']
+    # Get the full primitive dictionary for the 'image' input.
+    image_primitive = item['input_data']['image']
+    # Extract the actual filepath from the 'data_path' key.
+    image_path = image_primitive['data_path']
     image = Image.open(image_path).convert("RGB")
     target_dtype = item.get('dtype', torch.bfloat16)
     # ... (all the necessary resizing, normalization, etc.) ...
@@ -420,6 +423,38 @@ def sdxl_vae_latent_preprocessor(item: Dict) -> Dict[str, torch.Tensor]:
         latent_tensor = f.get_tensor(latent_key)
         
     return {"latent": latent_tensor.to(dtype=item.get('dtype', torch.bfloat16))}
+
+def _sdxl_text_preprocessor_worker(item: Dict, tokenizer_1, tokenizer_2) -> Dict[str, torch.Tensor]:
+    """
+    [CORRECTED - v3] Implements the slider logic and then STACKS the
+    conditional and unconditional tokens into a single tensor for each encoder
+    to enable efficient batch processing on the accelerator.
+    """
+    # 1. Unpack and apply slider logic (unchanged)
+    prompt_primitive = item['input_data']['prompt']
+    prompt_recipe = prompt_primitive['data_content']
+    qualifier = prompt_primitive['qualifier']
+
+    conditional_text = ""
+    if qualifier == 'high_scale':
+        conditional_text = prompt_recipe.get('positive', '')
+    elif qualifier == 'low_scale':
+        conditional_text = prompt_recipe.get('neutral', '')
+    unconditional_text = prompt_recipe.get('unconditional', '')
+
+    # 2. Tokenize all four components individually first.
+    cond_tokens_1 = tokenizer_1(conditional_text, padding="max_length", max_length=tokenizer_1.model_max_length, truncation=True, return_tensors="pt").input_ids.squeeze()
+    cond_tokens_2 = tokenizer_2(conditional_text, padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True, return_tensors="pt").input_ids.squeeze()
+    uncond_tokens_1 = tokenizer_1(unconditional_text, padding="max_length", max_length=tokenizer_1.model_max_length, truncation=True, return_tensors="pt").input_ids.squeeze()
+    uncond_tokens_2 = tokenizer_2(unconditional_text, padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True, return_tensors="pt").input_ids.squeeze()
+
+    # --- THE ACCELERATOR EFFICIENCY FIX ---
+    # 3. Stack the cond/uncond pairs for each encoder.
+    # The output tensor for each tokenizer will have shape [2, 77].
+    tokens_1 = torch.stack([cond_tokens_1, uncond_tokens_1])
+    tokens_2 = torch.stack([cond_tokens_2, uncond_tokens_2])
+
+    return {"tokens_1": tokens_1, "tokens_2": tokens_2}
 
 
 # --- For Fictitious Text Encoding ---
@@ -583,8 +618,14 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
     # 1a. Get the full paths to the config FILES.
     # 1c. Instantiate the models by passing the config DICTIONARY.
     # This completely avoids all the library's path validation logic.
-    text_encoder_1 = CLIPTextModel.from_config(te1_config_dict)
-    text_encoder_2 = CLIPTextModelWithProjection.from_config(te2_config_dict)
+    # --- ** THE FIX IS HERE ** ---
+    # 1c. Create the specific 'Config' objects from the dictionaries.
+    # The 'transformers' library uses this two-step pattern.
+    te1_config = CLIPTextConfig.from_dict(te1_config_dict)
+    te2_config = CLIPTextConfig.from_dict(te2_config_dict)
+
+    text_encoder_1 = CLIPTextModel(te1_config)
+    text_encoder_2 = CLIPTextModelWithProjection(te2_config)
 
     tokenizer_1_path = os.path.abspath(kwargs.get('tokenizer_1_path'))
     tokenizer_2_path = os.path.abspath(kwargs.get('tokenizer_2_path'))
@@ -622,12 +663,15 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
     tokenizer_1 = CLIPTokenizer.from_pretrained(tokenizer_1_path)
     tokenizer_2 = CLIPTokenizer.from_pretrained(tokenizer_2_path)
     
-    # --- 5. The Rest of the Pipeline (unchanged) ---
-    def text_preprocessor(item: Dict) -> Dict[str, torch.Tensor]:
-        prompt = item['input_data']['prompt']
-        tokens_1 = tokenizer_1(prompt, padding="max_length", max_length=tokenizer_1.model_max_length, truncation=True, return_tensors="pt").input_ids
-        tokens_2 = tokenizer_2(prompt, padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True, return_tensors="pt").input_ids
-        return {"tokens_1": tokens_1.squeeze(), "tokens_2": tokens_2.squeeze()}
+    # Create a partial function. This "freezes" the tokenizer arguments into our
+    # pure worker function. The result is a new, simple callable that only
+    # requires the `item` argument, which matches the loader's API.
+    # This object is simple, pickle-safe, and has no hidden state.
+    text_preprocessor = functools.partial(
+        _sdxl_text_preprocessor_worker,
+        tokenizer_1=tokenizer_1,
+        tokenizer_2=tokenizer_2
+    )
 
     id_iterator, loader_iterator = itertools.tee(work_iterator)
     work_ids = [spec['work_id'] for spec in id_iterator]
@@ -639,7 +683,9 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
         "history": [],
         "latest_run_metrics": {}
     }
-    all_embeds, all_pooled = [], []
+    all_text_embeds_cond, all_text_embeds_uncond = [], []
+    all_pooled_embeds_cond, all_pooled_embeds_uncond = [], []
+
     while True:
         try:
             # 1. ADVISE: Get the next batch size to try.
@@ -649,18 +695,38 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
             # 2. TIME & FETCH: Start the timer and get the batch.
             start_time = time.time()
             on_device_batch = loader.get_next_batch()
+            batch_size = on_device_batch.shape[0]
 
             # 3. COMPUTE: The core model inference.
             with torch.no_grad():
-                prompt_embeds_1 = text_encoder_1(on_device_batch['tokens_1'], output_hidden_states=True).hidden_states[-2]
-                encoder_2_output = text_encoder_2(on_device_batch['tokens_2'], output_hidden_states=True)
-                prompt_embeds_2 = encoder_2_output.hidden_states[-2]
-                pooled_prompt_embeds = encoder_2_output.text_embeds
-            
-            final_prompt_embeds = torch.cat((prompt_embeds_1, prompt_embeds_2), dim=-1)
+                # --- THE CORRECTED, SPEC-COMPLIANT LOGIC ---
+                # 1. Prepare one large, efficient batch for each encoder.
+                tokens_1_batched = on_device_batch['tokens_1'].view(batch_size * 2, -1)
+                tokens_2_batched = on_device_batch['tokens_2'].view(batch_size * 2, -1)
+
+                # 2. Run Text Encoder 1 to get the 'text_embedding' asset.
+                text_embeds_all = text_encoder_1(tokens_1_batched, output_hidden_states=True).hidden_states[-2]
+
+                # 3. Run Text Encoder 2 to get the 'pooled_text_embedding' asset.
+                encoder_2_output_all = text_encoder_2(tokens_2_batched, output_hidden_states=True)
+                pooled_embeds_all = encoder_2_output_all.text_embeds # We ONLY care about the pooled output here.
+
+                # 4. Un-stack the results for the 'text_embedding' asset.
+                text_embeds_reshaped = text_embeds_all.view(2, batch_size, *text_embeds_all.shape[1:])
+                text_embeds_chunked = text_embeds_reshaped.chunk(2, dim=0)
+                cond_text_embeds = text_embeds_chunked[0].squeeze(0)
+                uncond_text_embeds = text_embeds_chunked[1].squeeze(0)
+
+                # 5. Un-stack the results for the 'pooled_text_embedding' asset.
+                pooled_embeds_reshaped = pooled_embeds_all.view(2, batch_size, -1)
+                pooled_embeds_chunked = pooled_embeds_reshaped.chunk(2, dim=0)
+                cond_pooled_embeds = pooled_embeds_chunked[0].squeeze(0)
+                uncond_pooled_embeds = pooled_embeds_chunked[1].squeeze(0)
+                # --- End of Fix ---
 
             # 4. MEASURE: Get timing and memory stats.
-            torch.cuda.synchronize(device)
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(device)
             duration = time.time() - start_time
             vram_peak_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
 
@@ -672,8 +738,10 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
             }
 
             # 6. STORE RESULTS: Append to CPU lists.
-            all_embeds.append(final_prompt_embeds.cpu())
-            all_pooled.append(pooled_prompt_embeds.cpu())
+            all_text_embeds_cond.append(cond_text_embeds.cpu())
+            all_text_embeds_uncond.append(uncond_text_embeds.cpu())
+            all_pooled_embeds_cond.append(cond_pooled_embeds.cpu())
+            all_pooled_embeds_uncond.append(uncond_pooled_embeds.cpu())
 
         except StopIteration:
             print("[Text Encoder] Finished processing all prompts.")
@@ -693,13 +761,25 @@ def real_sdxl_text_encoder(**kwargs) -> dict:
         calibration_state.get("bs_at_best_throughput", 0)
     )
 
-    final_embeds = torch.cat(all_embeds, dim=0)
-    final_pooled = torch.cat(all_pooled, dim=0)
+    final_text_embeds_cond = torch.cat(all_text_embeds_cond, dim=0)
+    final_text_embeds_uncond = torch.cat(all_text_embeds_uncond, dim=0)
+    final_pooled_embeds_cond = torch.cat(all_pooled_embeds_cond, dim=0)
+    final_pooled_embeds_uncond = torch.cat(all_pooled_embeds_uncond, dim=0)
     
-    results_by_work_id = {
-        work_id: {"text_embedding": final_embeds[i], "pooled_text_embedding": final_pooled[i]}
-        for i, work_id in enumerate(work_ids)
-    }
+    results_by_work_id = {}
+    for i, work_id in enumerate(work_ids):
+        results_by_work_id[work_id] = {
+            # Key 1: "text_embedding"
+            "text_embedding": {
+                "cond": final_text_embeds_cond[i],
+                "uncond": final_text_embeds_uncond[i]
+            },
+            # Key 2: "pooled_text_embedding"
+            "pooled_text_embedding": {
+                "cond": final_pooled_embeds_cond[i],
+                "uncond": final_pooled_embeds_uncond[i]
+            }
+        }
     return results_by_work_id
 
 
@@ -726,16 +806,24 @@ def real_time_id_synthesizer(**kwargs) -> dict:
 # --- TENSOR-COMPLIANT REPLACEMENT for scale_tensor_synthesizer_v1 ---
 def scale_tensor_synthesizer_v1(**kwargs) -> dict:
     """
-    [COMPLIANT] A simple function that now returns a torch.Tensor.
+    [CORRECTED] A simple function that now correctly unpacks the full
+    'scale_metadata' primitive dictionary to find the data_value.
     """
     data_iterator = kwargs['data_iterator']
     results = {}
 
     for spec in data_iterator:
         work_id = spec['work_id']
-        scale_metadata = spec['input_data']['scale_metadata']
-        # The core logic is tiny, but it's now wrapped to be compliant.
-        results[work_id] = {"scales_tensor": torch.tensor(scale_metadata)}
+
+        # --- THE FIX IS HERE ---
+        # 1. Get the full primitive dictionary.
+        scale_metadata_primitive = spec['input_data']['scale_metadata']
+        # 2. Extract the actual numerical value from the 'data_value' key.
+        scale_value = scale_metadata_primitive['data_value']
+        # --- End of Fix ---
+
+        # The core logic now uses the correctly extracted value.
+        results[work_id] = {"scales_tensor": torch.tensor(scale_value)}
 
     return results
 
@@ -822,7 +910,8 @@ def real_latent_to_image_decoder(**kwargs) -> dict:
                 # Denormalize from [-1, 1] to [0, 1] for metrics/saving
                 images = (images / 2 + 0.5).clamp(0, 1)
 
-            torch.cuda.synchronize(device)
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(device)
             duration = time.time() - start_time
             vram_peak_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
 
@@ -968,7 +1057,8 @@ def real_denoise_input_encoder(**kwargs) -> dict:
             unet_timesteps = timesteps
             
             # CALIB4. MEASURE
-            torch.cuda.synchronize(device)
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(device)
             duration = time.time() - start_time
             vram_peak_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
 

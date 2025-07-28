@@ -79,15 +79,16 @@ execution_graph:
         text_encode_1:
           processing_category: "text_encoding"
           consumer_function: "text_encoder_v1"
-          input_types: ["prompt"]
+          input_types: ["prompt"]   #prompt recipes aren't 'text' or 'string'. they're 'prompt'.
           output_types: ["text_embedding", "pooled_text_embedding"]
+          device: "cuda" 
           model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
           # ** THE FIX **: Paths now point to the local canon_configs directories.
-          text_encoder_1_config_path: "./canon_configs/stabilityai__stable_diffusion_xl_base_1_0/text_encoder/config.json"
-          text_encoder_2_config_path: "./canon_configs/stabilityai__stable_diffusion_xl_base_1_0/text_encoder_2/config.json"
+          text_encoder_1_config_path: "./canon_configs/stabilityai__stable-diffusion-xl-base-1.0/text_encoder/config.json"
+          text_encoder_2_config_path: "./canon_configs/stabilityai__stable-diffusion-xl-base-1.0/text_encoder_2/config.json"
           # Point to the local directories downloaded by the new script.
-          tokenizer_1_path: "./canon_configs/stabilityai__stable_diffusion_xl_base_1_0/tokenizer"
-          tokenizer_2_path: "./canon_configs/stabilityai__stable_diffusion_xl_base_1_0/tokenizer_2"
+          tokenizer_1_path: "./canon_configs/stabilityai__stable-diffusion-xl-base-1.0/tokenizer"
+          tokenizer_2_path: "./canon_configs/stabilityai__stable-diffusion-xl-base-1.0/tokenizer_2"
           vram_safety_ratio: 0.8 # e.g., use 90% of total VRAM
           stabilization_samples: 4 # Run each new batch size 3 times before trusting the VRAM reading
         time_encode_1:

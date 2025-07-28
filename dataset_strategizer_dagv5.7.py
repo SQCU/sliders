@@ -301,7 +301,11 @@ def plan_asset_workload(own_config: Dict, **upstream_data) -> Dict[str, Any]:
                     work_specifications.append({
                         "work_id": work_id,
                         "required_capabilities": capability,
-                        "input_data": {p['type']: p.get('data_path') or p.get('data_value') or p.get('data_content') for p in primitive_bundle},
+                        # --- THE MINIMAL, CORRECT FIX ---
+                        # Instead of extracting one value, we pass the ENTIRE
+                        # primitive dictionary for each type. Layer 3 remains
+                        # agnostic to its contents.
+                        "input_data": {p['type']: p for p in primitive_bundle},
                         "expected_outputs": capability['output_types']
                     })
 
@@ -413,14 +417,31 @@ def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
 
         # Instead of writing here, we collect the tensors.
         for work_id, assets in results_by_work_id.items():
-            for asset_type, tensor_data in assets.items():
-                target_cache_file = cache_files_config.get(asset_type, "default_cache.safetensors")
-                location_in_file = f"{work_id}_{asset_type}"
-                
-                # Update the manifest with the planned location.
-                cache_manifest[(work_id, asset_type)] = (target_cache_file, location_in_file)
-                # Stage the tensor for writing.
-                tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
+            for asset_type, asset_data in assets.items():
+                # Check if the asset data is a dictionary (our nested case)
+                if isinstance(asset_data, dict):
+                    # If it's a dict, iterate through its key-value pairs
+                    for sub_key, tensor_data in asset_data.items():
+                        # Create a new, unique asset type for the manifest
+                        # e.g., 'text_embedding_cond'
+                        flattened_asset_type = f"{asset_type}_{sub_key}"
+                        # Find the target file based on the ORIGINAL asset type
+                        target_cache_file = cache_files_config.get(asset_type, "default_cache.safetensors")
+                        # Create a unique key for within the safetensors file
+                        location_in_file = f"{work_id}_{flattened_asset_type}"
+                        # Update the manifest with the planned location.
+                        # The manifest key uses the new, flattened asset type.
+                        cache_manifest[(work_id, flattened_asset_type)] = (target_cache_file, location_in_file)
+                        # Stage the tensor for writing.
+                        tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
+                else:
+                    # This is the original path for simple, non-nested tensor assets.
+                    tensor_data = asset_data
+                    target_cache_file = cache_files_config.get(asset_type, "default_cache.safetensors")
+                    location_in_file = f"{work_id}_{asset_type}"
+                    
+                    cache_manifest[(work_id, asset_type)] = (target_cache_file, location_in_file)
+                    tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
 
     # --- STEP 2: Perform batched WRITES to disk ---
     print("  - All asset functions executed. Writing caches to disk...")
