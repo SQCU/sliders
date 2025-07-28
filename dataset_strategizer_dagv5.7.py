@@ -420,27 +420,31 @@ def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
             for asset_type, asset_data in assets.items():
                 # Check if the asset data is a dictionary (our nested case)
                 if isinstance(asset_data, dict):
-                    # If it's a dict, iterate through its key-value pairs
+                    # This is our nested asset (e.g., text_embedding).
+                    # We will save the inner tensors flatly, but build a structured
+                    # entry in the cache manifest.
+                    # tragically safetensors forces us to explicitly 
+                    # assemble non-flat-metadata as we serialize
+
+                    location_recipe = {}
                     for sub_key, tensor_data in asset_data.items():
-                        # Create a new, unique asset type for the manifest
-                        # e.g., 'text_embedding_cond'
-                        flattened_asset_type = f"{asset_type}_{sub_key}"
-                        # Find the target file based on the ORIGINAL asset type
-                        target_cache_file = cache_files_config.get(asset_type, "default_cache.safetensors")
-                        # Create a unique key for within the safetensors file
-                        location_in_file = f"{work_id}_{flattened_asset_type}"
-                        # Update the manifest with the planned location.
-                        # The manifest key uses the new, flattened asset type.
-                        cache_manifest[(work_id, flattened_asset_type)] = (target_cache_file, location_in_file)
-                        # Stage the tensor for writing.
+                        # Save the inner tensor to a flat key.
+                        location_in_file = f"{work_id}_{asset_type}_{sub_key}"
                         tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
+                        
+                        # Add the location of this sub-tensor to our recipe.
+                        location_recipe[sub_key] = f"loc:{target_cache_file}|key:{location_in_file}"
+                    
+                    # The manifest entry for the LOGICAL asset 'text_embedding'
+                    # is now the RECIPE for how to assemble it.
+                    cache_manifest[(work_id, asset_type)] = location_recipe
                 else:
                     # This is the original path for simple, non-nested tensor assets.
                     tensor_data = asset_data
                     target_cache_file = cache_files_config.get(asset_type, "default_cache.safetensors")
                     location_in_file = f"{work_id}_{asset_type}"
                     
-                    cache_manifest[(work_id, asset_type)] = (target_cache_file, location_in_file)
+                    cache_manifest[(work_id, asset_type)] = f"loc:{target_cache_file}|key:{location_in_file}"
                     tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
 
     # --- STEP 2: Perform batched WRITES to disk ---
@@ -465,8 +469,11 @@ def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
         # Combine existing tensors with the new ones, letting new ones take precedence.
         final_tensors = {**existing_tensors, **tensors_to_write}
 
-        # Save all tensors to the file in one operation.
-        safetensors.torch.save_file(final_tensors, output_path)
+        # write new accumulated tensors to temprorary output file
+        temp_output_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+        safetensors.torch.save_file(final_tensors, temp_output_path)
+        # commit changes by replacing pre-union cache with post-union cache
+        os.replace(temp_output_path, output_path)
 
     print(f"  - Caching complete. Generated manifest with {len(cache_manifest)} asset locations.")
     return {'asset_cache_manifest': cache_manifest}
@@ -498,9 +505,13 @@ def assemble_training_dataset(own_config: Dict, **upstream_data) -> Dict[str, An
                 
                 manifest_key = (work_id, asset_type)
                 if manifest_key in cache_manifest:
-                    filepath, key_in_file = cache_manifest[manifest_key]
-                    batch[final_key] = f"loc:{filepath}|key:{key_in_file}"
+                    # --- THE FIX IS HERE ---
+                    # The value from the manifest can now be a string OR a dictionary (our recipe).
+                    asset_location_info = cache_manifest[manifest_key]
+                    batch[final_key] = asset_location_info
+                    # --- End of Fix ---
                 else:
+                    # This part remains the same.
                     print(f"  - WARNING: Missing cached asset for work_id '{work_id}' (asset: {asset_type}).")
                     all_assets_found = False
                     break
