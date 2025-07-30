@@ -1,8 +1,9 @@
-# FFW13: dataset_strategizer_dagv5.7.py
+# FFW13: dataset_strategizer_dagv5.8.py
 # This version is a complete architectural refactor to enforce strict layer separation
 # as per the "Semantic Layer Specifications" and the provided critique.
-# python dataset_strategizer_dagv5.7.py >> dset_strat_dagv5.7.txt 2>&1
+# uv run python dataset_strategizer_dagv5.8.py >> dset_strat_dagv5.8.txt 2>&1
 
+import json
 import yaml
 from pathlib import Path
 from collections import defaultdict
@@ -17,6 +18,9 @@ from discovery_scanner import discover_data_pool
 import multiprocessing as mp # <--- ADD THIS IMPORT AT THE TOP
 import safetensors
 
+#disable nuisanceware logprints by library developers who don't know right from wrong
+import warnings
+import re
 
 # --- Layer 1: Model Asset Registry (Interface Contract Definition) ---
 # ARCH-FIX: VIOLATION 1 & 3 FIXED.
@@ -89,7 +93,7 @@ DATA_CONSUMER_REGISTRY = {
             }
         ]
     },
-    'SDXL_VAE_Decoder': {
+    'SDXL_VAE_Encoder': {
         'required_assets': [
             {
                 "asset_type": "latent",
@@ -97,6 +101,19 @@ DATA_CONSUMER_REGISTRY = {
                     "processing_category": "image_to_latent_encoding",
                     "input_types": ["image"],
                     "output_types": ["latent"]
+                }
+            }
+        ]
+    },
+    # --- VAE DECODING TASK (CORRECTLY NAMED) ---
+    'SDXL_VAE_Decoder': {
+        'required_assets': [
+            {
+                "asset_type": "decoded_image",
+                "capability_requirements": {
+                    "processing_category": "latent_to_image_decoding",
+                    "input_types": ["latent"],
+                    "output_types": ["decoded_image"]
                 }
             }
         ]
@@ -254,6 +271,93 @@ def discover_slider_pairs_from_filesystem(own_config: Dict, **kwargs) -> Dict[st
     # The output is PURE DATA, not configuration, with the key expected by the DAG.
     return {'source_data_stream': generator()}
 
+def discover_reconstruction_pairs_from_manifests(own_config: Dict, **upstream_data) -> Dict[str, Any]:
+    """
+    LAYER 2 (CORRECTED): Discovers (original, reconstructed) image pairs by tracing
+    the lineage of work_ids through the encoding and decoding plans.
+    """
+    print("[LAYER 2] Discovering reconstruction pairs from manifests...")
+    # Input 1: The original plan to encode images. This links an original image path to an 'encode_work_id'.
+    encoding_plan = upstream_data['source_plan']
+    # Input 2: The plan that DECODED the latents. This links a 'decode_work_id' back to an 'encode_work_id'.
+    decoding_plan = upstream_data['decoding_plan']
+    # Input 3: The final manifest. This links a 'decode_work_id' to a reconstructed image location.
+    reconstructed_manifest = upstream_data['reconstructed_asset_manifest']
+
+    # --- THE FIX ---
+    # 1. Create a lookup map of {encode_work_id -> original_image_path}
+    encode_id_to_path = {
+        spec['work_id']: spec['input_data']['image']['data_path']
+        for spec in encoding_plan
+    }
+
+    # 2. Create a lookup map of {decode_work_id -> reconstructed_image_location}
+    decode_id_to_location = {
+        work_id: loc
+        for (work_id, asset_type), loc in reconstructed_manifest.items()
+        if asset_type == 'reconstructed_image' # Make sure we only get the right assets
+    }
+
+    def generator() -> Iterator[Dict]:
+        # 3. Iterate through the DECODING plan, which contains the critical link.
+        for decode_spec in decoding_plan:
+            decode_work_id = decode_spec['work_id']
+
+            # 4. Extract the original 'encode_work_id' from the latent's key.
+            # The key is structured like: 'ENCODE_WORK_ID_latent'
+            latent_location = decode_spec['input_data']['latent']['data_location']
+            latent_key = {p.split(':')[0]: p.split(':')[1] for p in latent_location.split('|')}['key']
+            # Split the key and take the first part, which is the original encode_work_id
+            original_encode_id = latent_key.split('_latent')[0]
+
+            # 5. Use the IDs to look up the paths/locations in our maps.
+            if original_encode_id in encode_id_to_path and decode_work_id in decode_id_to_location:
+                original_path = encode_id_to_path[original_encode_id]
+                recon_location = decode_id_to_location[decode_work_id]
+
+                # Yield a standard primitive package for the validation planner.
+                yield {
+                    "source_identifier": original_encode_id, # Use original ID for consistency
+                    "primitives": [
+                        {"qualifier": "original", "type": "original_image", "data_path": original_path},
+                        {"qualifier": "reconstructed", "type": "reconstructed_image", "data_location": recon_location}
+                    ]
+                }
+
+    print(f"  - Tracing lineage for {len(decoding_plan)} decoded images.")
+    return {'source_data_stream': generator()}
+
+# this is a good example of a layer 2 function!
+def discover_assets_from_manifest(own_config: Dict, **upstream_data) -> Dict[str, Any]:
+    """
+    LAYER 2: A generic discovery function that turns an asset manifest into a
+    source_data_stream. It treats each asset in the manifest as a new primitive.
+    """
+    print("[LAYER 2] Discovering assets from an upstream manifest...")
+    asset_manifest = upstream_data['asset_manifest']
+    asset_type_to_find = own_config['asset_type_to_find']
+    primitive_type_label = own_config['primitive_type_label']
+
+    def generator() -> Iterator[Dict]:
+        # We iterate through the manifest, which is the ground truth of what was created.
+        for (work_id, asset_type), location_str in asset_manifest.items():
+            if asset_type == asset_type_to_find:
+                # For each matching asset, we create a new data item for the planner.
+                yield {
+                    "source_identifier": work_id,
+                    "primitives": [
+                        {
+                           "qualifier": "reconstruction_source",
+                           "type": primitive_type_label,
+                           # The "data" for this primitive is its location in the cache.
+                           "data_location": location_str
+                        }
+                    ]
+                }
+
+    print(f"  - Discovering assets of type '{asset_type_to_find}' from manifest.")
+    return {'source_data_stream': generator()}
+
 # --- Layer 3: Work Planning Engine (v5.5 - Final Revision) ---
 
 def plan_asset_workload(own_config: Dict, **upstream_data) -> Dict[str, Any]:
@@ -300,6 +404,7 @@ def plan_asset_workload(own_config: Dict, **upstream_data) -> Dict[str, Any]:
 
             for primitive_bundle in itertools.product(*candidate_primitives_per_type):
                 def get_primitive_data_as_string(p):
+                    if 'data_location' in p: return str(p['data_location'])
                     if 'data_path' in p: return str(p['data_path'])
                     if 'data_value' in p: return str(p['data_value'])
                     if 'data_content' in p: return str(p['data_content'])
@@ -356,7 +461,6 @@ from d_dset_functions import (
     scale_tensor_synthesizer_v1,
     real_image_to_latent_encoder,
     real_latent_to_image_decoder,
-    real_latent_to_image_decoder,
     compute_validation_metrics,
     
 )
@@ -366,8 +470,9 @@ ASSET_CONSUMER_FUNCTIONS = {
     "text_encoder_v1": real_sdxl_text_encoder,
     "time_id_synthesizer_v1": real_time_id_synthesizer,
     "scale_tensor_synthesizer_v1": scale_tensor_synthesizer_v1,
-    "real_image_to_latent_encoder_v1": real_image_to_latent_encoder,
+    "real_image_to_latent_encoder": real_image_to_latent_encoder,
     "real_latent_to_image_decoder": real_latent_to_image_decoder,
+    "compute_validation_metrics": compute_validation_metrics,
 }
 
 
@@ -405,6 +510,10 @@ def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
     cache_manifest: Dict[Tuple[str, str], Tuple[str, str]] = {}
     # This new dictionary will collect all tensors to be written to each file.
     tensors_to_write_by_file = defaultdict(dict)
+
+    metadata_to_write_by_file = defaultdict(lambda: defaultdict(dict))
+    # This will hold the metadata dictionaries to be written to each cache file.
+    # The structure will be: { "filename.safetensors": {"aggregates": {...}} }
     print(f"  - Received {len(work_specs)} generic work specifications.")
 
     # Group work by the target consumer function
@@ -427,37 +536,56 @@ def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
         
         results_by_work_id = consumer_func(**kwargs_for_consumer)
 
-        # Instead of writing here, we collect the tensors.
-        for work_id, assets in results_by_work_id.items():
-            for asset_type, asset_data in assets.items():
-                # Check if the asset data is a dictionary (our nested case)
-                if isinstance(asset_data, dict):
-                    # This is our nested asset (e.g., text_embedding).
-                    # We will save the inner tensors flatly, but build a structured
-                    # entry in the cache manifest.
-                    # tragically safetensors forces us to explicitly 
-                    # assemble non-flat-metadata as we serialize
+        #new bespoke functionality which supports metadata mapping tensors
+        #  *written into our cachefiles in the safetensors configheader*!!!
+        if "aggregate_result" in results_by_work_id:
+            agg_data = results_by_work_id["aggregate_result"]
+            tensor_dict = agg_data["asset_data"]
+            asset_type = agg_data["asset_type"]
+            contributing_ids = agg_data["contributing_work_ids"]
 
-                    location_recipe = {}
-                    for sub_key, tensor_data in asset_data.items():
-                        # Save the inner tensor to a flat key.
-                        location_in_file = f"{work_id}_{asset_type}_{sub_key}"
-                        tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
-                        
-                        # Add the location of this sub-tensor to our recipe.
-                        location_recipe[sub_key] = f"loc:{target_cache_file}|key:{location_in_file}"
-                    
-                    # The manifest entry for the LOGICAL asset 'text_embedding'
-                    # is now the RECIPE for how to assemble it.
-                    cache_manifest[(work_id, asset_type)] = location_recipe
-                else:
-                    # This is the original path for simple, non-nested tensor assets.
-                    tensor_data = asset_data
+            target_cache_file = cache_files_config.get(asset_type, "default_cache.safetensors")
+            agg_id = hashlib.sha1("".join(sorted(contributing_ids)).encode()).hexdigest()
+
+            # --- THE KEY CHANGE IS HERE ---
+            # Create the metadata payload we WANT to store.
+            metadata_payload = {
+                "asset_type": asset_type,
+                "contributing_work_ids": contributing_ids
+            }
+            # Serialize the entire payload into a single JSON string.
+            # The key is the aggregate asset ID, the value is the string.
+            metadata_to_write_by_file[target_cache_file][agg_id] = json.dumps(metadata_payload)
+            # --- End of Change ---
+
+            location_recipe = {}
+            for sub_key, tensor_data in tensor_dict.items():
+                location_in_file = f"{agg_id}_{asset_type}_{sub_key}"
+                tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
+                location_recipe[sub_key] = f"loc:{target_cache_file}|key:{location_in_file}"
+            
+            for c_id in contributing_ids:
+                cache_manifest[(c_id, asset_type)] = location_recipe
+
+        # Path 2: Handle all "normal" any_in -> tensor_out functions.
+        else:
+            for work_id, assets in results_by_work_id.items():
+                for asset_type, asset_data in assets.items():
                     target_cache_file = cache_files_config.get(asset_type, "default_cache.safetensors")
-                    location_in_file = f"{work_id}_{asset_type}"
-                    
-                    cache_manifest[(work_id, asset_type)] = f"loc:{target_cache_file}|key:{location_in_file}"
-                    tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
+                    # Check if the asset data is a dictionary (our nested case)
+                    if isinstance(asset_data, dict):
+                        location_recipe = {}
+                        for sub_key, tensor_data in asset_data.items():
+                            location_in_file = f"{work_id}_{asset_type}_{sub_key}"
+                            tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
+                            location_recipe[sub_key] = f"loc:{target_cache_file}|key:{location_in_file}"
+                        cache_manifest[(work_id, asset_type)] = location_recipe
+                    else:
+                        # This is the original path for simple, non-nested tensor assets.
+                        tensor_data = asset_data
+                        location_in_file = f"{work_id}_{asset_type}"
+                        cache_manifest[(work_id, asset_type)] = f"loc:{target_cache_file}|key:{location_in_file}"
+                        tensors_to_write_by_file[target_cache_file][location_in_file] = tensor_data
 
     # --- STEP 2: Perform batched WRITES to disk ---
     print("  - All asset functions executed. Writing caches to disk...")
@@ -465,9 +593,6 @@ def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
         if not tensors_to_write: continue
         
         print(f"    - Writing {len(tensors_to_write)} assets to {target_file}")
-        
-        # ** THE FIX **: Ensure the directory exists before trying to write the file.
-        # This uses pathlib for platform-independent path handling.
         output_path = Path(target_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -477,14 +602,17 @@ def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
             with safetensors.safe_open(output_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     existing_tensors[key] = f.get_tensor(key)
+                existing_metadata = f.metadata() if f.metadata() is not None else {}
         
-        # Combine existing tensors with the new ones, letting new ones take precedence.
         final_tensors = {**existing_tensors, **tensors_to_write}
 
-        # write new accumulated tensors to temprorary output file
+        # --- THE FINAL METADATA MERGE ---
+        new_metadata_for_this_file = metadata_to_write_by_file.get(target_file, {})
+        # Now it's a simple, flat dictionary merge. No deep nesting needed.
+        final_metadata = {**existing_metadata, **new_metadata_for_this_file}
+
         temp_output_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
-        safetensors.torch.save_file(final_tensors, temp_output_path)
-        # commit changes by replacing pre-union cache with post-union cache
+        safetensors.torch.save_file(final_tensors, temp_output_path, metadata=final_metadata)
         os.replace(temp_output_path, output_path)
 
     print(f"  - Caching complete. Generated manifest with {len(cache_manifest)} asset locations.")
@@ -544,10 +672,12 @@ def assemble_training_dataset(own_config: Dict, **upstream_data) -> Dict[str, An
 STRATEGIZER_FUNCTION_MAP = {
     "get_required_asset_spec": get_required_asset_spec,
     "discover_slider_pairs_from_filesystem": discover_slider_pairs_from_filesystem,
+    "discover_reconstruction_pairs_from_manifests": discover_reconstruction_pairs_from_manifests,
     "plan_asset_workload": plan_asset_workload,
     "execute_asset_caching": execute_asset_caching,
     "assemble_training_dataset": assemble_training_dataset,
     "compute_validation_metrics": compute_validation_metrics,
+    'discover_assets_from_manifest': discover_assets_from_manifest,
 }
 
 def execute_dag_from_manifest(manifest_path: Path) -> Dict[str, Any]:
@@ -610,9 +740,38 @@ def execute_dag_from_manifest(manifest_path: Path) -> Dict[str, Any]:
 
 # --- Main for Self-Testing ---
 def main():
-    # ARCH-FIX: Point to the new, architecturally correct manifest.
+
+    # --- BEGIN WARNING SUPPRESSION PATCH ---
+    # This section silences specific, high-volume warnings that are not relevant
+    # to this workflow and only add noise to the logs.
+
+    # 1. Silence the torchmetrics `torch.load` pickle warning.
+    # Rationale: We are providing our own model files and operate in an environment
+    # where we already trust the code and artifacts being used.
+    warnings.filterwarnings(
+        "ignore",
+        message=".*You are using `torch.load` with `weights_only=False`.*",
+        category=FutureWarning,
+        module="torchmetrics.*"
+    )
+
+    # 2. Silence the `torch.tensor(sourceTensor)` copy warning.
+    # Rationale: This warning is for performance optimization in computation graphs.
+    # We are using torch.tensor to create detached data-holding tensors, where
+    # this specific copy pattern is intentional and correct.
+    warnings.filterwarnings(
+        "ignore",
+        message=".*To copy construct from a tensor, it is recommended to use.*",
+        category=UserWarning
+    )
+    # --- END WARNING SUPPRESSION PATCH ---
+    
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-m', '--manifest', default="run_artifacts/yamlzoo/experiment_manifest_dagv5.8.yaml")
+    args = parser.parse_args()
     project_root = Path(os.getcwd())
-    manifest_path = project_root / "run_artifacts" / "yamlzoo" / "experiment_manifest_dagv5.7.yaml"
+    manifest_path = project_root / args.manifest
     print(f"--- Executing Refactored DAG from: {manifest_path} ---")
     try:
         final_results = execute_dag_from_manifest(manifest_path)

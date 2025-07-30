@@ -409,20 +409,40 @@ def sdxl_vae_image_preprocessor(item: Dict) -> Dict[str, torch.Tensor]:
     image_tensor = image_tensor.to(dtype=target_dtype)
     return {"image": image_tensor}
 
-def sdxl_vae_latent_preprocessor(item: Dict) -> Dict[str, torch.Tensor]:
+def sdxl_vae_latent_preprocessor(item: Dict, dtype: torch.dtype) -> Dict[str, torch.Tensor]:
     """
-    Takes a data item and loads the latent tensor from its safetensor file.
-    Assumes the work spec's input_data contains a path to a safetensors file
-    and the key for the tensor within it.
+    [DEBUG LOGGING ADDED] Takes a data item and loads the latent tensor from its
+    safetensor file by parsing the 'data_location' string.
     """
-    latent_cache_path = item['input_data']['latent_file']
-    latent_key = item['input_data']['latent_key']
-    
-    # safe_open is more memory efficient for loading a single tensor from a large file
-    with safetensors.safe_open(latent_cache_path, framework="pt", device="cpu") as f:
-        latent_tensor = f.get_tensor(latent_key)
-        
-    return {"latent": latent_tensor.to(dtype=item.get('dtype', torch.bfloat16))}
+    try:
+        # --- NEW LOGGING ---
+        logstr=""
+        work_id = item.get('work_id', 'Unknown')
+        logstr+=f"  [Preprocessor] Processing work_id: {work_id}"
+        logstr+=f"    - DEBUG: Keys in item['input_data']: {item['input_data'].keys()}"
+        latent_primitive = item['input_data']['latent']
+        logstr+=f"    - DEBUG: Keys in latent_primitive: {latent_primitive.keys()}"
+        loc_str = latent_primitive['data_location']
+        logstr+=f"    - Found data_location string: {loc_str}"
+
+        loc_parts = {p.split(':')[0]: p.split(':')[1] for p in loc_str.split('|')}
+        latent_cache_path = loc_parts['loc']
+        latent_key = loc_parts['key']
+        logstr+=f"    - Parsed path='{latent_cache_path}', key='{latent_key}'"
+
+        with safetensors.safe_open(latent_cache_path, framework="pt", device="cpu") as f:
+            latent_tensor = f.get_tensor(latent_key)
+
+        logstr+=f"    - SUCCESS: Loaded latent tensor of shape {latent_tensor.shape}."
+        return {"latent": latent_tensor.to(dtype=dtype)}
+
+    except Exception as e:
+        # --- NEW LOGGING ---
+        # This will catch ANY error during preprocessing and print it explicitly.
+        print(f"  [Preprocessor] ERROR processing work_id '{item.get('work_id', 'N/A')}': {e}")
+        print(f"logstring:"+logstr)
+        # Re-raise the exception to make sure the loader's own error handling catches it.
+        raise e
 
 def _sdxl_text_preprocessor_worker(item: Dict, tokenizer_1, tokenizer_2) -> Dict[str, torch.Tensor]:
     """
@@ -827,126 +847,6 @@ def scale_tensor_synthesizer_v1(**kwargs) -> dict:
 
     return results
 
-
-# NEW FUNCTION PER CLAUDE SPEC
-def real_latent_to_image_decoder(**kwargs) -> dict:
-    """
-    Decodes latent tensors back into images using a VAE. Follows the same
-    high-performance, batch-calibrating pattern as the encoder.
-    """
-    # --- Standard setup from kwargs ---
-    model_path = kwargs.get('model_path')
-    config_path = kwargs.get('config_path')
-    device = kwargs.get('device', 'cpu')
-    dtype_str = kwargs.get('dtype', 'bfloat16')
-    work_iterator = kwargs['data_iterator']
-    torch_dtype = torch.float32 if dtype_str == 'float32' else torch.bfloat16
-
-    # VAE LOADING
-    # --- 1. Load the raw state dictionary and all its keys ---
-    raw_vae_keys = {}
-    with safetensors.safe_open(model_path, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            if key.startswith("first_stage_model."):
-                raw_vae_keys[key] = f.get_tensor(key)
-
-    # --- 2. Infer format and apply MAPPING AND RESHAPING EXPLICITLY ---
-    inferred_format = infer_vae_sdxl_state_dict_format(set(raw_vae_keys.keys()))
-    working_state_dict = {}
-    
-    print("\n" + "="*80)
-    print("== [MODEL LOADER] Key Format Inference Report")
-    print(f"==  - Model Path: {os.path.basename(model_path)}")
-    print(f"==  - Inferred Format: '{inferred_format}'")
-
-    if inferred_format == "A1111_KOHYA":
-        print("==  - Action: Applying full 'A1111_KOHYA_TO_DIFFUSERS' state_dict transformation.")
-        # ** THE REFACTOR **: A single, clean call to the new, powerful translator.
-        working_state_dict = translate_a1111_vae_to_diffusers(raw_vae_keys)
-    elif inferred_format == "Diffusers":
-        print("==  - Action: No key transformation needed. Loading keys as-is.")
-        working_state_dict = raw_vae_keys # Already filtered for VAE keys
-    else:
-        print("==  - WARNING: Unknown format. Attempting to load keys as-is. This may fail.")
-        working_state_dict = raw_vae_keys
-    print("="*80 + "\n")
-
-    # --- 3. Load the model with the corrected state dict ---
-    with open(config_path, 'r') as f:
-        vae_config = json.load(f)
-    vae = AutoencoderKL.from_config(vae_config)
-    vae.load_state_dict(working_state_dict, strict=True) # This will now succeed
-    vae.to(device=device, dtype=torch_dtype).eval()
-
-    # --- 2. Setup Pipeline for decoding ---
-    id_iterator, loader_iterator = itertools.tee(work_iterator)
-    work_ids = [spec['work_id'] for spec in id_iterator]
-
-    loader = PipelinedTensorDictLoader(
-        raw_data_iterator=loader_iterator,
-        preprocessing_fn=sdxl_vae_latent_preprocessor, # Use latent preprocessor
-        device=device,
-        initial_bs=1
-    )
-    calibration_state = {
-        "config": {"vram_safety_ratio": 0.8, "device": device},
-        "history": [],
-        "latest_run_metrics": {}
-    }
-    all_results = []
-    
-    # 3. Run the internal processing loop
-    while True:
-        try:
-            next_bs, calibration_state = advise_next_batch_size(calibration_state)
-            loader.set_batch_size(next_bs)
-            start_time = time.time()
-            on_device_batch = loader.get_next_batch()
-            
-            with torch.no_grad():
-                # The core decoding operation
-                latents = on_device_batch['latent']
-                images = vae.decode(latents / vae.config.scaling_factor).sample
-                # Denormalize from [-1, 1] to [0, 1] for metrics/saving
-                images = (images / 2 + 0.5).clamp(0, 1)
-
-            if device.startswith("cuda"):
-                torch.cuda.synchronize(device)
-            duration = time.time() - start_time
-            vram_peak_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
-
-            calibration_state["latest_run_metrics"] = {
-                "bs": on_device_batch.shape[0], "duration": duration, "vram_peak_gb": vram_peak_gb
-            }
-            all_results.append(images.cpu())
-
-        except StopIteration:
-            print("[VAE Decoder] Finished processing all latents.")
-            break
-        except torch.cuda.OutOfMemoryError:
-            print(f"  [Batch Advisor] CUDA OOM detected at BS={next_bs}. Forcing downsearch.")
-            torch.cuda.empty_cache()
-            calibration_state["latest_run_metrics"] = {"bs": on_device_batch.shape[0], "duration": float('inf'), "vram_peak_gb": float('inf')}
-            continue
-            
-    loader.close()
-
-    print_batch_size_summary(
-        calibration_state.get("history", []),
-        calibration_state.get("best_throughput", 0),
-        calibration_state.get("bs_at_best_throughput", 0)
-    )
-
-    # 4. Collate and return results
-    final_images = torch.cat(all_results, dim=0)
-    print(f"--- [VAE Decoder] Complete. Produced final image tensor of shape: {final_images.shape} ---")
-    results_by_work_id = {
-        work_id: {"decoded_image": final_images[i]}
-        for i, work_id in enumerate(work_ids)
-    }
-    return results_by_work_id
-
-
 def real_denoise_input_encoder(**kwargs) -> dict:
     """
     [REAL - CORRECTED] Encodes images to latents, selects timesteps, and adds noise.
@@ -1096,73 +996,255 @@ def real_denoise_input_encoder(**kwargs) -> dict:
     }
     return results_by_work_id
 
+
+
 # NEW FUNCTION PER CLAUDE SPEC
+def real_latent_to_image_decoder(**kwargs) -> dict:
+    """
+    Decodes latent tensors back into images using a VAE. Follows the same
+    high-performance, batch-calibrating pattern as the encoder.
+    """
+    # --- Standard setup from kwargs ---
+    model_path = kwargs.get('model_path')
+    config_path = kwargs.get('config_path')
+    device = kwargs.get('device', 'cpu')
+    dtype_str = kwargs.get('dtype', 'bfloat16')
+    work_iterator = kwargs['data_iterator']
+    torch_dtype = torch.float32 if dtype_str == 'float32' else torch.bfloat16
+
+    # VAE LOADING
+    # --- 1. Load the raw state dictionary and all its keys ---
+    raw_vae_keys = {}
+    with safetensors.safe_open(model_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if key.startswith("first_stage_model."):
+                raw_vae_keys[key] = f.get_tensor(key)
+
+    # --- 2. Infer format and apply MAPPING AND RESHAPING EXPLICITLY ---
+    inferred_format = infer_vae_sdxl_state_dict_format(set(raw_vae_keys.keys()))
+    working_state_dict = {}
+    
+    print("\n" + "="*80)
+    print("== [MODEL LOADER] Key Format Inference Report")
+    print(f"==  - Model Path: {os.path.basename(model_path)}")
+    print(f"==  - Inferred Format: '{inferred_format}'")
+
+    if inferred_format == "A1111_KOHYA":
+        print("==  - Action: Applying full 'A1111_KOHYA_TO_DIFFUSERS' state_dict transformation.")
+        # ** THE REFACTOR **: A single, clean call to the new, powerful translator.
+        working_state_dict = translate_a1111_vae_to_diffusers(raw_vae_keys)
+    elif inferred_format == "Diffusers":
+        print("==  - Action: No key transformation needed. Loading keys as-is.")
+        working_state_dict = raw_vae_keys # Already filtered for VAE keys
+    else:
+        print("==  - WARNING: Unknown format. Attempting to load keys as-is. This may fail.")
+        working_state_dict = raw_vae_keys
+    print("="*80 + "\n")
+
+    # --- 3. Load the model with the corrected state dict ---
+    with open(config_path, 'r') as f:
+        vae_config = json.load(f)
+    vae = AutoencoderKL.from_config(vae_config)
+    vae.load_state_dict(working_state_dict, strict=True) # This will now succeed
+    vae.to(device=device, dtype=torch_dtype).eval()
+
+    # --- 2. Setup Pipeline for decoding ---
+    work_list = list(work_iterator)
+    print(f"\n--- [VAE Decoder Tool] Received {len(work_list)} work items to process. ---")
+    if not work_list:
+        print("--- [VAE Decoder Tool] WARNING: Iterator is empty. Aborting. ---")
+        return {}
+
+    id_iterator, loader_iterator = itertools.tee(work_list)
+    work_ids = [spec['work_id'] for spec in id_iterator]
+
+    latent_preprocessor = functools.partial(sdxl_vae_latent_preprocessor, dtype=torch_dtype)
+
+    loader = PipelinedTensorDictLoader(
+        raw_data_iterator=loader_iterator,
+        preprocessing_fn=latent_preprocessor, # Use latent preprocessor
+        device=device,
+        initial_bs=1
+    )
+    calibration_state = {
+        "config": {"vram_safety_ratio": 0.8, "device": device},
+        "history": [],
+        "latest_run_metrics": {}
+    }
+    all_results = []
+    
+    # 3. Run the internal processing loop
+    while True:
+        try:
+            next_bs, calibration_state = advise_next_batch_size(calibration_state)
+            loader.set_batch_size(next_bs)
+            start_time = time.time()
+            on_device_batch = loader.get_next_batch()
+            
+            with torch.no_grad():
+                # The core decoding operation
+                latents = on_device_batch['latent']
+                images = vae.decode(latents / vae.config.scaling_factor).sample
+                # Denormalize from [-1, 1] to [0, 1] for metrics/saving
+                images = (images / 2 + 0.5).clamp(0, 1)
+
+            if device.startswith("cuda"):
+                torch.cuda.synchronize(device)
+            duration = time.time() - start_time
+            vram_peak_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
+
+            calibration_state["latest_run_metrics"] = {
+                "bs": on_device_batch.shape[0], "duration": duration, "vram_peak_gb": vram_peak_gb
+            }
+            all_results.append(images.cpu())
+
+        except StopIteration:
+            print("[VAE Decoder] Finished processing all latents.")
+            break
+        except torch.cuda.OutOfMemoryError:
+            print(f"  [Batch Advisor] CUDA OOM detected at BS={next_bs}. Forcing downsearch.")
+            torch.cuda.empty_cache()
+            calibration_state["latest_run_metrics"] = {"bs": on_device_batch.shape[0], "duration": float('inf'), "vram_peak_gb": float('inf')}
+            continue
+            
+    loader.close()
+
+    print_batch_size_summary(
+        calibration_state.get("history", []),
+        calibration_state.get("best_throughput", 0),
+        calibration_state.get("bs_at_best_throughput", 0)
+    )
+
+    # 4. Collate and return results
+    final_images = torch.cat(all_results, dim=0)
+    print(f"--- [VAE Decoder] Complete. Produced final image tensor of shape: {final_images.shape} ---")
+    results_by_work_id = {
+        work_id: {"reconstructed_image": final_images[i]}
+        for i, work_id in enumerate(work_ids)
+    }
+    return results_by_work_id
+
+# NEW FUNCTION PER CLAUDE SPEC
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image.fid import FrechetInceptionDistance
+
+# ... (all existing functions)
+
 def compute_validation_metrics(**kwargs) -> dict:
     """
-    Computes LPIPS and FID between original and reconstructed images.
-    Consumes two synchronized data streams.
+    [NEW - v5.8] A d_dset 'tool' function that calculates aggregate image-to-image
+    comparison metrics (LPIPS, FID) over a dataset of paired images. It functions
+    as a 'many-to-one' reducer, consuming an entire iterator of work items and
+    producing a single output asset containing the final scores.
+
+    This function is invoked by the generic Layer 4 'execute_asset_caching' stage.
     """
-    # --- Config ---
+    # --- 1. Standard Setup and Configuration Unpacking ---
+    print("--- [Validator Tool] Initializing image reconstruction metric computation ---")
     device = kwargs.get('device', 'cuda')
-    lpips_net = kwargs.get('lpips_net', 'vgg') # 'vgg' or 'alex'
-    fid_feature_dim = kwargs.get('fid_feature_dim', 64) # 64, 192, 768, 2048
+    lpips_net = kwargs.get('lpips_net', 'vgg')
+    fid_feature_dim = kwargs.get('fid_feature_dim', 64) # Valid: 64, 192, 768, 2048
+    data_iterator = kwargs['data_iterator']
+
+    # --- 2. Initialize Metric Objects from TorchMetrics ---
+    # Metrics are initialized once and updated iteratively.
+    try:
+        lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type=lpips_net, normalize=True).to(device)
+        fid_metric = FrechetInceptionDistance(feature=fid_feature_dim, normalize=True).to(device)
+        print(f"  - Metrics (LPIPS-{lpips_net}, FID-{fid_feature_dim}) initialized on {device}.")
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize torchmetrics objects: {e}")
+        # Return an empty dict if we can't even start.
+        return {}
+
+    # --- 3. Collect all work items before processing ---
+    # This is necessary for a many-to-one reduction. We need all work_ids to
+    # map the single final result back to every input item.
+    work_items_to_process = list(data_iterator)
+    if not work_items_to_process:
+        print("  - WARNING: Received an empty data iterator. Nothing to validate.")
+        return {}
     
-    # --- Iterators (passed by the DAG runner) ---
-    original_images_iterator = kwargs['original_data_stream']
-    reconstructed_data_iterator = kwargs['reconstructed_data_iterator']
+    all_work_ids = [spec['work_id'] for spec in work_items_to_process]
+    print(f"  - Discovered {len(all_work_ids)} image pairs to validate.")
 
-    # --- Metric Initialization ---
-    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type=lpips_net, normalize=True).to(device) # normalize expects [0,1]
-    fid_metric = FrechetInceptionDistance(feature=fid_feature_dim, normalize=True).to(device) # normalize expects [0,1]
-    print(f"--- [Validator] Metrics (LPIPS-{lpips_net}, FID-{fid_feature_dim}) initialized on {device}. ---")
-
-    # --- Processing Loop ---
-    # This assumes the two iterators are aligned, which the DAG must guarantee
-    # by using the same source data stream and planning logic.
+    # --- 4. Iterative Processing and Metric Updates ---
     sample_count = 0
-    for original_spec, recon_spec in zip(original_images_iterator, reconstructed_data_iterator):
+    # Define a standard preprocessing pipeline for original images.
+    # Decoded images are already tensors; originals are file paths.
+    preprocess = transforms.Compose([
+        transforms.Resize((512, 512)), # Standardize size for comparison
+        transforms.ToTensor() # Converts to [C, H, W] tensor in [0, 1] range
+    ])
+
+    for spec in work_items_to_process:
         try:
-            # 1. Load original image and preprocess
-            original_path = original_spec['input_data']['image']
-            original_img = Image.open(original_path).convert("RGB")
-            # NOTE: Preprocessing MUST match here. We assume a simple ToTensor for [0,1] range.
-            preprocess = transforms.Compose([transforms.Resize((512, 512)), transforms.ToTensor()])
-            original_tensor = preprocess(original_img).unsqueeze(0).to(device)
+            # a. Load the original image from its file path
+            original_primitive = spec['input_data']['original_image']
+            original_path = original_primitive['data_path']
+            original_img_pil = Image.open(original_path).convert("RGB")
+            original_tensor = preprocess(original_img_pil).unsqueeze(0).to(device) # -> [1, C, H, W]
 
-            # 2. Load reconstructed image tensor
-            recon_tensor = recon_spec['input_data']['decoded_image'].unsqueeze(0).to(device)
-            # Ensure tensors are 4D [B, C, H, W] and compatible shapes
-            if original_tensor.shape != recon_tensor.shape:
-                recon_tensor = torch.nn.functional.interpolate(recon_tensor, size=original_tensor.shape[2:])
+            # b. Load the reconstructed image from its safetensor cache location
+            reconstructed_primitive = spec['input_data']['reconstructed_image']
+            loc_str = reconstructed_primitive['data_location'] # "loc:path|key:name"
+            loc_parts = {p.split(':')[0]: p.split(':')[1] for p in loc_str.split('|')}
+            with safetensors.safe_open(loc_parts['loc'], framework="pt", device=device) as f:
+                reconstructed_tensor = f.get_tensor(loc_parts['key']).unsqueeze(0) # -> [1, C, H, W]
 
-            # 3. Update metrics
-            lpips_metric.update(original_tensor, recon_tensor)
+            # c. Ensure tensors are 4D and have compatible shapes for metrics
+            if original_tensor.shape != reconstructed_tensor.shape:
+                # This should be rare if decoder output size is consistent
+                reconstructed_tensor = torch.nn.functional.interpolate(
+                    reconstructed_tensor, size=original_tensor.shape[2:]
+                )
+
+            # d. Update the metric accumulators
+            lpips_metric.update(original_tensor, reconstructed_tensor)
+            # For FID, update the two distributions separately
             fid_metric.update(original_tensor, real=True)
-            fid_metric.update(recon_tensor, real=False)
-            
+            fid_metric.update(reconstructed_tensor, real=False)
+
             sample_count += 1
             if sample_count % 50 == 0:
-                print(f"  [Validator] Processed {sample_count} image pairs...")
+                print(f"    - Processed {sample_count} image pairs...")
 
         except Exception as e:
-            print(f"  - WARNING: Skipping validation pair due to error: {e}")
+            print(f"  - WARNING: Skipping validation pair for work_id '{spec['work_id']}' due to error: {e}")
             continue
 
-    # --- Final Computation ---
-    final_lpips = lpips_metric.compute().item()
-    final_fid = fid_metric.compute().item()
-    
-    print("--- [Validator] Metric Computation Complete ---")
-    print(f"  - Total Samples: {sample_count}")
-    print(f"  - Mean LPIPS:    {final_lpips:.4f}")
-    print(f"  - FID Score:     {final_fid:.4f}")
+    if sample_count == 0:
+        print("  - FAILED: No samples were successfully processed. Cannot compute metrics.")
+        return {}
 
-    # Per spec, return a dictionary suitable for logging
-    results = {
-        "validation_metrics": {
-           "lpips_mean": final_lpips,
-           "fid_score": final_fid,
-           "sample_count": sample_count,
+    # --- 5. Final Metric Computation and Asset Creation ---
+    print(f"  - Computation complete. Calculating final scores from {sample_count} samples.")
+    final_lpips = lpips_metric.compute().cpu()
+    final_fid = fid_metric.compute().cpu()
+
+    # CRITICAL: The output asset must be a dictionary of TENSORS to be saved
+    # by the safetensors-based caching layer.
+    final_metrics_asset = {
+        "lpips_mean": torch.tensor(final_lpips),
+        "fid_score": torch.tensor(final_fid),
+        "sample_count": torch.tensor(float(sample_count))
+    }
+    
+    print("\n--- [Validation Report] ---")
+    print(f"  - Mean LPIPS (lower is better): {final_metrics_asset['lpips_mean'].item():.4f}")
+    print(f"  - FID Score (lower is better):  {final_metrics_asset['fid_score'].item():.4f}")
+    print("---------------------------\n")
+
+    # --- 6. Format the output for the generic caching layer ---
+    # Map the single result asset to every work_id that contributed to it.
+    # This allows the Layer 5 assembler to find the result.
+    # --- THE NEW, ELEGANT RETURN CONTRACT ---
+    # Return ONE object that contains the single asset and the list of IDs it covers.
+    return {
+        "aggregate_result": {
+            "asset_data": final_metrics_asset,
+            "asset_type": "reconstruction_metrics",
+            "contributing_work_ids": all_work_ids
         }
     }
-    return results
+    

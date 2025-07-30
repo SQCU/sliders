@@ -1,0 +1,309 @@
+# experiment_manifest_dag.yaml
+# uv run python dataset_strategizer_dagv5.8.py >> dset_strat_dagv5.8.txt 2>&1
+
+version: v5.8
+
+execution_graph:
+  - stage_name: "get_asset_spec"
+    function: "get_required_asset_spec"
+    config:
+      # ARCH-FIX: The config key is now generic.
+      data_consumer_name: "StableDiffusionXL_UNet"
+    outputs:
+      # Map the function's local output key to the DAG's global key
+      required_assets_spec: "required_assets_spec"
+
+  - stage_name: "discover_data"
+    # This stage is unchanged.
+    function: "discover_slider_pairs_from_filesystem"
+    config:
+      folder_main: "datasets/bracket"
+      folders: ['0', '1', '2']
+      scales: [0, 1, 2]
+      file_extensions: [".png", ".jpg"]
+      min_scales_required: 2
+      pairing_strategy: "relaxed"
+      seed: 42
+      prompt_sources:
+        root:
+          file: 'datasets/bracket/rootprompt.yaml'
+          importance: 5.0
+        metadata:
+          file: 'datasets/bracket/promptmetadata.json'
+          folder_importance: 2.0
+          item_importance: 5.0
+    outputs:
+      source_data_stream: "source_data_stream"
+
+  - stage_name: "plan_workload"
+    function: "plan_asset_workload"
+    inputs:
+      required_assets_spec: "required_assets_spec"
+      source_data_stream: "source_data_stream"
+    config:
+      max_training_items: 200
+    outputs:
+      work_specifications: "work_specifications"
+      assembly_instructions: "assembly_instructions"
+
+  - stage_name: "execute_caching"
+    function: "execute_asset_caching"
+    inputs:
+      # ARCH-FIX: The input is the new generic work spec list.
+      work_specifications: "work_specifications"
+    config:
+      cache_location_root: "./cache_decoupled/"
+      vae_model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+      vae_config_path: "./canon_configs/madebyollin__sdxl_vae_fp16_fix/config.json"
+      # ARCH-FIX: The core change. This map bridges capabilities to implementations
+      # without leaking names between layers. It's the ONLY place this knowledge lives.
+      capability_implementation_map:
+        denoise_prep_1:
+          processing_category: "image_denoising_prep"
+          consumer_function: "denoise_input_encoder_v1"
+          input_types: ["image", "prng_seed"]
+          output_types: ["noisy_latent", "timestep_for_unet"]
+          # --- **THE FIX IS HERE** ---
+          # These lines were missing. They provide the necessary paths to the
+          # real_denoise_input_encoder function via kwargs.
+          device: "cuda"
+          model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+          config_path: "./canon_configs/madebyollin__sdxl_vae_fp16_fix/config.json"
+          # The full schedule length
+          num_train_timesteps: 1000
+          # The number of steps to sample from, for inference-like importance sampling.
+          max_denoising_steps: 50
+          vram_safety_ratio: 0.8 # e.g., use 90% of total VRAM
+          stabilization_samples: 4 # Run each new batch size 3 times before trusting the VRAM reading
+        text_encode_1:
+          processing_category: "text_encoding"
+          consumer_function: "text_encoder_v1"
+          input_types: ["prompt"]   #prompt recipes aren't 'text' or 'string'. they're 'prompt'.
+          output_types: ["text_embedding", "pooled_text_embedding"]
+          device: "cuda" 
+          model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+          # ** THE FIX **: Paths now point to the local canon_configs directories.
+          text_encoder_1_config_path: "./canon_configs/stabilityai__stable-diffusion-xl-base-1.0/text_encoder/config.json"
+          text_encoder_2_config_path: "./canon_configs/stabilityai__stable-diffusion-xl-base-1.0/text_encoder_2/config.json"
+          # Point to the local directories downloaded by the new script.
+          tokenizer_1_path: "./canon_configs/stabilityai__stable-diffusion-xl-base-1.0/tokenizer"
+          tokenizer_2_path: "./canon_configs/stabilityai__stable-diffusion-xl-base-1.0/tokenizer_2"
+          vram_safety_ratio: 0.8 # e.g., use 90% of total VRAM
+          stabilization_samples: 4 # Run each new batch size 3 times before trusting the VRAM reading
+        time_encode_1:
+          processing_category: "temporal_encoding"
+          consumer_function: "time_id_synthesizer_v1"
+          input_types: ["image"]
+          output_types: ["time_embedding"]
+        metadata_synth_1:
+          processing_category: "metadata_synthesis"
+          consumer_function: "scale_tensor_synthesizer_v1"
+          input_types: ["scale_metadata"]
+          output_types: ["scales_tensor"]
+      cache_files:
+        noisy_latent: "./datasets/bracket/latents.safetensors"
+        timestep_for_unet: "./datasets/bracket/latents.safetensors"
+        text_embedding: "./datasets/bracket/text_embeds.safetensors"
+        pooled_text_embedding: "./datasets/bracket/text_embeds.safetensors"
+        time_embedding: "./datasets/bracket/time_embeds.safetensors"
+    outputs:
+      asset_cache_manifest: "asset_cache_manifest"
+
+  - stage_name: "assemble_dataset"
+    # This stage is unchanged. Its inputs remain stable.
+    function: "assemble_training_dataset"
+    inputs:
+      # ARCH-FIX: Consume the new data contract
+      assembly_instructions: "assembly_instructions"
+      asset_cache_manifest: "asset_cache_manifest"
+    config:
+      batch_size: 4
+    outputs:
+      final_training_dataset: "final_training_dataset"
+
+# --- VAE VALIDATION PIPELINE (REBUILT FOR CLARITY AND CORRECTNESS) ---
+
+  # STEP 1: Plan the encoding of original images into latents.
+
+  - stage_name: "get_encoder_spec_for_validation"
+    function: "get_required_asset_spec"
+    config:
+      # We need to encode an image to a latent.
+      data_consumer_name: "SDXL_VAE_Encoder"
+    outputs:
+      required_assets_spec: "encoder_for_validation_spec"
+
+  - stage_name: "plan_latent_encoding"
+    function: "plan_asset_workload"
+    inputs:
+      required_assets_spec: "encoder_for_validation_spec" # From get_encoder_spec
+      source_data_stream: "source_data_stream"
+    config: { max_training_items: 10 }
+    outputs:
+      work_specifications: "latent_encoding_work_specs"
+      assembly_instructions: "latent_encoding_assembly_instructions"
+
+  - stage_name: "execute_latent_encoding"
+    function: "execute_asset_caching"
+    inputs:
+      work_specifications: "latent_encoding_work_specs"
+    config:
+      capability_implementation_map:
+        real_vae_encoder:
+          processing_category: "image_to_latent_encoding"
+          consumer_function: "real_image_to_latent_encoder"
+          input_types: ["image"]
+          output_types: ["latent"]
+          device: "cuda"
+          model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+          config_path: "./canon_configs/madebyollin__sdxl_vae_fp16_fix/config.json"
+      cache_files:
+        latent: "./validation/validation_latents.safetensors"
+    outputs:
+      asset_cache_manifest: "latent_encoding_manifest"
+  # decoding stage spec
+  - stage_name: "get_decoder_spec"
+    function: "get_required_asset_spec"
+    config: { data_consumer_name: "SDXL_VAE_Decoder" }
+    outputs: { required_assets_spec: "decoder_spec" }
+
+  # use new manifest -> iterator projection function to get an iterator from the previous output
+  - stage_name: "discover_cached_latents"
+    function: "discover_assets_from_manifest" # Our new generic function
+    inputs: { asset_manifest: "latent_encoding_manifest" }
+    config:
+      asset_type_to_find: "latent"
+      primitive_type_label: "latent"
+    outputs: { source_data_stream: "latent_data_stream" }
+  # boring old dataset -> executor abstractum
+  - stage_name: "plan_latent_decoding"
+    function: "plan_asset_workload"
+    inputs:
+      required_assets_spec: "decoder_spec"
+      source_data_stream: "latent_data_stream"
+    config: { max_training_items: 10 }
+    outputs:
+      work_specifications: "latent_decoding_work_specs"
+      assembly_instructions: "latent_decoding_assembly_instructions"
+  #latent -> img
+  - stage_name: "execute_latent_decoding"
+    function: "execute_asset_caching"
+    inputs:
+      # Use the same plan, but the capability map will trigger the DECODER.
+      work_specifications: "latent_decoding_work_specs"
+    config:
+      capability_implementation_map:
+        real_vae_decoder:
+          processing_category: "latent_to_image_decoding" # Matches plan
+          consumer_function: "real_latent_to_image_decoder"
+          # This capability consumes a 'latent' and produces a 'decoded_image'
+          input_types: ["latent"]
+          output_types: ["decoded_image"]
+          device: "cuda"
+          model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+          config_path: "./canon_configs/madebyollin__sdxl_vae_fp16_fix/config.json"
+      cache_files:
+        # Save the reconstructed images to their own cache file.
+        decoded_image: "./validation/reconstructed_images.safetensors"
+    outputs:
+      asset_cache_manifest: "reconstructed_image_manifest"
+
+  - stage_name: "get_validation_spec"
+    function: "get_required_asset_spec"
+    config:
+      data_consumer_name: "VAE_Validation_Report"
+    outputs:
+      required_assets_spec: "validation_spec"
+
+  - stage_name: "discover_validation_pairs"
+    function: "discover_reconstruction_pairs_from_manifests" # Our NEW, simple function
+    inputs:
+      # Input 1: The plan with original image paths.
+      source_plan: "latent_encoding_work_specs"
+      # input 2: the latent decoding work plan so we can join the thingies together
+      decoding_plan: "latent_decoding_work_specs"
+      # Input 3: The manifest with reconstructed image locations.
+      reconstructed_asset_manifest: "reconstructed_image_manifest"
+    outputs:
+      source_data_stream: "paired_validation_stream"
+
+  - stage_name: "plan_validation_work"
+    function: "plan_asset_workload"
+    inputs:
+      required_assets_spec: "validation_spec"
+      source_data_stream: "paired_validation_stream"
+    config:
+      max_training_items: 200
+    outputs:
+      work_specifications: "validation_work_specs"
+      assembly_instructions: "validation_assembly_instructions"
+
+  - stage_name: "execute_metric_calculation"
+    function: "execute_asset_caching"
+    inputs:
+      work_specifications: "validation_work_specs"
+    config:
+      capability_implementation_map:
+        image_eval_v1:
+          processing_category: "image_reconstruction_evaluation"
+          consumer_function: "compute_validation_metrics"
+          input_types: ["original_image", "reconstructed_image"]
+          output_types: ["reconstruction_metrics"]
+          device: "cuda"
+          lpips_net: "vgg"
+          fid_feature_dim: 64
+      cache_files:
+        # The final metrics are a single asset, can be saved to a distinct file.
+        reconstruction_metrics: "./validation/final_metrics.safetensors"
+    outputs:
+      asset_cache_manifest: "final_metrics_manifest"
+
+# --- Global Configurations ---
+# These are not part of the DAG but configure the runner/environment.
+trial_config:
+environment_setup:
+  # This block dictates the heavyweight, shared components.
+  # The harness is now model-agnostic. We specify what to load here.
+  base_model_name: 'StableDiffusionXL_UNet'  # Can be 'TesterUViT' or 'StableDiffusionXL_UNet'
+  # Add any model-specific paths if loading a real model from disk
+  model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors"
+  # This block defines the parameters for the specific trial to be run.
+  lora_config:
+    lora_rules:
+      - name: "ATTN_and_FFN"
+        rank: 8
+        alpha: 1.0
+        target_name_contains: ['attn', 'ff.net']
+  model_config:
+    weights_dtype: 'torch.bfloat16'
+        
+  optimizer_config:
+    lr: 0.0005
+
+  training_config:
+    iterations: 300
+    microbatch_size: 4 # This is now the batch size of *pairs* if CFG is true.
+    seed: 42
+    prediction_type: 'epsilon' # 'epsilon', 'sample', or 'v_prediction'
+
+    gradient_accumulation_steps: 4
+    # Set to false to disable GNS and use standard gradient accumulation.
+    estimate_gradient_noise_scale: true 
+    gns_profile_freq: 10 # Profile every 10 optimizer steps
+    gns_ema_fast: 0.1
+    gns_ema_slow: 0.01
+    search_config:
+    # This new block controls the search loop itself.
+    num_trials: 5
+    top_n_results_to_show: 3
+
+  evaluation_config:
+    # Constraint 1: Proportional to training data size.
+    # 0.1 means "use no more than 10% of the number of training samples for evaluation".
+    proportion_of_train: 0.1
+    # Constraint 2: Proportional to total training time.
+    # 0.05 means "spend no more than 5% of the total projected training time generating eval data".
+    max_eval_time_proportion: 0.05
+    sampling_config:
+      total_timesteps: 50
+      guidance_scale: 2.0
