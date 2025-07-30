@@ -1,4 +1,4 @@
-# FFW13: dataset_strategizer_dagv5.8.py
+# FFW15: dataset_strategizer_dagv5.8.py
 # This version is a complete architectural refactor to enforce strict layer separation
 # as per the "Semantic Layer Specifications" and the provided critique.
 # uv run python dataset_strategizer_dagv5.8.py >> dset_strat_dagv5.8.txt 2>&1
@@ -140,17 +140,41 @@ DATA_CONSUMER_REGISTRY = {
         ]
     },
     'VAE_Validation_Report': {
-    'required_assets': [
-        {
-            "asset_type": "reconstruction_metrics",
-            "capability_requirements": {
-                "processing_category": "image_reconstruction_evaluation",
-                "input_types": ["original_image", "reconstructed_image"],
-                "output_types": ["reconstruction_metrics"]
+        'required_assets': [
+            {
+                "asset_type": "reconstruction_metrics",
+                "capability_requirements": {
+                    "processing_category": "image_reconstruction_evaluation",
+                    "input_types": ["original_image", "reconstructed_image"],
+                    "output_types": ["reconstruction_metrics"]
+                }
             }
-        }
-    ]
-}   ,
+        ]
+    },
+    'Latent_Stats_Calculator': {
+        'required_assets': [
+            {
+                "asset_type": "latent_stats", # The output we want per-image
+                "capability_requirements": {
+                    "processing_category": "latent_statistics_computation",
+                    "input_types": ["latent"], # It needs a latent to work
+                    "output_types": ["latent_stats"]
+                }
+            }
+        ]
+    },
+    'Latent_Stats_Aggregator': {
+        'required_assets': [
+            {
+                "asset_type": "aggregate_latent_stats_report", # The final report
+                "capability_requirements": {
+                    "processing_category": "latent_statistics_aggregation",
+                    "input_types": ["latent_stats"], # Needs the per-image stats
+                    "output_types": ["aggregate_latent_stats_report"]
+                }
+            }
+        ]
+    },
     # To add a new data consumer, a developer would simply add a new entry here.
     # The rest of the DAG is responsible for fulfilling the declared capabilities.
 }
@@ -462,7 +486,8 @@ from d_dset_functions import (
     real_image_to_latent_encoder,
     real_latent_to_image_decoder,
     compute_validation_metrics,
-    
+    compute_per_image_latent_stats,
+    aggregate_latent_stats,
 )
 
 ASSET_CONSUMER_FUNCTIONS = {
@@ -473,6 +498,8 @@ ASSET_CONSUMER_FUNCTIONS = {
     "real_image_to_latent_encoder": real_image_to_latent_encoder,
     "real_latent_to_image_decoder": real_latent_to_image_decoder,
     "compute_validation_metrics": compute_validation_metrics,
+    "compute_per_image_latent_stats": compute_per_image_latent_stats,
+    "aggregate_latent_stats": aggregate_latent_stats,
 }
 
 
@@ -598,6 +625,7 @@ def execute_asset_caching(own_config: Dict, **upstream_data) -> Dict[str, Any]:
 
         # To prevent overwriting, we first load existing tensors from the file if it exists.
         existing_tensors = {}
+        existing_metadata = {}
         if output_path.exists():
             with safetensors.safe_open(output_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
@@ -765,7 +793,7 @@ def main():
         category=UserWarning
     )
     # --- END WARNING SUPPRESSION PATCH ---
-    
+
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('-m', '--manifest', default="run_artifacts/yamlzoo/experiment_manifest_dagv5.8.yaml")

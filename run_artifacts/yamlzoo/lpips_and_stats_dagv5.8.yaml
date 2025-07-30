@@ -1,0 +1,121 @@
+# lpips_and_stats_dagv5.8.yaml
+# A combined DAG that runs VAE reconstruction validation (LPIPS) and
+# a full latent statistics analysis in parallel.
+# USAGE: 
+# uv run python dataset_strategizer_dagv5.8.py -m run_artifacts/yamlzoo/lpips_and_stats_dagv5.8.yaml >> lpips_and_stats_dagv5.8.txt 2>&1
+# thereafter:
+# uv run python dset_latents_loupe.py -s ./validation/final_stats_report.safetensors -l ./validation/validation_latents.safetensors
+# thereafter:
+# uv run python dset_visualize_single_latent.py -c "./validation/validation_latents.safetensors" -k "SOME_WORK_ID_latent"
+
+version: v5.9
+
+execution_graph:
+  # --- STAGES 1 & 2: Discover data and encode images to latents (Unchanged) ---
+  - stage_name: "discover_data"
+    function: "discover_slider_pairs_from_filesystem"
+    config:
+      folder_main: "datasets/bracket"
+      folders: ['0', '1', '2']
+      scales: [0, 1, 2]
+      file_extensions: [".png", ".jpg"]
+      min_scales_required: 2
+      pairing_strategy: "relaxed"
+      seed: 42
+      prompt_sources:
+        root: { file: 'datasets/bracket/rootprompt.yaml', importance: 1.0 }
+        metadata: { file: 'datasets/bracket/promptmetadata.json', folder_importance: 0.0, item_importance: 0.0 }
+    outputs:
+      source_data_stream: "source_data_stream"
+
+  - { stage_name: "get_encoder_spec_for_validation", function: "get_required_asset_spec", config: { data_consumer_name: "SDXL_VAE_Encoder" }, outputs: { required_assets_spec: "encoder_for_validation_spec" } }
+  - stage_name: "plan_latent_encoding"
+    function: "plan_asset_workload"
+    inputs: { required_assets_spec: "encoder_for_validation_spec", source_data_stream: "source_data_stream" }
+    config: { max_training_items: 50 } # Increased samples for better stats
+    outputs: { work_specifications: "latent_encoding_work_specs" }
+  - stage_name: "execute_latent_encoding"
+    function: "execute_asset_caching"
+    inputs: { work_specifications: "latent_encoding_work_specs" }
+    config:
+      capability_implementation_map:
+        real_vae_encoder: { processing_category: "image_to_latent_encoding", consumer_function: "real_image_to_latent_encoder", input_types: ["image"], output_types: ["latent"], device: "cuda", model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors", config_path: "./canon_configs/madebyollin__sdxl_vae_fp16_fix/config.json" }
+      cache_files:
+        latent: "./validation/validation_latents.safetensors"
+    outputs:
+      asset_cache_manifest: "latent_encoding_manifest"
+
+  # --- VAE VALIDATION BRANCH (Unchanged) ---
+  # This entire section runs as before, consuming the `latent_encoding_manifest`.
+  - { stage_name: "get_decoder_spec", function: "get_required_asset_spec", config: { data_consumer_name: "SDXL_VAE_Decoder" }, outputs: { required_assets_spec: "decoder_spec" } }
+  - { stage_name: "discover_cached_latents", function: "discover_assets_from_manifest", inputs: { asset_manifest: "latent_encoding_manifest" }, config: { asset_type_to_find: "latent", primitive_type_label: "latent" }, outputs: { source_data_stream: "latent_data_stream" } }
+  - { stage_name: "plan_latent_decoding", function: "plan_asset_workload", inputs: { required_assets_spec: "decoder_spec", source_data_stream: "latent_data_stream" }, config: { max_training_items: 50 }, outputs: { work_specifications: "latent_decoding_work_specs" } }
+  - stage_name: "execute_latent_decoding"
+    function: "execute_asset_caching"
+    inputs: { work_specifications: "latent_decoding_work_specs" }
+    config:
+      capability_implementation_map:
+        real_vae_decoder: { processing_category: "latent_to_image_decoding", consumer_function: "real_latent_to_image_decoder", input_types: ["latent"], output_types: ["decoded_image"], device: "cuda", model_path: "F:/dox/ai/stable-diffusion-1.5/models/Stable-diffusion/molKeunMix_deepblueV2EPS.safetensors", config_path: "./canon_configs/madebyollin__sdxl_vae_fp16_fix/config.json" }
+      cache_files:
+        decoded_image: "./validation/reconstructed_images.safetensors"
+    outputs:
+      asset_cache_manifest: "reconstructed_image_manifest"
+  - { stage_name: "get_validation_spec", function: "get_required_asset_spec", config: { data_consumer_name: "VAE_Validation_Report" }, outputs: { required_assets_spec: "validation_spec" } }
+  - { stage_name: "discover_validation_pairs", function: "discover_reconstruction_pairs_from_manifests", inputs: { source_plan: "latent_encoding_work_specs", decoding_plan: "latent_decoding_work_specs", reconstructed_asset_manifest: "reconstructed_image_manifest" }, outputs: { source_data_stream: "paired_validation_stream" } }
+  - { stage_name: "plan_validation_work", function: "plan_asset_workload", inputs: { required_assets_spec: "validation_spec", source_data_stream: "paired_validation_stream" }, outputs: { work_specifications: "validation_work_specs" } }
+  - stage_name: "execute_metric_calculation"
+    function: "execute_asset_caching"
+    inputs: { work_specifications: "validation_work_specs" }
+    config:
+      capability_implementation_map:
+        image_eval_v1: { processing_category: "image_reconstruction_evaluation", consumer_function: "compute_validation_metrics", input_types: ["original_image", "reconstructed_image"], output_types: ["reconstruction_metrics"], device: "cuda", lpips_net: "vgg", fid_feature_dim: 64 }
+      cache_files:
+        reconstruction_metrics: "./validation/final_metrics.safetensors"
+    outputs:
+      asset_cache_manifest: "final_metrics_manifest"
+
+  # --- LATENT STATISTICS BRANCH (NEWLY ADDED) ---
+  # This entire section runs in parallel, also consuming the `latent_encoding_manifest`.
+  - { stage_name: "get_per_image_stats_spec", function: "get_required_asset_spec", config: { data_consumer_name: "Latent_Stats_Calculator" }, outputs: { required_assets_spec: "per_image_stats_spec" } }
+  - stage_name: "discover_cached_latents_for_stats"
+    function: "discover_assets_from_manifest"
+    inputs: { asset_manifest: "latent_encoding_manifest" } # REUSE the manifest from the encoding step
+    config: { asset_type_to_find: "latent", primitive_type_label: "latent" }
+    outputs: { source_data_stream: "latent_data_stream_for_stats" }
+  - stage_name: "plan_per_image_stats_work"
+    function: "plan_asset_workload"
+    inputs: { required_assets_spec: "per_image_stats_spec", source_data_stream: "latent_data_stream_for_stats" }
+    outputs: { work_specifications: "per_image_stats_work_specs" }
+  - stage_name: "execute_per_image_stats_calculation"
+    function: "execute_asset_caching"
+    inputs: { work_specifications: "per_image_stats_work_specs" }
+    config:
+      capability_implementation_map:
+        # The consumer_function name here is the key that was failing the lookup.
+        stats_calculator_v1: { processing_category: "latent_statistics_computation", consumer_function: "compute_per_image_latent_stats", input_types: ["latent"], output_types: ["latent_stats"] }
+      cache_files:
+        latent_stats: "./validation/per_image_stats.safetensors"
+    outputs:
+      asset_cache_manifest: "per_image_stats_manifest"
+
+  # --- AGGREGATE STATS (NEWLY ADDED) ---
+  - { stage_name: "get_aggregate_stats_spec", function: "get_required_asset_spec", config: { data_consumer_name: "Latent_Stats_Aggregator" }, outputs: { required_assets_spec: "aggregate_stats_spec" } }
+  - stage_name: "discover_cached_stats_for_aggregation"
+    function: "discover_assets_from_manifest"
+    inputs: { asset_manifest: "per_image_stats_manifest" }
+    config: { asset_type_to_find: "latent_stats", primitive_type_label: "latent_stats" }
+    outputs: { source_data_stream: "stats_data_stream_for_aggregation" }
+  - stage_name: "plan_aggregate_stats_work"
+    function: "plan_asset_workload"
+    inputs: { required_assets_spec: "aggregate_stats_spec", source_data_stream: "stats_data_stream_for_aggregation" }
+    outputs: { work_specifications: "aggregate_stats_work_specs" }
+  - stage_name: "execute_aggregate_stats_calculation"
+    function: "execute_asset_caching"
+    inputs: { work_specifications: "aggregate_stats_work_specs" }
+    config:
+      capability_implementation_map:
+        stats_aggregator_v1: { processing_category: "latent_statistics_aggregation", consumer_function: "aggregate_latent_stats", input_types: ["latent_stats"], output_types: ["aggregate_latent_stats_report"] }
+      cache_files:
+        aggregate_latent_stats_report: "./validation/final_stats_report.safetensors"
+    outputs:
+      asset_cache_manifest: "final_stats_report_manifest"

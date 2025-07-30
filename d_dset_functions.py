@@ -12,6 +12,7 @@ from trainscripts.imagesliders.minimal_scheduler import MinimalDDPMScheduler as 
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer, CLIPTextConfig
 from PIL import Image
 from torchvision import transforms
+import numpy as np
 import json
 import time
 import itertools
@@ -1247,4 +1248,157 @@ def compute_validation_metrics(**kwargs) -> dict:
             "contributing_work_ids": all_work_ids
         }
     }
+
+def compute_per_image_latent_stats(**kwargs) -> dict:
+    """
+    [ENHANCED - v5.9] Calculates detailed statistical properties (global and per-channel)
+    for individual latent tensors.
+    """
+    print("--- [Latent Stats Tool] Initializing per-image latent stat computation (Enhanced) ---")
+    data_iterator = kwargs['data_iterator']
+    results_by_work_id = {}
+
+    for spec in data_iterator:
+        work_id = spec['work_id']
+        try:
+            latent_primitive = spec['input_data']['latent']
+            loc_str = latent_primitive['data_location']
+            loc_parts = {p.split(':')[0]: p.split(':')[1] for p in loc_str.split('|')}
+            with safetensors.safe_open(loc_parts['loc'], framework="pt", device="cpu") as f:
+                latent_tensor = f.get_tensor(loc_parts['key'])
+
+            if latent_tensor.dim() < 3:
+                print(f"  - WARNING: Skipping work_id '{work_id}'. Latent tensor dim < 3.")
+                continue
+
+            # LEVEL 2 (CRITICAL): Per-channel stats, reducing only H, W dimensions.
+            # Resulting shape: [num_channels]
+            mean_per_channel = torch.mean(latent_tensor, dim=(-2, -1))
+            std_per_channel = torch.std(latent_tensor, dim=(-2, -1))
+
+            # LEVEL 1: Global stats for the whole tensor.
+            # Resulting shape: [1] (scalar)
+            global_mean = torch.mean(latent_tensor)
+            global_std = torch.std(latent_tensor)
+
+            # The asset is a richer dictionary of tensors.
+            stats_asset = {
+                "mean_per_channel": mean_per_channel,
+                "std_per_channel": std_per_channel,
+                "global_mean": torch.tensor(global_mean),
+                "global_std": torch.tensor(global_std)
+            }
+            results_by_work_id[work_id] = {"latent_stats": stats_asset}
+
+        except Exception as e:
+            print(f"  - WARNING: Skipping stats for work_id '{work_id}' due to error: {e}")
+            continue
+            
+    print(f"  - Calculated detailed statistics for {len(results_by_work_id)} latents.")
+    return results_by_work_id
+
+def aggregate_latent_stats(**kwargs) -> dict:
+    """
+    [CORRECTED - v5.9] Aggregates detailed latent stats, computes dataset-wide
+    distributions, and identifies top outliers, expressing ALL outputs as tensors
+    to conform to the strict Layer 4 caching contract.
+    """
+    print("--- [Latent Stats Aggregator] Initializing dataset-wide aggregation (Contract-Compliant) ---")
+    data_iterator = kwargs['data_iterator']
+    num_outliers_to_report = kwargs.get('num_outliers_to_report', 10)
+
+    all_stats_items = list(data_iterator)
+    if not all_stats_items: return {}
     
+    all_work_ids = [spec['work_id'] for spec in all_stats_items]
+    print(f"  - Aggregating detailed stats from {len(all_work_ids)} items.")
+
+    # --- 1. Collect all detailed stats from the cache (Unchanged) ---
+    all_means_per_channel, all_stds_per_channel = [], []
+    for spec in all_stats_items:
+        try:
+            location_recipe = spec['input_data']['latent_stats']['data_location']
+            # We just need one entry to find the file path.
+            # We assume all tensors for a given asset are in the same file.
+            any_sub_asset_loc_str = next(iter(location_recipe.values()))
+            file_path = {p.split(':')[0]: p.split(':')[1] for p in any_sub_asset_loc_str.split('|')}['loc']
+
+            with safetensors.safe_open(file_path, framework="pt", device="cpu") as f:
+                # Use the location recipe to look up the exact key for each tensor
+                mean_key = {p.split(':')[0]: p.split(':')[1] for p in location_recipe['mean_per_channel'].split('|')}['key']
+                std_key = {p.split(':')[0]: p.split(':')[1] for p in location_recipe['std_per_channel'].split('|')}['key']
+                all_means_per_channel.append(f.get_tensor(mean_key))
+                all_stds_per_channel.append(f.get_tensor(std_key))
+
+        except Exception as e:
+            print(f"  - WARNING: Skipping aggregation for work_id '{spec['work_id']}' due to error: {e}")
+            continue
+    
+    if not all_means_per_channel: 
+        print("  - FAILED: No stats were successfully loaded. Aborting.")
+        return {}
+
+    # --- 2. Perform LEVEL 3 Aggregations (Unchanged) ---
+    means_matrix = torch.stack(all_means_per_channel)
+    stds_matrix = torch.stack(all_stds_per_channel)
+    num_channels = means_matrix.shape[1]
+    
+    dataset_mean_of_means_per_channel = torch.mean(means_matrix, dim=0)
+    dataset_std_of_means_per_channel = torch.std(means_matrix, dim=0)
+    dataset_mean_of_stds_per_channel = torch.mean(stds_matrix, dim=0)
+    dataset_std_of_stds_per_channel = torch.std(stds_matrix, dim=0)
+
+    # --- 3. Outlier Detection (Corrected Implementation) ---
+    stats_vectors = torch.cat((means_matrix, stds_matrix), dim=1)
+    ideal_vector = torch.cat((torch.zeros(num_channels), torch.ones(num_channels)))
+    distances = torch.linalg.norm(stats_vectors - ideal_vector.unsqueeze(0), dim=1)
+    
+    top_k = min(num_outliers_to_report, len(all_work_ids))
+    top_scores, top_indices = torch.topk(distances, k=top_k)
+
+    # --- 4. Prepare Final Asset as a "Totally Ordinary Dataset" of Tensors ---
+    final_report_asset = {
+        # Dataset-level aggregate stats
+        "dataset_mean_of_means_per_channel": dataset_mean_of_means_per_channel,
+        "dataset_std_of_means_per_channel": dataset_std_of_means_per_channel,
+        "dataset_mean_of_stds_per_channel": dataset_mean_of_stds_per_channel,
+        "dataset_std_of_stds_per_channel": dataset_std_of_stds_per_channel,
+        "sample_count": torch.tensor(float(len(all_work_ids))),
+        
+        # ** THE CRITICAL FIX: Expressing the outlier report as pure tensors **
+        # The indices of the outliers within the original `all_work_ids` list.
+        "outlier_indices": top_indices.long(), # Store as LongTensor
+        # The corresponding scores for the top outliers.
+        "outlier_scores": top_scores,
+        # The full stats vectors for the top outliers for detailed reporting.
+        "outlier_stats_vectors": stats_vectors[top_indices],
+    }
+    
+    # Add per-channel histograms (Unchanged)
+    for i in range(num_channels):
+        mean_hist_counts, mean_hist_bins = np.histogram(means_matrix[:, i].to(torch.float32).numpy(), bins=20, range=(-1.0, 1.0))
+        std_hist_counts, std_hist_bins = np.histogram(stds_matrix[:, i].to(torch.float32).numpy(), bins=20, range=(0.0, 2.0))
+        final_report_asset[f"ch{i}_means_hist_counts"] = torch.from_numpy(mean_hist_counts)
+        final_report_asset[f"ch{i}_means_hist_bins"] = torch.from_numpy(mean_hist_bins)
+
+        final_report_asset[f"ch{i}_means_hist_counts"] = torch.from_numpy(mean_hist_counts)
+        final_report_asset[f"ch{i}_means_hist_bins"] = torch.from_numpy(mean_hist_bins)
+        final_report_asset[f"ch{i}_stds_hist_counts"] = torch.from_numpy(std_hist_counts)
+        final_report_asset[f"ch{i}_stds_hist_bins"] = torch.from_numpy(std_hist_bins)
+    
+    print("\n--- [Latent Statistics Report (Per-Channel)] ---")
+    for i in range(num_channels):
+        print(f"  Channel {i}:")
+        # Also cast the values for printing to avoid any potential display issues
+        print(f"    - Mean of Means: {dataset_mean_of_means_per_channel[i].item():.4f} (std: {dataset_std_of_means_per_channel[i].item():.4f})")
+        print(f"    - Mean of Stds:  {dataset_mean_of_stds_per_channel[i].item():.4f} (std: {dataset_std_of_stds_per_channel[i].item():.4f})")
+    print("--------------------------------------------------\n")
+
+    # Return using the standard, unmodified aggregate contract. No special keys.
+    return {
+        "aggregate_result": {
+            "asset_data": final_report_asset,
+            "asset_type": "aggregate_latent_stats_report",
+            "contributing_work_ids": all_work_ids
+        }
+    }
