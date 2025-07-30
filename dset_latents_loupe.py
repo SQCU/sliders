@@ -43,8 +43,10 @@ def main():
     # --- Step 1: Load all data from the file in a single, simple block ---
     report_key = None
     contributing_work_ids = []
-    outlier_report = []
+    channelwise_outlier_report = []
+    global_outlier_report = []
     histogram_data = {}
+    global_histogram_data = {}
     
     try:
         with safetensors.safe_open(report_path, framework="pt", device="cpu") as f:
@@ -56,14 +58,27 @@ def main():
             report_metadata = json.loads(metadata[report_key])
             contributing_work_ids = report_metadata.get("contributing_work_ids", [])
 
-            # Load ESSENTIAL tensors for the outlier report
-            outlier_indices = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_outlier_indices")
-            outlier_scores = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_outlier_scores")
-            outlier_stats_vectors = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_outlier_stats_vectors")
-            sample_count = int(f.get_tensor(f"{report_key}_aggregate_latent_stats_report_sample_count").item())
+            # Load Channel-wise outlier data
+            chwise_indices = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_channelwise_outlier_indices")
+            chwise_scores = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_channelwise_outlier_scores")
+            chwise_stats_vectors = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_channelwise_outlier_stats_vectors")
+            num_channels = chwise_stats_vectors.shape[1] // 2
             
-            # Reliably determine num_channels from the essential stats vector
-            num_channels = outlier_stats_vectors.shape[1] // 2
+            # Load Global outlier data
+            global_indices = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_global_outlier_indices")
+            global_scores = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_global_outlier_scores")
+            global_stats_vectors = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_global_outlier_stats_vectors")
+            sample_count = int(f.get_tensor(f"{report_key}_aggregate_latent_stats_report_sample_count").item())
+
+            # take a peek at the channel-squashed histogram tensors
+            try:
+                global_histogram_data['means_counts'] = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_global_means_hist_counts")
+                global_histogram_data['means_bins'] = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_global_means_hist_bins")
+                global_histogram_data['stds_counts'] = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_global_stds_hist_counts")
+                global_histogram_data['stds_bins'] = f.get_tensor(f"{report_key}_aggregate_latent_stats_report_global_stds_hist_bins")
+            except KeyError:
+                print("[INFO] Report file does not contain global histogram data. Skipping global plot.")
+                global_histogram_data = {}
 
             # Try to load OPTIONAL histogram tensors
             try:
@@ -81,41 +96,60 @@ def main():
         return
 
     # --- Step 2: Process loaded data to create the readable outlier report ---
-    for i, original_index in enumerate(outlier_indices):
-        stats_vec = outlier_stats_vectors[i]
-        outlier_report.append({
-            "work_id": contributing_work_ids[original_index.item()],
-            "outlier_score": outlier_scores[i].item(),
-            "means_per_channel": stats_vec[:num_channels].tolist(),
-            "stds_per_channel": stats_vec[num_channels:].tolist(),
-        })
+     # --- Step 2: Process data into human-readable reports ---
+    for i, idx in enumerate(chwise_indices):
+        vec = chwise_stats_vectors[i]
+        channelwise_outlier_report.append({ "work_id": contributing_work_ids[idx.item()], 
+        "score": chwise_scores[i].item(), "means": vec[:num_channels].tolist(), "stds": vec[num_channels:].tolist() })
+    
+    for i, idx in enumerate(global_indices):
+        vec = global_stats_vectors[i]
+        global_outlier_report.append({ "work_id": contributing_work_ids[idx.item()], 
+        "score": global_scores[i].item(), "mean": vec[0].item(), "std": vec[1].item() })
 
     # --- Step 3: Present the results ---
     print("\n--- Top Outlier Images (Most distant from ideal Gaussian stats) ---")
-    if not outlier_report:
-        print("  - No outlier information found in the report.")
-    else:
-        for item in outlier_report:
-            means_str = ", ".join([f"{m:.3f}" for m in item['means_per_channel']])
-            stds_str = ", ".join([f"{s:.3f}" for s in item['stds_per_channel']])
-            print(f"  - Work ID: {item['work_id']}")
-            print(f"    - Score: {item['outlier_score']:.4f}, Means: [{means_str}], Stds: [{stds_str}]")
-    print("---------------------------------------------------------------------")
+    print("\n--- Top Outliers (by Per-Channel Stats) ---")
+    for item in channelwise_outlier_report:
+        means_str = ", ".join([f"{m:.3f}" for m in item['means']])
+        stds_str = ", ".join([f"{s:.3f}" for s in item['stds']])
+        print(f"  - Work ID: {item['work_id']} | Score: {item['score']:.4f}\n    - Means: [{means_str}]\n    - Stds:  [{stds_str}]")
 
-    if outlier_report:
-        top_outlier_work_id = outlier_report[0]['work_id']
-        latent_key = f"{top_outlier_work_id}_latent"
-        print("\n[ACTION] To visualize the channels of the top outlier latent, run this command:")
-        print(f"uv run python dset_visualize_single_latent.py -c \"{args.latent_cache}\" -k \"{latent_key}\"")
+    print("\n--- Top Outliers (by Global Stats) ---")
+    for item in global_outlier_report:
+        print(f"  - Work ID: {item['work_id']} | Score: {item['score']:.4f} (Mean: {item['mean']:.3f}, Std: {item['std']:.3f})")
+
+    # --- Actionable command for the top of EACH list ---
+    if channelwise_outlier_report:
+        top_chwise_id = channelwise_outlier_report[0]['work_id']
+        print("\n[ACTION] To visualize the top CHANNEL-WISE outlier, run:")
+        print(f"python dset_visualize_single_latent.py -c \"{args.latent_cache}\" -k \"{top_chwise_id}_latent\"")
+    
+    if global_outlier_report:
+        top_global_id = global_outlier_report[0]['work_id']
+        print("\n[ACTION] To visualize the top GLOBAL outlier, run:")
+        print(f"python dset_visualize_single_latent.py -c \"{args.latent_cache}\" -k \"{top_global_id}_latent\"")
 
     # --- Step 4: Visualize if possible ---
     if histogram_data:
-        fig, axes = plt.subplots(num_channels, 2, figsize=(12, 3 * num_channels), sharex='col')
-        fig.suptitle(f"Per-Channel Latent Statistics Distribution for {sample_count} Images", fontsize=16)
+        num_plot_rows = num_channels + 1 if global_histogram_data else num_channels
+        fig, axes = plt.subplots(num_plot_rows, 2, figsize=(12, 3 * num_plot_rows), sharex='col')
+        fig.suptitle(f"Latent Statistics Distribution for {sample_count} Images", fontsize=16)
+
+        plot_row_offset = 0
+        if global_histogram_data:
+            # --- NEW: Plot Global Stats in the first row ---
+            plot_row_offset = 1
+            ax_mean_global = axes[0, 0]
+            ax_std_global = axes[0, 1]
+            plot_histogram(ax_mean_global, global_histogram_data['means_counts'].numpy(), global_histogram_data['means_bins'].numpy(), "Global Mean Distribution (All Channels)", "Mean Value", 0.0)
+            plot_histogram(ax_std_global, global_histogram_data['stds_counts'].numpy(), global_histogram_data['stds_bins'].numpy(), "Global Std. Dev. Distribution (All Channels)", "Std. Dev. Value", 1.0)
 
         for i in range(num_channels):
-            plot_histogram(axes[i, 0], histogram_data[f'ch{i}_means_counts'].numpy(), histogram_data[f'ch{i}_means_bins'].numpy(), f"Channel {i} Mean Distribution", "Mean Value", 0.0)
-            plot_histogram(axes[i, 1], histogram_data[f'ch{i}_stds_counts'].numpy(), histogram_data[f'ch{i}_stds_bins'].numpy(), f"Channel {i} Std. Dev. Distribution", "Std. Dev. Value", 1.0)
+            ax_mean = axes[i + plot_row_offset, 0]
+            ax_std = axes[i + plot_row_offset, 1]
+            plot_histogram(ax_mean, histogram_data[f'ch{i}_means_counts'].numpy(), histogram_data[f'ch{i}_means_bins'].numpy(), f"Channel {i} Mean Distribution", "Mean Value", 0.0)
+            plot_histogram(ax_std, histogram_data[f'ch{i}_stds_counts'].numpy(), histogram_data[f'ch{i}_stds_bins'].numpy(), f"Channel {i} Std. Dev. Distribution", "Std. Dev. Value", 1.0)
         
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         output_filename = report_path.parent / f"{report_path.stem}_per_channel_viz.png"

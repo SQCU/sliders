@@ -1315,6 +1315,8 @@ def aggregate_latent_stats(**kwargs) -> dict:
 
     # --- 1. Collect all detailed stats from the cache (Unchanged) ---
     all_means_per_channel, all_stds_per_channel = [], []
+    # --- NEW: Create lists to hold the global stats ---
+    all_global_means, all_global_stds = [], []
     for spec in all_stats_items:
         try:
             location_recipe = spec['input_data']['latent_stats']['data_location']
@@ -1329,6 +1331,12 @@ def aggregate_latent_stats(**kwargs) -> dict:
                 std_key = {p.split(':')[0]: p.split(':')[1] for p in location_recipe['std_per_channel'].split('|')}['key']
                 all_means_per_channel.append(f.get_tensor(mean_key))
                 all_stds_per_channel.append(f.get_tensor(std_key))
+
+                # --- NEW: Load global data ---
+                mean_key_global = {p.split(':')[0]: p.split(':')[1] for p in location_recipe['global_mean'].split('|')}['key']
+                std_key_global = {p.split(':')[0]: p.split(':')[1] for p in location_recipe['global_std'].split('|')}['key']
+                all_global_means.append(f.get_tensor(mean_key_global))
+                all_global_stds.append(f.get_tensor(std_key_global))
 
         except Exception as e:
             print(f"  - WARNING: Skipping aggregation for work_id '{spec['work_id']}' due to error: {e}")
@@ -1348,13 +1356,28 @@ def aggregate_latent_stats(**kwargs) -> dict:
     dataset_mean_of_stds_per_channel = torch.mean(stds_matrix, dim=0)
     dataset_std_of_stds_per_channel = torch.std(stds_matrix, dim=0)
 
-    # --- 3. Outlier Detection (Corrected Implementation) ---
-    stats_vectors = torch.cat((means_matrix, stds_matrix), dim=1)
-    ideal_vector = torch.cat((torch.zeros(num_channels), torch.ones(num_channels)))
-    distances = torch.linalg.norm(stats_vectors - ideal_vector.unsqueeze(0), dim=1)
-    
+    # --- NEW: Global aggregations ---
+    global_means_tensor = torch.tensor(all_global_means)
+    global_stds_tensor = torch.tensor(all_global_stds)
+    dataset_mean_of_global_means = torch.mean(global_means_tensor)
+    dataset_std_of_global_means = torch.std(global_means_tensor)
+    dataset_mean_of_global_stds = torch.mean(global_stds_tensor)
+    dataset_std_of_global_stds = torch.std(global_stds_tensor)
+
+    # --- 3. Outlier Detection (Now Two-Fold) ---
     top_k = min(num_outliers_to_report, len(all_work_ids))
-    top_scores, top_indices = torch.topk(distances, k=top_k)
+
+    # --- Ranking 1: Based on Per-Channel Stats (Existing Logic) ---
+    stats_vectors_chwise = torch.cat((means_matrix, stds_matrix), dim=1)
+    ideal_vector_chwise = torch.cat((torch.zeros(num_channels), torch.ones(num_channels)))
+    distances_chwise = torch.linalg.norm(stats_vectors_chwise - ideal_vector_chwise.unsqueeze(0), dim=1)
+    top_scores_chwise, top_indices_chwise = torch.topk(distances_chwise, k=top_k)
+
+    # --- Ranking 2: Based on Global Stats (New Logic) ---
+    stats_vectors_global = torch.stack((global_means_tensor, global_stds_tensor), dim=1)
+    ideal_vector_global = torch.tensor([0.0, 1.0]) # Ideal global state
+    distances_global = torch.linalg.norm(stats_vectors_global - ideal_vector_global.unsqueeze(0), dim=1)
+    top_scores_global, top_indices_global = torch.topk(distances_global, k=top_k)
 
     # --- 4. Prepare Final Asset as a "Totally Ordinary Dataset" of Tensors ---
     final_report_asset = {
@@ -1365,13 +1388,20 @@ def aggregate_latent_stats(**kwargs) -> dict:
         "dataset_std_of_stds_per_channel": dataset_std_of_stds_per_channel,
         "sample_count": torch.tensor(float(len(all_work_ids))),
         
-        # ** THE CRITICAL FIX: Expressing the outlier report as pure tensors **
-        # The indices of the outliers within the original `all_work_ids` list.
-        "outlier_indices": top_indices.long(), # Store as LongTensor
-        # The corresponding scores for the top outliers.
-        "outlier_scores": top_scores,
-        # The full stats vectors for the top outliers for detailed reporting.
-        "outlier_stats_vectors": stats_vectors[top_indices],
+        "dataset_mean_of_global_means": dataset_mean_of_global_means,
+        "dataset_std_of_global_means": dataset_std_of_global_means,
+        "dataset_mean_of_global_stds": dataset_mean_of_global_stds,
+        "dataset_std_of_global_stds": dataset_std_of_global_stds,
+
+        # Per-Channel Outliers
+        "channelwise_outlier_indices": top_indices_chwise.long(),
+        "channelwise_outlier_scores": top_scores_chwise,
+        "channelwise_outlier_stats_vectors": stats_vectors_chwise[top_indices_chwise],
+
+        # Global Outliers
+        "global_outlier_indices": top_indices_global.long(),
+        "global_outlier_scores": top_scores_global,
+        "global_outlier_stats_vectors": stats_vectors_global[top_indices_global],
     }
     
     # Add per-channel histograms (Unchanged)
@@ -1385,6 +1415,13 @@ def aggregate_latent_stats(**kwargs) -> dict:
         final_report_asset[f"ch{i}_means_hist_bins"] = torch.from_numpy(mean_hist_bins)
         final_report_asset[f"ch{i}_stds_hist_counts"] = torch.from_numpy(std_hist_counts)
         final_report_asset[f"ch{i}_stds_hist_bins"] = torch.from_numpy(std_hist_bins)
+
+        mean_hist_counts_global, mean_hist_bins_global = np.histogram(global_means_tensor.to(torch.float32).numpy(), bins=20, range=(-1.0, 1.0))
+        std_hist_counts_global, std_hist_bins_global = np.histogram(global_stds_tensor.to(torch.float32).numpy(), bins=20, range=(0.0, 2.0))
+        final_report_asset["global_means_hist_counts"] = torch.from_numpy(mean_hist_counts_global)
+        final_report_asset["global_means_hist_bins"] = torch.from_numpy(mean_hist_bins_global)
+        final_report_asset["global_stds_hist_counts"] = torch.from_numpy(std_hist_counts_global)
+        final_report_asset["global_stds_hist_bins"] = torch.from_numpy(std_hist_bins_global)
     
     print("\n--- [Latent Statistics Report (Per-Channel)] ---")
     for i in range(num_channels):
