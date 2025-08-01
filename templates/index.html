@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dataset Loupe</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; background-color: #f0f2f5; color: #1c1e21; }
+        header { background-color: #fff; padding: 10px 20px; border-bottom: 1px solid #dddfe2; text-align: center; }
+        .container { display: flex; height: calc(100vh - 51px); }
+        .sidebar { width: 250px; background-color: #fff; border-right: 1px solid #dddfe2; overflow-y: auto; padding: 10px; }
+        .main-content { flex-grow: 1; padding: 20px; overflow-y: auto; }
+        .work-item-btn { display: block; width: 100%; padding: 8px; margin-bottom: 5px; border: 1px solid #ccc; background-color: #f5f6f7; text-align: left; cursor: pointer; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .work-item-btn:hover { background-color: #e9ebee; }
+        .view-panel { border: 1px solid #ccc; padding: 15px; margin-top: 20px; background-color: #fff; }
+        .view-panel h3 { margin-top: 0; }
+        .image-container img { max-width: 100%; height: auto; border: 1px solid #eee; margin-top: 10px; }
+        .loader { text-align: center; padding: 50px; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>Dataset Loupe</h1>
+    </header>
+
+    <div class="container">
+        <div class="sidebar" id="sidebar">
+            <h2>Work Items</h2>
+            <div id="work-item-list">
+                <p class="loader">Loading summary...</p>
+            </div>
+        </div>
+        <div class="main-content" id="main-content">
+            <h2>Select a Work Item to View Details</h2>
+        </div>
+    </div>
+
+    <script>
+        const sidebar = document.getElementById('sidebar');
+        const workItemList = document.getElementById('work-item-list');
+        const mainContent = document.getElementById('main-content');
+
+        // Load summary on page load
+        document.addEventListener('DOMContentLoaded', async () => {
+            try {
+                const response = await fetch('/api/summary');
+                const data = await response.json();
+                renderWorkItemList(data.work_ids);
+            } catch (error) {
+                workItemList.innerHTML = `<p style="color: red;">Failed to load summary.</p>`;
+                console.error('Error fetching summary:', error);
+            }
+        });
+
+        function renderWorkItemList(workIds) {
+            if (!workIds || workIds.length === 0) {
+                workItemList.innerHTML = `<p>No work items found.</p>`;
+                return;
+            }
+            workItemList.innerHTML = ''; // Clear loader
+            workIds.forEach(id => {
+                const btn = document.createElement('button');
+                btn.className = 'work-item-btn';
+                btn.textContent = id;
+                btn.onclick = () => loadItemDetails(id);
+                workItemList.appendChild(btn);
+            });
+        }
+
+        async function loadItemDetails(workId) {
+            mainContent.innerHTML = `<h2>Loading details for ${workId.substring(0,12)}...</h2>`;
+            try {
+                const response = await fetch(`/api/item/${workId}`);
+                if (!response.ok) throw new Error(`Server returned ${response.status}`);
+                const data = await response.json();
+                renderItemDetails(workId, data);
+            } catch (error) {
+                mainContent.innerHTML = `<h2 style="color: red;">Failed to load details for ${workId}.</h2>`;
+                console.error('Error fetching item details:', error);
+            }
+        }
+
+        function renderItemDetails(workId, assets) {
+            let html = `<h2>Details for: ${workId}</h2>`;
+            for (const assetType in assets) {
+                html += `
+                    <div class="view-panel">
+                        <h3>Asset: ${assetType}</h3>
+                        <button onclick="renderImage('${workId}', '${assetType}')">View as Image</button>
+                        <div class="image-container" id="container-${workId}-${assetType}"></div>
+                    </div>
+                `;
+            }
+             // Add virtual asset for residual
+            if ('reconstructed_image' in assets) {
+                 html += `
+                    <div class="view-panel">
+                        <h3>Virtual Asset: vae_residual</h3>
+                        <button onclick="renderImage('${workId}', 'vae_residual')">View VAE Residual</button>
+                        <div class="image-container" id="container-${workId}-vae_residual"></div>
+                    </div>
+                `;
+            }
+            mainContent.innerHTML = html;
+        }
+
+        function renderImage(workId, assetType) {
+            const container = document.getElementById(`container-${workId}-${assetType}`);
+            container.innerHTML = `<p class="loader">Rendering image...</p>`;
+            const img = document.createElement('img');
+            img.src = `/api/view/image/${workId}/${assetType}`;
+            img.onload = () => { container.innerHTML = ''; container.appendChild(img); };
+            img.onerror = () => { container.innerHTML = `<p style="color: red;">Failed to render image.</p>`; };
+        }
+    </script>
+
+</body>
+</html>
