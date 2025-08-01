@@ -1,6 +1,6 @@
 # dset_latents_loupe.py (v2)
 # An enhanced tool to visualize detailed, per-channel latent statistics.
-# USAGE: python latents_loupe.py -f ./stats/final_stats_report.safetensors
+# USAGE: python dset_latents_loupe.py -f ./stats/final_stats_report.safetensors
 
 import safetensors
 import torch
