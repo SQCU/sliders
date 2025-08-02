@@ -16,7 +16,7 @@ from pathlib import Path
 import json
 import io
 
-from flask import Flask, jsonify, request, send_file, render_template, abort
+from flask import Flask, jsonify, request, send_file, render_template, abort, send_from_directory
 import safetensors
 import torch
 from torchvision.transforms.functional import to_pil_image
@@ -25,16 +25,14 @@ import matplotlib
 matplotlib.use('Agg') # Use non-interactive backend for server-side plotting
 
 # --- 1. Global State & Configuration ---
-# This data will be loaded once at startup.
-# The server is read-only, so this simple global state is sufficient.
 API_SPEC = {}
 CACHE_ROOT = None
-# Maps work_id -> {asset_type: {location_str, ...}}
+# Maps work_id -> {asset_key_suffix: {location_file, ...}}
 WORK_ID_TO_ASSETS = {}
-# Maps asset_type -> list of available work_ids
+# Maps asset_type_suffix -> list of available work_ids
 ASSET_TYPE_INDEX = {}
-# Maps report_name -> {file_path, metadata}
-REPORTS_INDEX = {}
+# Maps report_name -> list of contributing work_ids
+REPORT_BASED_INDEX = {}
 
 # --- 2. Server Setup Utilities ---
 
@@ -46,83 +44,67 @@ def find_free_port():
 
 def scan_cache_directory(root_path: Path):
     """
-    Scans the cache directory, parsing all .safetensors files to build
-    the server's internal index of available assets and reports.
+    (REVISED) Scans the cache directory to build a work-item-centric index.
+    This creates a WORK_ID_TO_ASSETS mapping of:
+    { work_id_1: [asset_type_A, asset_type_B], ... }
     """
-    global WORK_ID_TO_ASSETS, ASSET_TYPE_INDEX, REPORTS_INDEX, CACHE_ROOT
+    global WORK_ID_TO_ASSETS, CACHE_ROOT
     CACHE_ROOT = root_path
     print(f"[Server] Scanning cache directory: {root_path}...")
 
     if not root_path.is_dir():
         raise FileNotFoundError(f"Cache root directory not found: {root_path}")
 
+    # This will temporarily map work_id -> {asset_type: location}
+    temp_work_id_map = {}
+    # This will be our final primary index: work_id -> sorted list of asset types
+    WORK_ID_TO_ASSETS = {}
+    
     for f_path in root_path.glob("*.safetensors"):
         try:
             with safetensors.safe_open(f_path, framework="pt", device="cpu") as f:
-                # Check for aggregate reports first via metadata
-                metadata = f.metadata()
-                if metadata and "aggregate_result" in " ".join(metadata.keys()):
-                    # This is likely an aggregate report file
-                    report_key = next(iter(metadata.keys()))
-                    report_info = json.loads(metadata[report_key])
-                    asset_type = report_info.get("asset_type")
-                    if asset_type:
-                        report_name = asset_type.replace("aggregate_", "").replace("_report", "")
-                        REPORTS_INDEX[report_name] = {
-                            "file_path": f_path,
-                            "asset_type": asset_type,
-                            "report_key_prefix": report_key,
-                            "contributing_work_ids": report_info.get("contributing_work_ids", [])
-                        }
-                        print(f"  - Found Aggregate Report: '{report_name}' in {f_path.name}")
-                    continue
-
-                # Process as a regular asset cache file
                 for key in f.keys():
-                    parts = key.split('_')
+                    parts = key.split('_', 1)
                     if len(parts) < 2: continue
+                    work_id, asset_type = parts[0], parts[1]
                     
-                    work_id, asset_type = parts[0], "_".join(parts[1:])
-                    
-                    # Handle nested assets (like text embeddings)
-                    if asset_type.endswith(("cond", "uncond")):
-                       asset_type = "_".join(parts[1:-1]) # e.g. text_embedding
-                    if asset_type.endswith(("mean", "std", "global", "channel")):
-                        asset_type = "latent_stats"
+                    if work_id not in temp_work_id_map:
+                        temp_work_id_map[work_id] = {}
 
-                    if work_id not in WORK_ID_TO_ASSETS:
-                        WORK_ID_TO_ASSETS[work_id] = {}
-                    if asset_type not in ASSET_TYPE_INDEX:
-                        ASSET_TYPE_INDEX[asset_type] = []
-
-                    if asset_type not in WORK_ID_TO_ASSETS[work_id]:
-                         WORK_ID_TO_ASSETS[work_id][asset_type] = {"location_file": str(f_path)}
-                         ASSET_TYPE_INDEX[asset_type].append(work_id)
+                    # Store the location info for each asset
+                    if asset_type not in temp_work_id_map[work_id]:
+                        temp_work_id_map[work_id][asset_type] = {"location_file": str(f_path)}
 
         except Exception as e:
-            print(f"  - WARNING: Could not process file {f_path.name}. Error: {e}")
+            print(f"  - WARNING: Could not process file {f_path.name} during asset scan. Error: {e}")
     
-    print(f"[Server] Scan complete. Found {len(WORK_ID_TO_ASSETS)} unique work items.")
-    print(f"         Available asset types: {list(ASSET_TYPE_INDEX.keys())}")
-    print(f"         Available reports: {list(REPORTS_INDEX.keys())}")
+    # Finalize the primary WORK_ID_TO_ASSETS index with sorted asset lists
+    for work_id, assets in temp_work_id_map.items():
+        WORK_ID_TO_ASSETS[work_id] = sorted(list(assets.keys()))
 
+    # Store the more detailed location map in the app's context for later use
+    # This avoids making it a global, keeping WORK_ID_TO_ASSETS as the clean index.
+    app.config['ASSET_LOCATION_MAP'] = temp_work_id_map
+
+    print(f"[Server] Scan complete. Found {len(WORK_ID_TO_ASSETS)} unique work items.")
 
 def build_api_spec(host, port):
-    """Builds the API specification dictionary."""
+    """
+    (REVISED) Builds the API specification dictionary, replacing the legacy
+    /api/view/image endpoint with the more capable /api/asset endpoint.
+    """
     global API_SPEC
     base_url = f"http://{host}:{port}"
     API_SPEC = {
         "description": "The Dataset Loupe API. A read-only service for exploring artifacts.",
-        "version": "1.0.0",
+        "version": "4.0.0",
         "human_interface": f"{base_url}/client",
         "endpoints": {
             "GET /": "Returns this API specification.",
             "GET /client": "Serves the interactive web UI.",
-            "GET /api/summary": "Provides a high-level overview of all cached items.",
-            "GET /api/item/{work_id}": "Fetches the detailed manifest for a single work item.",
-            "GET /api/view/image/{work_id}/{asset_type}": "Renders a tensor as a PNG image.",
-            "GET /api/reports/{report_name}": "Retrieves a pre-computed aggregate report.",
-            "POST /client/action": "Receives a high-level command and returns a display plan."
+            "GET /api/index": "Provides the primary, work-item-centric index of the dataset.",
+            "POST /api/batch/assets": "Accepts a list of work_ids and an asset_type, and returns the data for all of them.",
+            "GET /api/asset/{work_id}/{asset_type}": "Fetches a single asset, prepared as structured JSON for client-side rendering."
         }
     }
 
@@ -138,27 +120,35 @@ def resource_not_found(e):
 def internal_server_error(e):
     return jsonify(error="Internal Server Error", message=str(e)), 500
 
-# --- Core Endpoints ---
-
 @app.route("/")
 def get_api_spec():
-    """Serves the universal map of the API."""
     return jsonify(API_SPEC)
 
 @app.route("/client")
 def serve_client():
-    """Serves the human-facing web client."""
     return render_template('index.html')
 
-# --- API Endpoints ---
+# ADDED: Route to serve JS file from the templates directory.
+@app.route('/templates/<path:filename>')
+def serve_template_asset(filename):
+    return send_from_directory('templates', filename)
 
-@app.route("/api/summary")
-def get_summary():
+@app.route("/api/indices")
+def get_indices():
     return jsonify({
-        "work_ids": sorted(list(WORK_ID_TO_ASSETS.keys())),
-        "available_asset_types": sorted(list(ASSET_TYPE_INDEX.keys())),
-        "available_reports": sorted(list(REPORTS_INDEX.keys())),
-        "total_items": len(WORK_ID_TO_ASSETS)
+        "by_asset_type": ASSET_TYPE_INDEX,
+        "by_report": REPORT_BASED_INDEX
+    })
+
+@app.route("/api/index")
+def get_index():
+    """
+    Serves the primary, work-item-centric view of the dataset.
+    Satisfies Rule 2.1 by its structure.
+    """
+    return jsonify({
+        "query_endpoint": "/api/index",
+        "work_items": WORK_ID_TO_ASSETS
     })
 
 @app.route("/api/item/<work_id>")
@@ -166,128 +156,131 @@ def get_item_details(work_id):
     if work_id not in WORK_ID_TO_ASSETS:
         abort(404)
     return jsonify(WORK_ID_TO_ASSETS[work_id])
-    
-@app.route("/api/reports/<report_name>")
-def get_report(report_name):
-    if report_name not in REPORTS_INDEX:
-        abort(404)
-    # For now, we just return the basic info. A more complex implementation
-    # could parse the report file here.
-    return jsonify(REPORTS_INDEX[report_name])
 
-
-@app.route("/api/view/image/<work_id>/<asset_type>")
-def view_image(work_id, asset_type):
-    """The core visualization engine. Loads a tensor and renders it as a PNG."""
-    if work_id not in WORK_ID_TO_ASSETS:
-        abort(404)
-    
-    asset_info = WORK_ID_TO_ASSETS[work_id].get(asset_type)
-    if not asset_info and asset_type != 'vae_residual':
-        abort(404, description=f"Asset type '{asset_type}' not found for work_id '{work_id}'.")
-
-    try:
-        if asset_type == 'vae_residual':
-            # This is a virtual asset, computed on the fly
-            recon_info = WORK_ID_TO_ASSETS[work_id].get('reconstructed_image')
-            # For original image, we'd need to trace it back to the source plan.
-            # This is complex, so we'll stub it for now and just show the reconstruction.
-            # A real implementation would need to read the `latent_encoding_work_specs`.
-            if not recon_info: abort(404, description="Reconstructed image required for residual not found.")
-            
-            with safetensors.safe_open(recon_info['location_file'], framework="pt", device="cpu") as f:
-                tensor = f.get_tensor(f"{work_id}_reconstructed_image")
-            # For demo, the residual is just the reconstructed image.
-            # A real version would be `original - recon`.
-            tensor = (tensor - tensor.min()) / (tensor.max() - tensor.min()) # Normalize for viewing
-
-        elif asset_type == 'latent':
-            latent_info = WORK_ID_TO_ASSETS[work_id]['latent']
-            with safetensors.safe_open(latent_info['location_file'], framework="pt", device="cpu") as f:
-                tensor = f.get_tensor(f"{work_id}_latent")
-        
-        else: # Assumes a standard image-like asset
-            with safetensors.safe_open(asset_info['location_file'], framework="pt", device="cpu") as f:
-                tensor = f.get_tensor(f"{work_id}_{asset_type}")
-
-        # --- Tensor to Image Conversion ---
-        if tensor.dim() == 4 and tensor.shape[0] == 1: tensor = tensor.squeeze(0)
+def _prepare_asset_for_transport(tensor, asset_type):
+    """
+    (NEW HELPER) Centralized function to inspect a tensor and convert it
+    into a structured, client-friendly JSON object with a render_type hint.
+    """
+    # Special case: The detailed 2x2 plot for multi-channel latent tensors.
+    if asset_type == 'latent' and tensor.dim() == 3 and tensor.shape[0] == 4:
+        fig, axes = plt.subplots(2, 2, figsize=(8, 8), constrained_layout=True)
+        vmin, vmax = tensor.min(), tensor.max()
+        for i, ax in enumerate(axes.flat):
+            channel_data = tensor[i].float()
+            ax.imshow(channel_data, cmap='viridis', vmin=vmin, vmax=vmax)
+            ax.set_title(f"Ch {i} | Mean: {channel_data.mean():.2f}, Std: {channel_data.std():.2f}")
+            ax.axis('off')
         
         img_buffer = io.BytesIO()
+        fig.savefig(img_buffer, format='png')
+        plt.close(fig)
+        b64_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+        return {"render_type": "image", "data": b64_image}
 
-        if asset_type == 'latent' and tensor.dim() == 3 and tensor.shape[0] == 4:
-            # Render 4 channels in a 2x2 grid
-            fig, axes = plt.subplots(2, 2, figsize=(8, 8), constrained_layout=True)
-            fig.suptitle(f"Latent: {work_id[:12]}...", fontsize=14)
-            vmin, vmax = tensor.min(), tensor.max()
-            for i, ax in enumerate(axes.flat):
-                channel_data = tensor[i].float()
-                ax.imshow(channel_data, cmap='viridis', vmin=vmin, vmax=vmax)
-                ax.set_title(f"Ch {i} | Mean: {channel_data.mean():.2f}, Std: {channel_data.std():.2f}")
-                ax.axis('off')
-            fig.savefig(img_buffer, format='png')
-            plt.close(fig)
-        else:
-            # Render as a standard image
-            pil_img = to_pil_image(tensor.float().cpu())
-            pil_img.save(img_buffer, format='PNG')
-            
-        img_buffer.seek(0)
-        return send_file(img_buffer, mimetype='image/png')
+    # General cases for other tensors.
+    elif tensor.dim() >= 2: # Treat as a standard image
+        if tensor.dim() == 4 and tensor.shape[0] == 1: tensor = tensor.squeeze(0)
+        tensor = torch.clamp(tensor, 0, 1)
+        pil_img = to_pil_image(tensor.float().cpu())
+        img_buffer = io.BytesIO()
+        pil_img.save(img_buffer, format='PNG')
+        b64_image = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+        return {"render_type": "image", "data": b64_image}
+
+    elif tensor.dim() == 0: # Treat as a scalar value
+        return {"render_type": "scalar", "data": {"value": f"{tensor.item():.4f}"}}
+    
+    else: # Treat as a generic vector/tensor
+        return {
+            "render_type": "vector", 
+            "data": {
+                "repr": str(tensor.tolist()),
+                "shape": str(list(tensor.shape)),
+                "dtype": str(tensor.dtype)
+            }
+        }
+
+
+@app.route("/api/asset/<work_id>/<path:asset_type>")
+def get_asset_details(work_id, asset_type):
+    """
+    Fetches a single asset and returns its structured
+    JSON representation, prepared for client-side rendering.
+    This endpoint replaces the legacy /api/view/image endpoint.
+    """
+    asset_location_map = app.config.get('ASSET_LOCATION_MAP', {})
+    if work_id not in asset_location_map or asset_type not in asset_location_map[work_id]:
+        abort(404, description=f"Asset '{asset_type}' not found for work_id '{work_id}'.")
+    
+    asset_info = asset_location_map[work_id][asset_type]
+    location_file = asset_info['location_file']
+    tensor_key = f"{work_id}_{asset_type}"
+
+    try:
+        with safetensors.safe_open(location_file, framework="pt", device="cpu") as f:
+            tensor = f.get_tensor(tensor_key)
+        
+        # Use the centralized helper function to ensure consistent processing
+        response_data = _prepare_asset_for_transport(tensor, asset_type)
+        return jsonify(response_data)
 
     except Exception as e:
-        print(f"ERROR rendering image for {work_id}/{asset_type}: {e}")
-        abort(500, description="Failed to render tensor as image.")
+        print(f"ERROR preparing asset for {work_id}/{asset_type}: {e}")
+        return jsonify({"render_type": "error", "data": {"message": str(e)}}), 500
 
+@app.route("/api/batch/assets", methods=['POST'])
+def get_batch_assets():
+    """
+    (REVISED) Serves a collection of assets, using the centralized helper
+    to ensure consistent visualization logic.
+    """
+    request_data = request.get_json()
+    if not request_data or 'work_ids' not in request_data or 'asset_type' not in request_data:
+        abort(400)
 
-@app.route("/client/action", methods=['POST'])
-def handle_client_action():
-    """The 'MCP Latch' - translates a high-level UI query into a display plan."""
-    action_request = request.get_json()
-    if not action_request or "action" not in action_request:
-        return jsonify(error="Invalid request format"), 400
+    work_ids = request_data['work_ids']
+    asset_type = request_data['asset_type']
+    
+    asset_location_map = app.config.get('ASSET_LOCATION_MAP', {})
+    batch_response = {}
 
-    action = action_request.get("action")
-    query = action_request.get("query", {})
+    for work_id in work_ids:
+        if work_id not in asset_location_map or asset_type not in asset_location_map[work_id]:
+            continue
 
-    if action == "view_list":
-        # In a real app, we'd apply sorting/filtering from the query.
-        # For now, we'll just return a plan for the first few items.
-        limit = query.get("limit", 5)
-        work_ids = sorted(list(WORK_ID_TO_ASSETS.keys()))[:limit]
-        views_to_render = action_request.get("views_to_render", ["reconstructed_image"])
+        asset_info = asset_location_map[work_id][asset_type]
+        location_file = asset_info['location_file']
+        tensor_key = f"{work_id}_{asset_type}"
 
-        display_plan = []
-        for work_id in work_ids:
-            plan_item = {"work_id": work_id, "views": {}}
-            for view in views_to_render:
-                if view in WORK_ID_TO_ASSETS[work_id] or view == 'vae_residual':
-                    plan_item["views"][view] = f"/api/view/image/{work_id}/{view}"
-            display_plan.append(plan_item)
-        
-        return jsonify({"display_plan": display_plan})
-        
-    return jsonify(error="Unknown action"), 400
+        try:
+            with safetensors.safe_open(location_file, framework="pt", device="cpu") as f:
+                tensor = f.get_tensor(tensor_key)
+            
+            # Use the new centralized helper function
+            batch_response[work_id] = _prepare_asset_for_transport(tensor, asset_type)
 
+        except Exception as e:
+            print(f"ERROR preparing batch asset for {work_id}/{asset_type}: {e}")
+            batch_response[work_id] = {"render_type": "error", "data": {"message": str(e)}}
+
+    return jsonify({
+        "query": { "asset_type": asset_type },
+        "assets": batch_response
+    })
 
 # --- 4. Main Execution ---
 
 if __name__ == "__main__":
+    import base64
     parser = argparse.ArgumentParser(description="Dataset Loupe Backend Server")
-    parser.add_argument(
-        '--cache_root',
-        type=Path,
-        required=True,
-        help="Path to the root directory containing the .safetensors cache files."
-    )
+    parser.add_argument('--cache_root', type=Path, required=True, help="Path to the cache directory.")
     args = parser.parse_args()
 
-    # Initialize the server state
     scan_cache_directory(args.cache_root)
     port = find_free_port()
     host = "127.0.0.1"
     
-    # Finalize the spec with the runtime host/port
     build_api_spec(host, port)
     
     print("\n--- Dataset Loupe Server ---")
@@ -295,6 +288,5 @@ if __name__ == "__main__":
     print(f"API specification available at: http://{host}:{port}/")
     print(f"Human-friendly client at: http://{host}:{port}/client")
     print("----------------------------")
-    print("Press CTRL+C to stop the server.")
 
     app.run(host=host, port=port, debug=False)
