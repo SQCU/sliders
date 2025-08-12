@@ -457,7 +457,7 @@ if __name__ == "__main__":
                 
                 print(
                     f"[Main Loop] BS: {batch_size:<2} | "
-                    f"Shape:{on_device_batch.shape} | "
+                    f"Shape:{payload_tensor.shape} | "
                     f"Wait: {wait_time_ms:6.2f}ms | Work: {work_time_ms:6.2f}ms | "
                     f"Processed: {processed_items_count + batch_size}"
                 )
