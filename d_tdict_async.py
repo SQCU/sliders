@@ -67,28 +67,29 @@ class LoaderStalledSignal:
 
 class BatchHandle:
     """A context manager that provides safe, temporary access to a GPU buffer."""
-    def __init__(self, loader_instance, gpu_buffer_ref, buffer_index, internal_key):
+    def __init__(self, loader_instance, gpu_buffer_ref, buffer_index):
         """
-        Initializes the handle.
+        Initializes the handle. The internal_key is no longer needed.
 
         Args:
             loader_instance: A reference to the parent SafePipelinedTensorDictLoader.
             gpu_buffer_ref: A direct reference to the TensorDict on the target device.
             buffer_index: The integer index of the buffer this handle manages.
-            internal_key: The private key to access the tensor payload within the container.
         """
         self._loader = loader_instance
         self._gpu_buffer_ref = gpu_buffer_ref
         self._buffer_index = buffer_index
-        self._internal_key = internal_key
 
     def __enter__(self):
-        """Called upon entering the 'with' block. Returns the actual data."""
-        return self._gpu_buffer_ref[self._internal_key]
+        """
+        REVISED: Called upon entering the 'with' block. Returns the actual
+        TensorDict data container.
+        """
+        return self._gpu_buffer_ref
 
     def __exit__(self, exc_type, exc_value, traceback):
         """
-        Called upon exiting the 'with' block. Guarantees the buffer is released.
+        (Unchanged) Called upon exiting the 'with' block. Guarantees the buffer is released.
         """
         self._loader._release_buffer_by_index(self._buffer_index)
 
@@ -103,74 +104,61 @@ def _cpu_worker_process(
     free_indices_queue: mp.Queue,
     cpu_filled_buffer_queue: mp.Queue,
     batch_size_queue: mp.Queue,
-    cpu_pinned_pool: list, # This will be a Manager.list
+    cpu_pinned_pool: list,
+    # The preprocessor now returns a dictionary of tensors.
     preprocessing_fn: callable,
     partial_batch_mode: str,
-    sentinel_value: object,
-    internal_key: str  # The private key for the container
+    sentinel_value: object
+    # No longer needs internal_key
 ):
     """
-    Worker that calls the user's preprocessor (which returns a Tensor),
-    packs the tensor into a TensorDict container, and batches them.
+    Worker that calls the user's preprocessor (which returns a Dict[str, Tensor]),
+    wraps each item into a TensorDict, and then batches them by stacking.
     """
     current_bs = 1
-    batch_buffer = [] # This will now be a list of Tensors
+    # The buffer will now hold single-item TensorDicts.
+    batch_buffer = []
 
     while True:
-        # Non-blockingly check for a batch size update
         try:
             current_bs = batch_size_queue.get_nowait()
         except Empty:
             pass
 
-        # Block until we get a raw data item or a shutdown signal
         raw_item = raw_data_queue.get()
 
-        # --- I. Handle Shutdown Signal ---
         if isinstance(raw_item, LoaderTerminationSignal):
-            # If there's a final partial batch, dispatch it.
             if batch_buffer:
-                # Get a buffer index only now that we need to dispatch.
                 idx = free_indices_queue.get()
                 if not isinstance(idx, LoaderTerminationSignal):
-                    stacked_tensor = torch.stack(batch_buffer, dim=0)
-                    container_td = TensorDict(
-                        {internal_key: stacked_tensor},
-                        batch_size=[stacked_tensor.shape[0]]
-                    )
-                    cpu_pinned_pool[idx] = container_td.pin_memory()
+                    # Stack the list of TensorDicts to create one batched TensorDict.
+                    stacked_td = torch.stack(batch_buffer, dim=0)
+                    cpu_pinned_pool[idx] = stacked_td.pin_memory()
                     cpu_filled_buffer_queue.put(idx)
-                    # batch_buffer is cleared implicitly as the worker exits.
 
-            # Ensure the shutdown signal propagates to the next stage and exit.
             cpu_filled_buffer_queue.put(sentinel_value)
             break
 
-        # --- II. Normal Processing Path ---
-        user_tensor = preprocessing_fn(raw_item)
-        batch_buffer.append(user_tensor)
+        # --- REVISED: Normal Processing Path ---
+        # 1. Preprocessor returns a dictionary of tensors.
+        user_dict = preprocessing_fn(raw_item)
+        # 2. Immediately wrap it in a non-batched TensorDict.
+        item_td = TensorDict(user_dict, batch_size=[])
+        batch_buffer.append(item_td)
 
-        # If the batch of tensors is full, acquire a buffer and dispatch
         if len(batch_buffer) >= current_bs:
-            # Get a buffer index only when the batch is ready.
             idx = free_indices_queue.get()
             if isinstance(idx, LoaderTerminationSignal):
-                # Shutdown signal received while trying to dispatch.
-                # Propagate the signal and exit; this batch is dropped.
                 cpu_filled_buffer_queue.put(sentinel_value)
                 break
 
-            stacked_tensor = torch.stack(batch_buffer, dim=0)
-            container_td = TensorDict(
-                {internal_key: stacked_tensor},
-                batch_size=[stacked_tensor.shape[0]]
-            )
+            # 3. Stack the list of TensorDicts. This correctly creates a
+            #    batched TensorDict where each key points to a batched tensor.
+            stacked_td = torch.stack(batch_buffer, dim=0)
 
-            # Place the container in the shared pool using the just-acquired index
-            cpu_pinned_pool[idx] = container_td.pin_memory()
+            # 4. Place the final batched TensorDict in the shared pool.
+            cpu_pinned_pool[idx] = stacked_td.pin_memory()
             cpu_filled_buffer_queue.put(idx)
-
-            # Reset for the next batch
             batch_buffer = []
 
 def _gpu_transfer_process(
@@ -226,7 +214,8 @@ class SafePipelinedTensorDictLoader:
         self.buffer_count = buffer_count
         self.partial_batch_mode = partial_batch_mode
         
-        self._INTERNAL_DATA_KEY = "_payload"
+        # The internal data key is no longer necessary.
+        # self._INTERNAL_DATA_KEY = "_payload"
         self.SENTINEL = LoaderTerminationSignal()
 
         ctx = mp.get_context("spawn")
@@ -255,7 +244,7 @@ class SafePipelinedTensorDictLoader:
                 target=_cpu_worker_process,
                 args=(self.raw_data_queue, self.free_indices_queue, self.cpu_filled_buffer_queue,
                       self.batch_size_queue, self.cpu_pinned_pool, preprocessing_fn,
-                      self.partial_batch_mode, self.SENTINEL, self._INTERNAL_DATA_KEY
+                      self.partial_batch_mode, self.SENTINEL
                       ),
                 daemon=True
             )
@@ -342,12 +331,8 @@ class SafePipelinedTensorDictLoader:
 
     def get_next_batch(self):
         """
-        Requests the next available batch from the pipeline.
-
-        Returns:
-            - BatchHandle: A context manager for safe access to the batch data.
-            - LoaderTerminationSignal: If the stream is finished.
-            - LoaderStalledSignal: If the pipeline is temporarily empty.
+        REVISED: Requests the next available batch. The returned handle now
+        provides the full TensorDict.
         """
         try:
             item = self.ready_for_consumption_queue.get_nowait()
@@ -356,13 +341,13 @@ class SafePipelinedTensorDictLoader:
 
             idx, sync_event = item
             if sync_event:
-                sync_event.synchronize() # Block until data is actually on GPU
+                sync_event.synchronize()
             
+            # REVISED: Create the handle without the internal key.
             return BatchHandle(
-            self,
-            self.gpu_pool[idx],
-            idx,
-            self._INTERNAL_DATA_KEY
+                self,
+                self.gpu_pool[idx],
+                idx
             )
 
         except Empty:
@@ -406,7 +391,7 @@ def simple_text_preprocessor(text_string: str) -> TensorDict:
     ascii_values = [ord(c) for c in text_string]
     # Pad or truncate to max_len
     padded_values = (ascii_values + [0] * max_len)[:max_len]
-    return torch.tensor(padded_values, dtype=torch.int32)
+    return {"input_ids": torch.tensor(padded_values, dtype=torch.int32)}
 
 if __name__ == "__main__":
     print("--- Testing SafePipelinedTensorDictLoader ---")
@@ -457,12 +442,13 @@ if __name__ == "__main__":
 
             # --- Use the handle in a 'with' block for state management ---
             with handle as on_device_batch:
-
+                
+                payload_tensor = on_device_batch['input_ids']
                 t_start_work = time.perf_counter()
 
                 #print(f"how confusing... what kind of object did we pass ourselves...?\nrepr:{repr(on_device_batch)}")
                 #print(f"we're about to call `on_device_batch.shape[0]`...\nwhat's on_device_batch.shape?\n{on_device_batch.shape}")
-                batch_size = on_device_batch.shape[0]                
+                batch_size = payload_tensor.shape[0]                
                 # Simulate a computationally intensive task
                 time.sleep(0.05)
                 
