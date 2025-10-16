@@ -408,6 +408,9 @@ def get_optimizer(name: str):
             import prodigyopt
             
             return prodigyopt.Prodigy
+        elif name == "gluondist":
+            from gluon_experiment import GlazyGloptimizer
+            return GlazyGloptimizer
         else:
             raise ValueError("Optimizer must be adam, adamw, lion or Prodigy")
 

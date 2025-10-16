@@ -3,18 +3,14 @@
 built from Official code implementation of "Concept Sliders: LoRA Adaptors for Precise Control in Diffusion Models", European Conference on Computer Vision (ECCV 2024).
 
 ## setup:
+updated for cuda 12.8 and pytorch 2.7.1 and also, believe it or not, the gluon optimizer!
+
 ```
 uv init
-uv venv
+uv venv --seed 
 #uv add torch torchvision torchaudio --index pytorch=https://download.pytorch.org/whl/cu124
-uv add https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl
-uv add setuptools
-uv add flash-attn==2.7.2.post1
-#MANUALLY OVERWRITE PYPROJECT.TOML WITH REAL INDEXES
-uv add torch torchvision torchaudio
-uv add -r requirements-loose.txt
-uv add bitsandbytes>=0.43.0
-uv add lycoris-lora?
+uv sync --extra cuda
+#uv add flash-attn... if you dare...
 ```
 `uv run trainscripts/imagesliders/train_lora-scale-xl.py *args ...`
 if you know how to install uv, i trust you. i trust you to understand how to reach inside of the pyproject.toml and lockfile... and add the appropriate lines to use the right indices for bsd, apple-mps, linux, and even system-v. you're gonna make it. it's gonna be okay. 

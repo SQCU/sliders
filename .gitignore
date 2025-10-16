@@ -3,3 +3,5 @@ models/**
 trainscripts/imagesliders/data/**
 trainscripts/textsliders/data/**
 trainscripts/imagesliders/__pycache__/**
+notes.txt
+trainscripts/__pycache__/

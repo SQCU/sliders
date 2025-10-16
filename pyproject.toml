@@ -9,7 +9,7 @@ dependencies = [
     "bitsandbytes>=0.43.0",
     "dadaptation>=3.2",
     "diffusers>=0.33.1",
-    "flash-attn==2.7.2.post1",
+    #"flash-attn==2.7.2.post1",
     "ipython>=8.36.0",
     "lion-pytorch>=0.2.3",
     "lpips>=0.1.4",
@@ -26,29 +26,34 @@ dependencies = [
     "requests>=2.32.3",
     "safetensors>=0.5.3",
     "setuptools>=80.4.0",
-    "torch>=2.5.1",
+    "torch>=2.7.1", # nu torch for distributed ops tests
     "torchaudio>=2.5.1",
     "torchvision>=0.20.1",
     "tqdm>=4.67.1",
     "transformers>=4.51.3",
-    "triton",
     "wandb>=0.19.11",
+    "gluon-experiment @ git+https://github.com/sqcu/gluon-experiment.git" # dion has rocked for a long long time
+]
+
+[project.optional-dependencies]
+cuda = [
+    #"triton @ git+https://github.com/woct0rdho/triton-windows.git@v3.3.1-windows.post19; sys_platform == 'win32'",
+    "triton-windows<3.4; sys_platform == 'win32'",
 ]
 
 [tool.uv.sources]
-triton = { url = "https://github.com/woct0rdho/triton-windows/releases/download/v3.1.0-windows.post8/triton-3.1.0-cp310-cp310-win_amd64.whl" }
 torch = [
-  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchvision = [
-  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchaudio = [
-  { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 
 
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true

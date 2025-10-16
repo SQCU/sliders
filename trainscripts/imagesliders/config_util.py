@@ -38,6 +38,7 @@ class TrainConfig(BaseModel):
     lr_scheduler: str = "constant"
 
     max_denoising_steps: int = 50
+    grad_accum: int = 16
 
 
 class SaveConfig(BaseModel):
