@@ -516,6 +516,15 @@ def train(
         
         if (i + 1) % ACCUMULATION_STEPS == 0:
             # The profiler's step method is called here, seeing the accumulated grad
+            GRAD_CLIP_MAX_NORM = getattr(config.train, 'grad_clip', 0.1)
+
+            if GRAD_CLIP_MAX_NORM is not None and GRAD_CLIP_MAX_NORM > 0:
+                # This is the list of parameters whose gradients will be clipped
+                params_to_clip = [p for group in optimizer.param_groups for p in group['params'] if p.grad is not None]
+                
+                # The single, canonical function call for gradient clipping
+                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=GRAD_CLIP_MAX_NORM)
+
             optimizer.step() 
             lr_scheduler.step()
             optimizer.zero_grad()

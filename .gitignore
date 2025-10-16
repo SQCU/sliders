@@ -5,3 +5,4 @@ trainscripts/textsliders/data/**
 trainscripts/imagesliders/__pycache__/**
 notes.txt
 trainscripts/__pycache__/
+glazy_gluon/

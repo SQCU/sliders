@@ -39,6 +39,7 @@ class TrainConfig(BaseModel):
 
     max_denoising_steps: int = 50
     grad_accum: int = 16
+    grad_clip: float = 0.1
 
 
 class SaveConfig(BaseModel):
