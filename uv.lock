@@ -537,7 +537,7 @@ wheels = [
 [[package]]
 name = "gluon-experiment"
 version = "0.1.0"
-source = { git = "https://github.com/sqcu/gluon-experiment.git#fe8cf342497074b4154d7fae6d8d2a7a208b24e0" }
+source = { git = "https://github.com/sqcu/gluon-experiment.git#55c854f2d30af8c4fd2bc14e939cf4d3a44834c5" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },

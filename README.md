@@ -11,6 +11,7 @@ uv venv --seed
 #uv add torch torchvision torchaudio --index pytorch=https://download.pytorch.org/whl/cu124
 uv sync --extra cuda
 #uv add flash-attn... if you dare...
+`"gluon-experiment @ git+https://github.com/sqcu/gluon-experiment.git"` in ur pyproject.toml...
 ```
 `uv run trainscripts/imagesliders/train_lora-scale-xl.py *args ...`
 if you know how to install uv, i trust you. i trust you to understand how to reach inside of the pyproject.toml and lockfile... and add the appropriate lines to use the right indices for bsd, apple-mps, linux, and even system-v. you're gonna make it. it's gonna be okay. 
@@ -18,6 +19,33 @@ if you know how to install uv, i trust you. i trust you to understand how to rea
 remember that pyprojects and lockfiles are there to *increase* the scope of support and reproducibility of software projects, not to induce playground arguments about whether ALGOLS or LISPS are gonna be the machines of the future. 
 
 ## config: 
+gluon update!
+
+use these hyperparameters as a starting point to get a reasonable assurance of a gluon orthogonalized optimization run. 
+
+gluon requires a warmup run: train 2 adapters: one for like idk 240 to 360 steps with at least grad accum 8 (necessary for gluon statistics, sorry, diffusion has very bouncy noisy gradient stats).
+
+you will end up with a logfile printed to a relative directory with some files and stuff. read them if you want! running the same script a *second time* will parse those files to initialize the l0 and l1 terms of the gluon algorithm and start up a muon-optimizer-like-training-run which will probably converge.
+
+gluon is stable at *far* higher learning rates than adam, but 1.0 LR still blows up.
+```
+network:
+  type: "c3lier" # or "c3lier" or "lierla"
+  rank: 64
+  alpha: 16.0
+  training_method: "noxattn"
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  iterations: 1200
+  lr: 0.01  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "cosine"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 8
+  grad_clip: 0.1
+```
+
 edit f"config-xl-{your_experiment}.yaml" to:
 ```
 network:
