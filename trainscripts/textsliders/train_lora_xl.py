@@ -7,6 +7,7 @@ import argparse
 import ast
 from pathlib import Path
 import gc
+import os
 
 import torch
 from tqdm import tqdm
@@ -386,9 +387,26 @@ def train(
 
     print("Done.")
 
+# uhhh check what attention backend is available
+from torch.backends.cuda import sdp_kernel, SDPBackend
+def log_attention_backend_status(worker_pid):
+    """Checks and logs the status of the selected PyTorch attention backend."""
+    if not torch.cuda.is_available():
+        print(f"[{worker_pid}] CUDA not available. Using default CPU attention backend.")
+        return
+
+    # Check which backend was successfully enabled by the sdp_kernel context
+    if torch.backends.cuda.flash_sdp_enabled():
+        print(f"[{worker_pid}] ✅ PyTorch attention backend set to FLASH ATTENTION (Fastest)")
+    elif torch.backends.cuda.mem_efficient_sdp_enabled():
+        print(f"[{worker_pid}] ✅ PyTorch attention backend set to MEMORY-EFFICIENT (xFormers/Native)")
+    else:
+        print(f"[{worker_pid}] ⚠️ PyTorch attention backend fell back to MATH (Eager/Slowest)")
 
 def main(args):
     config_file = args.config_file
+    worker_pid = os.getpid()
+    log_attention_backend_status(worker_pid)
 
     config = config_util.load_config_from_yaml(config_file)
     if args.name is not None:

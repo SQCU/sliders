@@ -9,6 +9,7 @@ import ast
 from pathlib import Path
 import gc, os
 import numpy as np
+import math
 
 import torch
 from tqdm import tqdm
@@ -34,6 +35,92 @@ import wandb
 
 NUM_IMAGES_PER_PROMPT = 1
 from lora import LoRANetwork, DEFAULT_TARGET_REPLACE, UNET_TARGET_REPLACE_MODULE_CONV
+
+def generate_ar_buckets(target_area: int, step: int = 64, max_ratio: float = 4.0):
+    """
+    Generates a list of (width, height) buckets with a target area, where dimensions
+    are multiples of a given step.
+    """
+    buckets = set()
+    min_dim = int(math.sqrt(target_area / max_ratio) // step) * step
+    max_dim = int(math.sqrt(target_area * max_ratio) // step) * step
+
+    for w in range(min_dim, max_dim + step, step):
+        if w == 0: continue
+        # Calculate height that gets closest to the target area
+        h = int(round(target_area / w / step)) * step
+        if h == 0: continue
+        buckets.add((w, h))
+        
+    # Also consider swapped aspect ratios
+    for h in range(min_dim, max_dim + step, step):
+        if h == 0: continue
+        w = int(round(target_area / h / step)) * step
+        if w == 0: continue
+        buckets.add((w, h))
+        
+    return sorted(list(buckets))
+
+def get_transform_params(
+    original_size: tuple[int, int],
+    buckets: list[tuple[int, int]],
+    k_nearest: int = 3,
+    sharpness: float = 1.0,
+):
+    """
+    Determines the target resolution and crop box for an image based on
+    probabilistic aspect ratio bucketing.
+
+    Returns:
+        crop_box (tuple[int, int, int, int]): The box to crop the original image.
+        target_size (tuple[int, int]): The final resolution to resize to.
+    """
+    original_w, original_h = original_size
+    original_ar = original_w / original_h
+
+    # Calculate distance to each bucket's aspect ratio
+    bucket_distances = []
+    for bucket_w, bucket_h in buckets:
+        bucket_ar = bucket_w / bucket_h
+        # Use log-space difference for better perceptual distance
+        distance = abs(math.log(original_ar) - math.log(bucket_ar))
+        bucket_distances.append((distance, (bucket_w, bucket_h)))
+
+    # Select the k-nearest buckets
+    bucket_distances.sort(key=lambda x: x[0])
+    nearest_buckets = bucket_distances[:k_nearest]
+
+    # Create a probability distribution using softmax
+    distances = np.array([-d for d, _ in nearest_buckets])
+    probabilities = np.exp((distances - np.max(distances)) * sharpness)
+    probabilities /= probabilities.sum()
+
+    # Sample a target bucket based on the distribution
+    chosen_idx = np.random.choice(len(nearest_buckets), p=probabilities)
+    _, target_size = nearest_buckets[chosen_idx]
+    target_w, target_h = target_size
+    target_ar = target_w / target_h
+
+    # Determine the crop box to match the target aspect ratio
+    if original_ar > target_ar:
+        # Original is wider than target -> crop width
+        new_w = int(target_ar * original_h)
+        offset = (original_w - new_w) // 2
+        crop_box = (offset, 0, offset + new_w, original_h)
+    else:
+        # Original is taller than target -> crop height
+        new_h = int(original_w / target_ar)
+        offset = (original_h - new_h) // 2
+        crop_box = (0, offset, original_w, offset + new_h)
+        
+    return crop_box, target_size
+
+
+def process_image(image: Image.Image, crop_box: tuple, target_size: tuple):
+    """Applies a crop and resize transformation to a PIL Image."""
+    cropped_image = image.crop(crop_box)
+    return cropped_image.resize(target_size, Image.LANCZOS)
+
 
 def flush():
     torch.cuda.empty_cache()
@@ -107,6 +194,18 @@ def train(
         print("✅  Successfully monkey-patched .sigmas onto the scheduler.")
     # ======================================================================
 
+    # --- NEW: Define bucketing parameters ---
+    TARGET_AREA = 512 * 512
+    BUCKET_STEP = 64
+    K_NEAREST_BUCKETS = 4 # How many nearby aspect ratios to consider for sampling
+    SAMPLING_SHARPNESS = 3.0 # Higher value -> more likely to pick the closest AR
+
+    print(f"Generating aspect ratio buckets for target area {TARGET_AREA}...")
+    ASPECT_RATIO_BUCKETS = generate_ar_buckets(TARGET_AREA, BUCKET_STEP)
+    print(f"✅ Generated {len(ASPECT_RATIO_BUCKETS)} buckets.")
+
+    LOGGING_INTERVAL = 100  # Log stats every 100 steps
+    sampled_ar_counts = {}
     
 
     for text_encoder in text_encoders:
@@ -352,13 +451,27 @@ def train(
             ims = os.listdir(f'{folder_main}/{folder1}/')
             ims = [im_ for im_ in ims if '.png' in im_ or '.jpg' in im_ or '.jpeg' in im_ or '.webp' in im_]
             random_sampler = random.randint(0, len(ims)-1)
+            image_name = random.choice(ims)
+
 
             #...
-            img1 = Image.open(f'{folder_main}/{folder1}/{ims[random_sampler]}').resize((512,512))#
-            img2 = Image.open(f'{folder_main}/{folder2}/{ims[random_sampler]}').resize((512,512))#
+            img1_raw = Image.open(f'{folder_main}/{folder1}/{image_name}').convert("RGB")
+            img2_raw = Image.open(f'{folder_main}/{folder2}/{image_name}').convert("RGB")
+            
+            # 4. Determine the *single* random transformation based on the first image
+            crop_box, target_size = get_transform_params(
+                original_size=img1_raw.size,
+                buckets=ASPECT_RATIO_BUCKETS,
+                k_nearest=K_NEAREST_BUCKETS,
+                sharpness=SAMPLING_SHARPNESS,
+            )
+            sampled_ar_counts[target_size] = sampled_ar_counts.get(target_size, 0) + 1
+
+            # 5. Apply the *exact same* transformation to both images
+            img1 = process_image(img1_raw, crop_box, target_size)
+            img2 = process_image(img2_raw, crop_box, target_size)
             
             seed = random.randint(0,2*15)
-            
             generator = torch.manual_seed(seed)
             denoised_latents_low, low_noise = train_util.get_noisy_image(
                 img1,
@@ -536,6 +649,24 @@ def train(
         )
         flush()
         
+
+        ### INTERVALED LOGGING AND PERSISTENCE:
+        # --- NEW: Periodically log the sampled aspect ratio distribution ---
+        if (i + 1) % LOGGING_INTERVAL == 0 and i > 0:
+            total_samples = sum(sampled_ar_counts.values())
+            print(f"\n--- Aspect Ratio Sampling Distribution (Step {i + 1}/{config.train.iterations}) ---")
+            print(f"{'Resolution':<15} | {'AR':<8} | {'Count':<7} | {'Percent':<7}")
+            print("-" * 50)
+            
+            # Sort by count in descending order for readability
+            sorted_counts = sorted(sampled_ar_counts.items(), key=lambda item: item[1], reverse=True)
+            
+            for (w, h), count in sorted_counts:
+                aspect_ratio = w / h
+                percentage = (count / total_samples) * 100
+                print(f"({w}, {h}){'':<6} | {aspect_ratio:.2f}:1{'':<3} | {count:<7} | {percentage:.2f}%")
+            print("-" * 50)
+        # -----------------------------------------------------------------
         if (
             i % config.save.per_steps == 0
             and i != 0
@@ -570,10 +701,27 @@ def train(
     print("Done.")
 
 
+# uhhh check what attention backend is available
+from torch.backends.cuda import sdp_kernel, SDPBackend
+def log_attention_backend_status(worker_pid):
+    """Checks and logs the status of the selected PyTorch attention backend."""
+    if not torch.cuda.is_available():
+        print(f"[{worker_pid}] CUDA not available. Using default CPU attention backend.")
+        return
+
+    # Check which backend was successfully enabled by the sdp_kernel context
+    if torch.backends.cuda.flash_sdp_enabled():
+        print(f"[{worker_pid}] ✅ PyTorch attention backend set to FLASH ATTENTION (Fastest)")
+    elif torch.backends.cuda.mem_efficient_sdp_enabled():
+        print(f"[{worker_pid}] ✅ PyTorch attention backend set to MEMORY-EFFICIENT (xFormers/Native)")
+    else:
+        print(f"[{worker_pid}] ⚠️ PyTorch attention backend fell back to MATH (Eager/Slowest)")
+
 def main(args):
     config_file = args.config_file
-
     config = config_util.load_config_from_yaml(config_file)
+
+    #meta
     if args.name is not None:
         config.save.name = args.name
     attributes = []
@@ -588,9 +736,14 @@ def main(args):
     config.save.name += f'_{config.network.training_method}'
     config.save.path += f'/{config.save.name}'
     
-    prompts = prompt_util.load_prompts_from_yaml(config.prompts_file, attributes)
-    
+    #cuda
     device = torch.device(f"cuda:{args.device}")
+    worker_pid = os.getpid()
+    log_attention_backend_status(worker_pid)
+
+    #data
+    prompts = prompt_util.load_prompts_from_yaml(config.prompts_file, attributes)
+
     
     folders = args.folders.split(',')
     folders = [f.strip() for f in folders]
