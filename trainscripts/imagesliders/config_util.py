@@ -41,6 +41,8 @@ class TrainConfig(BaseModel):
     grad_accum: int = 16
     grad_clip: float = 0.1
 
+    lambda_x0_loss: float = 0.001 # This is a starting point, it will need tuning!
+    lambda_std_loss: float = 0.001
 
 class SaveConfig(BaseModel):
     name: str = "untitled"

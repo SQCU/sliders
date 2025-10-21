@@ -234,6 +234,119 @@ def get_noisy_image(
     
     return init_latents, noise
 
+@torch.no_grad()
+def get_noisy_image_and_init_image(
+    img,
+    vae,
+    generator,
+    unet: UNet2DConditionModel,
+    scheduler: SchedulerMixin,
+    total_timesteps: int = 1000,
+    start_timesteps=0,
+    
+    **kwargs,
+):
+    # latents_steps = []
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor,do_convert_rgb=True)
+
+    image = img#.convert('RGB')
+    im_orig = image
+    device = vae.device
+    image = image_processor.preprocess(image).to(device)
+
+    init_latents = vae.encode(image).latent_dist.sample(None)
+    init_latents = vae.config.scaling_factor * init_latents
+
+    init_latents = torch.cat([init_latents], dim=0)
+
+    shape = init_latents.shape
+
+    noise = randn_tensor(shape, generator=generator, device=device)
+
+    time_ = total_timesteps
+    timestep = scheduler.timesteps[time_:time_+1]
+    # get latents
+    noisy_latents = scheduler.add_noise(init_latents, noise, timestep)
+    
+    return init_latents, noise, init_latents
+
+def get_x0_from_xt_eps(
+    xt_latents: torch.Tensor,
+    eps_theta: torch.Tensor,
+    timestep_t: int,
+    scheduler: SchedulerMixin,
+) -> torch.Tensor:
+    """
+    Calculates the predicted original sample (x_hat_0) from the noisy sample (xt)
+    and the predicted noise (eps_theta).
+    
+    Formula: x_hat_0 = (xt - sqrt(1-alpha_t) * eps_theta) / sqrt(alpha_t)
+    """
+    # Get the scheduler constants for the current timestep
+    alpha_prod_t = scheduler.alphas_cumprod[timestep_t]
+    
+    # Perform the calculation
+    predicted_x0 = (xt_latents - (1 - alpha_prod_t).sqrt() * eps_theta) / alpha_prod_t.sqrt()
+    return predicted_x0
+
+def statistical_matching_loss(eps_pred: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates a loss based on how well the statistics of the predicted noise
+    match the target statistics of a standard normal distribution (mean=0, std=1).
+    """
+    # Calculate the mean of the predicted noise across all dimensions (batch, channel, h, w)
+    mean_pred = eps_pred.mean()
+    
+    # Calculate the standard deviation of the predicted noise
+    std_pred = eps_pred.std()
+    
+    # The loss is the squared error from the target values
+    loss_mean = mean_pred**2  # Target mean is 0
+    loss_std = (std_pred - 1)**2  # Target std is 1
+    
+    # Combine them into a single statistical loss
+    return loss_mean, loss_std
+
+def get_latent_statistics(tensor: torch.Tensor) -> dict:
+    """
+    Calculates a detailed statistical fingerprint of a latent tensor.
+    This is used to diagnose deviations from the target N(0, I) distribution.
+    """
+    # Ensure tensor is on CPU for some calculations and in float32 for precision
+    tensor_fp32 = tensor.detach().to(torch.float32)
+    
+    stats = {}
+    
+    # --- Level 1: The Basics ---
+    stats['mean'] = tensor_fp32.mean().item()
+    stats['std'] = tensor_fp32.std().item()
+
+    # --- Level 2: The "Rainbow" Check (Per-Channel Variance) ---
+    # Are some channels consistently higher-energy than others?
+    # Dims are (batch, channel, height, width), so we reduce over batch, h, w
+    per_channel_std = torch.std(tensor_fp32, dim=[0, 2, 3])
+    for i, std in enumerate(per_channel_std):
+        stats[f'std_ch{i}'] = std.item()
+
+    # --- Level 3: The "Crunchy" Check (Kurtosis) ---
+    # Kurtosis measures the "tailedness" or "peakedness" of the distribution.
+    # A standard normal distribution has a kurtosis of 3.0.
+    # Higher values indicate a "spiky" or "crunchy" distribution with many outliers.
+    n = tensor_fp32.numel()
+    mean = stats['mean']
+    std = stats['std']
+    # Manual Kurtosis calculation: E[(X - μ)⁴] / σ⁴
+    kurt = (torch.sum((tensor_fp32 - mean)**4) / n) / (std**4)
+    stats['kurtosis'] = kurt.item()
+
+    # --- Level 4: The "Sharpness" Check (Outlier Magnitude) ---
+    # How extreme are the brightest and darkest "pixels" in the latent?
+    # For N(0,I), values are rarely outside [-4, 4].
+    stats['max_val'] = tensor_fp32.max().item()
+    stats['min_val'] = tensor_fp32.min().item()
+    
+    return stats
 
 def rescale_noise_cfg(
     noise_cfg: torch.FloatTensor, noise_pred_text, guidance_rescale=0.0

@@ -15,6 +15,9 @@ import torch
 from tqdm import tqdm
 from PIL import Image
 
+#prefetch data
+import queue
+import threading
 
 
 import train_util
@@ -121,6 +124,68 @@ def process_image(image: Image.Image, crop_box: tuple, target_size: tuple):
     cropped_image = image.crop(crop_box)
     return cropped_image.resize(target_size, Image.LANCZOS)
 
+def create_prefetch_generator(iterable, num_prefetch=2):
+    """
+    Creates a generator that fetches items in a background thread.
+    'iterable' should be a generator or iterator that yields your data.
+    """
+    q = queue.Queue(maxsize=num_prefetch)
+    sentinel = object()  # Marker for the end of the iterator
+
+    def producer():
+        for item in iterable:
+            q.put(item)
+        q.put(sentinel)
+
+    thread = threading.Thread(target=producer, daemon=True)
+    thread.start()
+
+    def consumer():
+        while True:
+            item = q.get()
+            if item is sentinel:
+                break
+            yield item
+            q.task_done()
+
+    return consumer()
+
+def image_pair_generator(folder_main, folders, scales, scales_unique, buckets, k, sharpness):
+    """A generator that yields processed image pairs indefinitely."""
+    while True:
+        # This is your existing image loading logic, now inside a generator
+        scales_to_look = random.sample(list(scales_unique), 2)
+        scales_to_look.sort()
+
+        folder1 = folders[scales == scales_to_look[-1]][0] #-1 is high, 0 is low
+        folder2 = folders[scales == scales_to_look[0]][0]  # but they're written in the order high,low in the source from top to bottom.
+        
+        try:
+            ims = os.listdir(f'{folder_main}/{folder1}/')
+            ims = [im_ for im_ in ims if im_.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+            if not ims:
+                continue # Skip if folder is empty
+            image_name = random.choice(ims)
+
+            img1_raw = Image.open(f'{folder_main}/{folder1}/{image_name}').convert("RGB")
+            img2_raw = Image.open(f'{folder_main}/{folder2}/{image_name}').convert("RGB")
+            
+            crop_box, target_size = get_transform_params(
+                original_size=img1_raw.size,
+                buckets=buckets,
+                k_nearest=k,
+                sharpness=sharpness,
+            )
+
+            img1 = process_image(img1_raw, crop_box, target_size)
+            img2 = process_image(img2_raw, crop_box, target_size)
+            
+            #'scales' list is absolutely required for network multiplier calls later
+            yield img1, img2, target_size, scales_to_look 
+        except (IOError, FileNotFoundError) as e:
+            print(f"Warning: Skipping image due to error: {e}")
+            continue
+
 
 def flush():
     torch.cuda.empty_cache()
@@ -198,7 +263,7 @@ def train(
     TARGET_AREA = 512 * 512
     BUCKET_STEP = 64
     K_NEAREST_BUCKETS = 4 # How many nearby aspect ratios to consider for sampling
-    SAMPLING_SHARPNESS = 3.0 # Higher value -> more likely to pick the closest AR
+    SAMPLING_SHARPNESS = 5.0 # Higher value -> more likely to pick the closest AR
 
     print(f"Generating aspect ratio buckets for target area {TARGET_AREA}...")
     ASPECT_RATIO_BUCKETS = generate_ar_buckets(TARGET_AREA, BUCKET_STEP)
@@ -207,6 +272,13 @@ def train(
     LOGGING_INTERVAL = 100  # Log stats every 100 steps
     sampled_ar_counts = {}
     
+    # --- NEW: Initialize the pre-fetcher ---
+    data_gen = image_pair_generator(
+        folder_main, folders, scales, scales_unique,
+        ASPECT_RATIO_BUCKETS, K_NEAREST_BUCKETS, SAMPLING_SHARPNESS
+    )
+    prefetcher = create_prefetch_generator(data_gen, num_prefetch=2)
+    # ----------------------------------------
 
     for text_encoder in text_encoders:
         text_encoder.to(device, dtype=weight_dtype)
@@ -328,6 +400,11 @@ def train(
 
     print(f"✅ Created {len(optimizer_param_groups)} granular parameter groups for the optimizer.")
 
+    #trivial optimization over naive adamw
+    if config.train.optimizer.lower() == "adamw" and device.type == 'cuda':
+        optimizer_kwargs["fused"] = True
+        print("✅ Using fused AdamW optimizer.")
+
     # A4. Pass the LIST of groups to the optimizer.
     optimizer = optimizer_module(
         optimizer_param_groups, 
@@ -353,6 +430,12 @@ def train(
 
     cache = PromptEmbedsCache()
     prompt_pairs: list[PromptEmbedsPair] = []
+
+    # cudastreams
+    # Before the training loop
+    s_high = torch.cuda.Stream()
+    s_low = torch.cuda.Stream()
+    s_vae = torch.cuda.Stream()
 
     #"for settings in prompts" seems to suggest u can run more than one prompt pair in a prompt config?
     #i think unconditional might be about specifying the negative prompt at inference time.
@@ -421,212 +504,218 @@ def train(
                 1, config.train.max_denoising_steps, (1,)
             ).item()
 
-            height, width = prompt_pair.resolution, prompt_pair.resolution
-            if prompt_pair.dynamic_resolution:
-                height, width = train_util.get_random_resolution_in_bucket(
-                    prompt_pair.resolution
-                )
-
-            if config.logging.verbose:
-                print("guidance_scale:", prompt_pair.guidance_scale)
-                print("resolution:", prompt_pair.resolution)
-                print("dynamic_resolution:", prompt_pair.dynamic_resolution)
-                if prompt_pair.dynamic_resolution:
-                    print("bucketed resolution:", (height, width))
-                print("batch_size:", prompt_pair.batch_size)
-                print("dynamic_crops:", prompt_pair.dynamic_crops)
-
-            
-            
-            #scale_to_look = abs(random.choice(list(scales_unique)))
-            scales_to_look = random.sample(list(scales_unique),2)   #2 choices
-            scales_to_look.sort()   #smaller first idx
-
-            #folder1 = folders[scales==-scale_to_look][0]
-            #folder2 = folders[scales==scale_to_look][0]
-            #use lowest then highest
-            folder1 = folders[scales==scales_to_look[-1]][0]
-            folder2 = folders[scales==scales_to_look[0]][0]
-            
-            ims = os.listdir(f'{folder_main}/{folder1}/')
-            ims = [im_ for im_ in ims if '.png' in im_ or '.jpg' in im_ or '.jpeg' in im_ or '.webp' in im_]
-            random_sampler = random.randint(0, len(ims)-1)
-            image_name = random.choice(ims)
-
-
-            #...
-            img1_raw = Image.open(f'{folder_main}/{folder1}/{image_name}').convert("RGB")
-            img2_raw = Image.open(f'{folder_main}/{folder2}/{image_name}').convert("RGB")
-            
-            # 4. Determine the *single* random transformation based on the first image
-            crop_box, target_size = get_transform_params(
-                original_size=img1_raw.size,
-                buckets=ASPECT_RATIO_BUCKETS,
-                k_nearest=K_NEAREST_BUCKETS,
-                sharpness=SAMPLING_SHARPNESS,
-            )
+            # --- REPLACED a large block of code with this single line ---
+            img1, img2, target_size, scales_to_look = next(prefetcher)
+            height, width = target_size
             sampled_ar_counts[target_size] = sampled_ar_counts.get(target_size, 0) + 1
+            # -----------------------------------------------------------
 
-            # 5. Apply the *exact same* transformation to both images
-            img1 = process_image(img1_raw, crop_box, target_size)
-            img2 = process_image(img2_raw, crop_box, target_size)
-            
-            seed = random.randint(0,2*15)
-            generator = torch.manual_seed(seed)
-            denoised_latents_low, low_noise = train_util.get_noisy_image(
-                img1,
-                vae,
-                generator,
-                unet,
-                noise_scheduler,
-                start_timesteps=0,
-                total_timesteps=timesteps_to)
-            denoised_latents_low = denoised_latents_low.to(device, dtype=weight_dtype)
-            low_noise = low_noise.to(device, dtype=weight_dtype)
-            
-            generator = torch.manual_seed(seed)
-            denoised_latents_high, high_noise = train_util.get_noisy_image(
-                img2,
-                vae,
-                generator,
-                unet,
-                noise_scheduler,
-                start_timesteps=0,
-                total_timesteps=timesteps_to)
-            denoised_latents_high = denoised_latents_high.to(device, dtype=weight_dtype)
-            high_noise = high_noise.to(device, dtype=weight_dtype)
-            noise_scheduler.set_timesteps(1000)
+            # The rest of your loop continues as before, starting with torch.no_grad()
+            with torch.no_grad():
+                seed = random.randint(0,2*15)
 
-            add_time_ids = train_util.get_add_time_ids(
-                height,
-                width,
-                dynamic_crops=prompt_pair.dynamic_crops,
-                dtype=weight_dtype,
-            ).to(device, dtype=weight_dtype)
+                with torch.cuda.stream(s_vae):
+                    generator = torch.manual_seed(seed)
+                    noisy_latents_low, low_noise, x0_latents_low = train_util.get_noisy_image_and_init_image(
+                        img1,
+                        vae,
+                        generator,
+                        unet,
+                        noise_scheduler,
+                        start_timesteps=0,
+                        total_timesteps=timesteps_to)
+                    noisy_latents_low = noisy_latents_low.to(device, dtype=weight_dtype)
+                    low_noise = low_noise.to(device, dtype=weight_dtype)
+                    
+                    generator = torch.manual_seed(seed)
+                    noisy_latents_high, high_noise, x0_latents_high = train_util.get_noisy_image_and_init_image(
+                        img2,
+                        vae,
+                        generator,
+                        unet,
+                        noise_scheduler,
+                        start_timesteps=0,
+                        total_timesteps=timesteps_to)
+                    noisy_latents_high = noisy_latents_high.to(device, dtype=weight_dtype)
+                    high_noise = high_noise.to(device, dtype=weight_dtype)
 
+                # =============================== THE FIX ===============================
+                #    Wait for ALL work depending on the 50-step schedule to FINISH.
+                #    This prevents the CPU from racing ahead and changing the scheduler's state
+                #    before the GPU is done with it.
+                torch.cuda.synchronize()
 
-            current_timestep = noise_scheduler.timesteps[
-                int(timesteps_to * 1000 / config.train.max_denoising_steps)
-            ]
-            # Get the sigma for the current timestep
-            current_sigma = noise_scheduler.sigmas[
-                int(timesteps_to * 1000 / config.train.max_denoising_steps)
-            ]
-            # Calculate a loss weight. A common formulation from Karras et al.
-            # adds 1 to the denominator for stability. The squared sigma is key.
-            loss_weight = 1.0 / (current_sigma**2 + 1.0) 
-                
-        #network.set_lora_slider(scale=scale_to_look)
-        if lycorisized:
-            network.set_multiplier(torch.tensor(scales_to_look[-1]))
-            target_latents_high = train_util.predict_noise_xl(
-                    unet,
-                    noise_scheduler,
-                    current_timestep,
-                    denoised_latents_high,
-                    text_embeddings=train_util.concat_embeddings(
-                        prompt_pair.unconditional.text_embeds,
-                        prompt_pair.positive.text_embeds,
-                        prompt_pair.batch_size,
-                    ),
-                    add_text_embeddings=train_util.concat_embeddings(
-                        prompt_pair.unconditional.pooled_embeds,
-                        prompt_pair.positive.pooled_embeds,
-                        prompt_pair.batch_size,
-                    ),
-                    add_time_ids=train_util.concat_embeddings(
-                        add_time_ids, add_time_ids, prompt_pair.batch_size
-                    ),
-                    guidance_scale=1,
+                noise_scheduler.set_timesteps(1000)
+
+                add_time_ids = train_util.get_add_time_ids(
+                    height,
+                    width,
+                    dynamic_crops=prompt_pair.dynamic_crops,
+                    dtype=weight_dtype,
                 ).to(device, dtype=weight_dtype)
-            #network.set_multiplier(0)   #similar to the exit part of `with`
-        else:
-            network.set_lora_slider(scale=scales_to_look[-1])
-            with network:
+                kilosteps_to = int(timesteps_to * 1000 / config.train.max_denoising_steps)
+                current_timestep = noise_scheduler.timesteps[
+                    int(timesteps_to * 1000 / config.train.max_denoising_steps)
+                ]
+                assert 0 <= current_timestep < 1000, f"FATAL: Invalid timestep index calculated. Got {current_timestep} from timesteps_to={timesteps_to}"
+                # Get the sigma for the current timestep
+                current_sigma = noise_scheduler.sigmas[
+                    int(timesteps_to * 1000 / config.train.max_denoising_steps)
+                ]
+                # Calculate a loss weight. A common formulation from Karras et al.
+                # adds 1 to the denominator for stability. The squared sigma is key.
+                loss_weight = 1.0 / (current_sigma**2 + 1.0) 
+        torch.cuda.synchronize()
+            # --- HIGH PASS on stream 1 ---
+        aux_losses = {}
+        with torch.cuda.stream(s_high):        
+            #network.set_lora_slider(scale=scale_to_look)
+            #with network context manager makes lycorisized case assymetric
+            if lycorisized:
+                network.set_multiplier(torch.tensor(scales_to_look[-1]))
                 target_latents_high = train_util.predict_noise_xl(
-                    unet,
-                    noise_scheduler,
-                    current_timestep,
-                    denoised_latents_high,
-                    text_embeddings=train_util.concat_embeddings(
-                        prompt_pair.unconditional.text_embeds,
-                        prompt_pair.positive.text_embeds,
-                        prompt_pair.batch_size,
-                    ),
-                    add_text_embeddings=train_util.concat_embeddings(
-                        prompt_pair.unconditional.pooled_embeds,
-                        prompt_pair.positive.pooled_embeds,
-                        prompt_pair.batch_size,
-                    ),
-                    add_time_ids=train_util.concat_embeddings(
-                        add_time_ids, add_time_ids, prompt_pair.batch_size
-                    ),
-                    guidance_scale=1,
-                ).to(device, dtype=weight_dtype)
+                        unet,
+                        noise_scheduler,
+                        current_timestep,
+                        noisy_latents_high,
+                        text_embeddings=train_util.concat_embeddings(
+                            prompt_pair.unconditional.text_embeds,
+                            prompt_pair.positive.text_embeds,
+                            prompt_pair.batch_size,
+                        ),
+                        add_text_embeddings=train_util.concat_embeddings(
+                            prompt_pair.unconditional.pooled_embeds,
+                            prompt_pair.positive.pooled_embeds,
+                            prompt_pair.batch_size,
+                        ),
+                        add_time_ids=train_util.concat_embeddings(
+                            add_time_ids, add_time_ids, prompt_pair.batch_size
+                        ),
+                        guidance_scale=1,
+                    ).to(device, dtype=weight_dtype)
+
+            else:
+                network.set_lora_slider(scale=scales_to_look[-1])
+                with network:
+                    target_latents_high = train_util.predict_noise_xl(
+                        unet,
+                        noise_scheduler,
+                        current_timestep,
+                        noisy_latents_high,
+                        text_embeddings=train_util.concat_embeddings(
+                            prompt_pair.unconditional.text_embeds,
+                            prompt_pair.positive.text_embeds,
+                            prompt_pair.batch_size,
+                        ),
+                        add_text_embeddings=train_util.concat_embeddings(
+                            prompt_pair.unconditional.pooled_embeds,
+                            prompt_pair.positive.pooled_embeds,
+                            prompt_pair.batch_size,
+                        ),
+                        add_time_ids=train_util.concat_embeddings(
+                            add_time_ids, add_time_ids, prompt_pair.batch_size
+                        ),
+                        guidance_scale=1,
+                    ).to(device, dtype=weight_dtype)
+            
+            # The forward pass and loss calculation are dispatched to s_high
+            loss_eps_high = criteria(target_latents_high, high_noise.to(weight_dtype))
+            # B. data prediction from eps extrapolation loss
+            pred_x0_high = train_util.get_x0_from_xt_eps(
+                    noisy_latents_high, target_latents_high, kilosteps_to, noise_scheduler
+                )
+            loss_x0_high = criteria(pred_x0_high.to(weight_dtype), x0_latents_high.to(weight_dtype))
+            loss_x0_high_karrasnormed =loss_weight*loss_x0_high
+            aux_losses["high"]=(loss_x0_high_karrasnormed.detach())
+            # C. Combine the losses
+            lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0.1)
+            lambda_std = getattr(config.train, 'lambda_std_loss', 0.1)
+            mean_loss_high, std_loss_high = train_util.statistical_matching_loss(target_latents_high)
+            loss_high = loss_eps_high + lambda_x0 * loss_x0_high_karrasnormed + lambda_std * std_loss_high
+            aux_losses["high_std"]=(std_loss_high.detach()) 
+            #Scale the loss to average the gradients, not sum them
+            loss_high = loss_high / ACCUMULATION_STEPS
+            loss_high.backward()
         
-        loss_high = criteria(target_latents_high, high_noise.to(weight_dtype))
-        pbar.set_description(f"Loss_high*1k: {loss_high.item()*1000:.4f};{loss_weight*loss_high.item()*1000}")
-        
-        #Scale the loss to average the gradients, not sum them
-        loss_high = loss_weight*loss_high / ACCUMULATION_STEPS
-        loss_high.backward()
-        
-        # opposite
-        #network.set_lora_slider(scale=-scale_to_look)
-        if lycorisized:
-            network.set_multiplier(torch.tensor(scales_to_look[0]))
-            target_latents_low = train_util.predict_noise_xl(
-                    unet,
-                    noise_scheduler,
-                    current_timestep,
-                    denoised_latents_low,
-                    text_embeddings=train_util.concat_embeddings(
-                        prompt_pair.unconditional.text_embeds,
-                        prompt_pair.neutral.text_embeds,
-                        prompt_pair.batch_size,
-                    ),
-                    add_text_embeddings=train_util.concat_embeddings(
-                        prompt_pair.unconditional.pooled_embeds,
-                        prompt_pair.neutral.pooled_embeds,
-                        prompt_pair.batch_size,
-                    ),
-                    add_time_ids=train_util.concat_embeddings(
-                        add_time_ids, add_time_ids, prompt_pair.batch_size
-                    ),
-                    guidance_scale=1,
-                ).to(device, dtype=weight_dtype)
-            #network.set_multiplier(0)   #similar to the exit part of 'with'.
-        else:
-            network.set_lora_slider(scale=scales_to_look[0])
-            with network:
+        # --- LOW PASS on stream 2 ---
+        with torch.cuda.stream(s_low):
+            #network.set_lora_slider(scale=-scale_to_look)
+            #with network context manager makes lycorisized case assymetric
+            if lycorisized:
+                network.set_multiplier(torch.tensor(scales_to_look[0]))
                 target_latents_low = train_util.predict_noise_xl(
-                    unet,
-                    noise_scheduler,
-                    current_timestep,
-                    denoised_latents_low,
-                    text_embeddings=train_util.concat_embeddings(
-                        prompt_pair.unconditional.text_embeds,
-                        prompt_pair.neutral.text_embeds,
-                        prompt_pair.batch_size,
-                    ),
-                    add_text_embeddings=train_util.concat_embeddings(
-                        prompt_pair.unconditional.pooled_embeds,
-                        prompt_pair.neutral.pooled_embeds,
-                        prompt_pair.batch_size,
-                    ),
-                    add_time_ids=train_util.concat_embeddings(
-                        add_time_ids, add_time_ids, prompt_pair.batch_size
-                    ),
-                    guidance_scale=1,
-                ).to(device, dtype=weight_dtype)
-        
-        loss_low = criteria(target_latents_low, low_noise.to(weight_dtype))
-        pbar.set_description(f"Loss_low*1k: {loss_low.item()*1000:.4f};{loss_weight*loss_low.item()*1000}")
-        #Scale the loss to average the gradients, not sum them
-        loss_low = loss_weight*loss_low / ACCUMULATION_STEPS
-        loss_low.backward()
-        
-        
+                        unet,
+                        noise_scheduler,
+                        current_timestep,
+                        noisy_latents_low,
+                        text_embeddings=train_util.concat_embeddings(
+                            prompt_pair.unconditional.text_embeds,
+                            prompt_pair.neutral.text_embeds,
+                            prompt_pair.batch_size,
+                        ),
+                        add_text_embeddings=train_util.concat_embeddings(
+                            prompt_pair.unconditional.pooled_embeds,
+                            prompt_pair.neutral.pooled_embeds,
+                            prompt_pair.batch_size,
+                        ),
+                        add_time_ids=train_util.concat_embeddings(
+                            add_time_ids, add_time_ids, prompt_pair.batch_size
+                        ),
+                        guidance_scale=1,
+                    ).to(device, dtype=weight_dtype)
+                #network.set_multiplier(0)   #similar to the exit part of 'with'.
+            else:
+                network.set_lora_slider(scale=scales_to_look[0])
+                with network:
+                    target_latents_low = train_util.predict_noise_xl(
+                        unet,
+                        noise_scheduler,
+                        current_timestep,
+                        noisy_latents_low,
+                        text_embeddings=train_util.concat_embeddings(
+                            prompt_pair.unconditional.text_embeds,
+                            prompt_pair.neutral.text_embeds,
+                            prompt_pair.batch_size,
+                        ),
+                        add_text_embeddings=train_util.concat_embeddings(
+                            prompt_pair.unconditional.pooled_embeds,
+                            prompt_pair.neutral.pooled_embeds,
+                            prompt_pair.batch_size,
+                        ),
+                        add_time_ids=train_util.concat_embeddings(
+                            add_time_ids, add_time_ids, prompt_pair.batch_size
+                        ),
+                        guidance_scale=1,
+                    ).to(device, dtype=weight_dtype)
+            
+            
+            loss_eps_low = criteria(target_latents_low, low_noise.to(weight_dtype))
+            # B. data prediction from eps extrapolation loss
+            lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0.1)
+            lambda_std = getattr(config.train, 'lambda_std_loss', 0.1)
+            pred_x0_low = train_util.get_x0_from_xt_eps(
+                    noisy_latents_low, target_latents_low, kilosteps_to, noise_scheduler
+                )
+            loss_x0_low = criteria(pred_x0_low.to(weight_dtype), x0_latents_low.to(weight_dtype))
+            loss_x0_low_karrasnormed = loss_weight*loss_x0_low
+            aux_losses["low"]=(loss_x0_low_karrasnormed.detach())
+            mean_loss_low, std_loss_low = train_util.statistical_matching_loss(target_latents_low)
+            aux_losses["low_std"]=(std_loss_high.detach()) 
+            # C. Combine the losses
+            loss_low = loss_eps_low + lambda_x0 * loss_x0_low_karrasnormed + lambda_std * std_loss_low
+            #Scale the loss to average the gradients, not sum them
+            loss_low = loss_low / ACCUMULATION_STEPS
+            loss_low.backward()
+
+        # --- Synchronize before optimizer step ---
+        # Crucially, we must wait for both backward passes to complete
+        # before we can clip gradients or step the optimizer.
+        torch.cuda.synchronize()
+        if len(aux_losses.keys()) >= 4:
+            pbar.set_description(f"Loss_high/low*1k: {loss_high.item()*1000:.1f}/{loss_low.item()*1000:.1f};{aux_losses['high']*1000:.1f}/{aux_losses['low']*1000:.1f};{aux_losses['high_std']*1000:.1f}/{aux_losses['low_std']*1000:.1f}")
+        else:
+            pbar.set_description(f"Loss_high/low*1k: {loss_high.item()*1000:.1f}/{loss_low.item()*1000:.1f}")
+        aux_losses = {}
         if (i + 1) % ACCUMULATION_STEPS == 0:
             # The profiler's step method is called here, seeing the accumulated grad
             GRAD_CLIP_MAX_NORM = getattr(config.train, 'grad_clip', 0.1)
@@ -634,7 +723,6 @@ def train(
             if GRAD_CLIP_MAX_NORM is not None and GRAD_CLIP_MAX_NORM > 0:
                 # This is the list of parameters whose gradients will be clipped
                 params_to_clip = [p for group in optimizer.param_groups for p in group['params'] if p.grad is not None]
-                
                 # The single, canonical function call for gradient clipping
                 torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=GRAD_CLIP_MAX_NORM)
 

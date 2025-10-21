@@ -59,3 +59,54 @@ uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'immd' --rank 96 
 uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'immd_ii' --rank 96 --alpha 24 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd.yaml' --folder_main 'datasets/immd' --folders 'A, B' --scales -1, 1
 
 uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'immd_ii_gl_a' --rank 96 --alpha 24 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluon.yaml' --folder_main 'datasets/immd' --folders 'A, B' --scales -1, 1
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'immd_ii_gl_a' --rank 96 --alpha 24 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'A, B' --scales -1, 1
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'immd_ilxl_i_glucli_b' --rank 96 --alpha 24 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'A, B' --scales -1, 1
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgluon_dilora_bracket_VIII_b' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+
+#speedhacks enabled
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgluon_dilora_bracket_VIII_c' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'glu_b_dilora_frsht_robe_VII' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-glulora-frshrt.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus,base_k' --scales 0.67, 1, 1.3, 2.0
+
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'glu_c_dilora_frsht_robe_VII' --rank 16 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-glulora-frshrt.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus,base_k' --scales 0.67, 1, 1.3, 2.0
+
+
+#hparam tuning
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'glu_c_molk_frsht_robe_VII' --rank 16 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-glulora-frshrt.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus,base_k' --scales -1, -0.67, 1.3, 2.0
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgluon_bracket_VIII_d' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+
+...
+errored last 2
+
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'glu_a_molk_frsht_robe_VIII' --rank 16 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-glulora-frshrt.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus,base_k' --scales -1, -0.67, 1.3, 2.0
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'glu_b_molk_frsht_robe_VIII' --rank 16 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-glulora-frshrt.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus,base_k' --scales -1, -0.67, 1.3, 2.0
+fail
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'glu_c_molk_frsht_robe_VIII' --rank 32 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-glulora-frshrt.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus,base_k' --scales 0.67, 0.75, 1.3, 2.0
+fail@gradclip2, lr 0.005
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'glu_d_molk_frsht_robe_VIII' --rank 32 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-glulora-frshrt.yaml' --folder_main 'datasets/assym_dilora' --folders 'base_one_minus, base_one, base_one_plus,base_k' --scales 1, 1.5, 2, 2.5
+pass@gradclip1, lr 0.005
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_VIII_d' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 0.8, 1.2
+#regraph finished, runs
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_b' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+
+#normalization on whole loss, finished, confetti noise
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_b2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+#normalize ONLY x_hat_0, finished, confetti noise
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_b3' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+#std_dev loss, finished, 
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_b4' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+# 0.001 x_hat_0 loss, 0.01 std_dev loss
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_b5' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+  lambda_x0_loss: 0.0001
+  lambda_std_loss: 0.001
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_b6' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+  lambda_x0_loss: 0
+  lambda_std_loss: 0.001
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_b7' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+  0
+  0
+  still fried! interesting! oh the folder indexing 'error' wasn't an error but was something else...
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_b8' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
