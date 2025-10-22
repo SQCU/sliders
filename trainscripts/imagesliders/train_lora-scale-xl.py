@@ -38,6 +38,12 @@ import wandb
 
 NUM_IMAGES_PER_PROMPT = 1
 from lora import LoRANetwork, DEFAULT_TARGET_REPLACE, UNET_TARGET_REPLACE_MODULE_CONV
+import lora_alt
+
+
+import torch._dynamo
+torch._dynamo.config.recompile_limit = 16 # Optional: Increase the limit
+
 
 def generate_ar_buckets(target_area: int, step: int = 64, max_ratio: float = 4.0):
     """
@@ -150,40 +156,77 @@ def create_prefetch_generator(iterable, num_prefetch=2):
 
     return consumer()
 
-def image_pair_generator(folder_main, folders, scales, scales_unique, buckets, k, sharpness):
-    """A generator that yields processed image pairs indefinitely."""
+def batch_generator(folder_main, folders, scales, scales_unique, buckets, k, sharpness, batch_size):
+    """
+    A generator that yields a dictionary containing a full batch of processed
+    image pairs and their corresponding scales.
+    """
+    # Convert to numpy for easier indexing
+    folders = np.array(folders)
+    scales = np.array(scales)
+    
     while True:
-        # This is your existing image loading logic, now inside a generator
-        scales_to_look = random.sample(list(scales_unique), 2)
-        scales_to_look.sort()
-
-        folder1 = folders[scales == scales_to_look[-1]][0] #-1 is high, 0 is low
-        folder2 = folders[scales == scales_to_look[0]][0]  # but they're written in the order high,low in the source from top to bottom.
-        
         try:
-            ims = os.listdir(f'{folder_main}/{folder1}/')
-            ims = [im_ for im_ in ims if im_.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
-            if not ims:
-                continue # Skip if folder is empty
-            image_name = random.choice(ims)
+            # --- Prepare a batch ---
+            batch_imgs_high = []
+            batch_imgs_low = []
+            batch_scales_high = []
+            batch_scales_low = []
 
-            img1_raw = Image.open(f'{folder_main}/{folder1}/{image_name}').convert("RGB")
-            img2_raw = Image.open(f'{folder_main}/{folder2}/{image_name}').convert("RGB")
-            
+            # CRITICAL: Determine the target size once for the entire batch
+            # To do this, we need a sample image to get the original aspect ratio
+            temp_scales_to_look = random.sample(list(scales_unique), 2)
+            temp_scales_to_look.sort()
+            temp_folder = folders[scales == temp_scales_to_look[-1]][0]
+            temp_ims = [im_ for im_ in os.listdir(f'{folder_main}/{temp_folder}/') if im_.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+            if not temp_ims: continue
+            temp_image_name = random.choice(temp_ims)
+            temp_img_raw = Image.open(f'{folder_main}/{temp_folder}/{temp_image_name}').convert("RGB")
+
             crop_box, target_size = get_transform_params(
-                original_size=img1_raw.size,
+                original_size=temp_img_raw.size,
                 buckets=buckets,
                 k_nearest=k,
                 sharpness=sharpness,
             )
 
-            img1 = process_image(img1_raw, crop_box, target_size)
-            img2 = process_image(img2_raw, crop_box, target_size)
+            # --- Fill the batch ---
+            for _ in range(batch_size):
+                scales_to_look = random.sample(list(scales_unique), 2)
+                scales_to_look.sort()
+
+                folder_high = folders[scales == scales_to_look[-1]][0]
+                folder_low = folders[scales == scales_to_look[0]][0]
+
+                ims = os.listdir(f'{folder_main}/{folder_high}/')
+                ims = [im_ for im_ in ims if im_.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+                if not ims: continue # Skip if folder is empty
+                image_name = random.choice(ims)
+
+                img_high_raw = Image.open(f'{folder_main}/{folder_high}/{image_name}').convert("RGB")
+                img_low_raw = Image.open(f'{folder_main}/{folder_low}/{image_name}').convert("RGB")
+
+                # Process both images with the same determined crop and target size
+                img_high = process_image(img_high_raw, crop_box, target_size)
+                img_low = process_image(img_low_raw, crop_box, target_size)
+
+                batch_imgs_high.append(img_high)
+                batch_imgs_low.append(img_low)
+                batch_scales_high.append(scales_to_look[-1])
+                batch_scales_low.append(scales_to_look[0])
+
+            if not batch_imgs_high: continue
+
+            yield {
+                "images_high": batch_imgs_high,
+                "images_low": batch_imgs_low,
+                "scales_high": torch.tensor(batch_scales_high, dtype=torch.float32),
+                "scales_low": torch.tensor(batch_scales_low, dtype=torch.float32),
+                "target_size": target_size
+            }
             
-            #'scales' list is absolutely required for network multiplier calls later
-            yield img1, img2, target_size, scales_to_look 
         except (IOError, FileNotFoundError) as e:
-            print(f"Warning: Skipping image due to error: {e}")
+            print(f"Warning: Skipping batch due to error: {e}")
             continue
 
 
@@ -211,6 +254,7 @@ def train(
     }
     save_path = Path(config.save.path)
 
+    #obsolete module selection code!
     modules = DEFAULT_TARGET_REPLACE
     if config.network.type == "c3lier":
         modules += UNET_TARGET_REPLACE_MODULE_CONV
@@ -218,8 +262,8 @@ def train(
     if config.logging.verbose:
         print(metadata)
 
-    if config.logging.use_wandb:
-        wandb.init(project=f"LECO_{config.save.name}", config=metadata)
+    #if config.logging.use_wandb:
+    #    wandb.init(project=f"LECO_{config.save.name}", config=metadata)
 
     weight_dtype = config_util.parse_precision(config.train.precision)
     save_weight_dtype = config_util.parse_precision(config.train.precision)
@@ -271,11 +315,19 @@ def train(
 
     LOGGING_INTERVAL = 100  # Log stats every 100 steps
     sampled_ar_counts = {}
-    
-    # --- NEW: Initialize the pre-fetcher ---
-    data_gen = image_pair_generator(
+
+    # ===============================================================================
+    # VVVVVVVVVVVVVVVVVVVVVVVV MODIFICATION START VVVVVVVVVVVVVVVVVVVVVVVVVV
+    # ===============================================================================
+
+    # Use a real batch size now, not just for gradient accumulation
+    # This should be set based on VRAM. It's the number of PAIRS to process.
+    BATCH_SIZE = 2 # Example value, adjust as needed
+
+    # --- REVISED: Initialize the new batch-aware prefetcher ---
+    data_gen = batch_generator(
         folder_main, folders, scales, scales_unique,
-        ASPECT_RATIO_BUCKETS, K_NEAREST_BUCKETS, SAMPLING_SHARPNESS
+        ASPECT_RATIO_BUCKETS, K_NEAREST_BUCKETS, SAMPLING_SHARPNESS, BATCH_SIZE
     )
     prefetcher = create_prefetch_generator(data_gen, num_prefetch=2)
     # ----------------------------------------
@@ -303,45 +355,35 @@ def train(
     if config.other.torch_compile:
         unet = torch.compile(unet)
     
-    lycorisized = False
-    if config.other.lycorisize:
-        from lycoris import create_lycoris, LycorisNetwork
-        #def LycorisWithify():
-        #    class WithLycorisNetwork(LycorisNetwork): 
-        #        def __init__(self, *args, **kwargs):
-        #            super().__init__(*args, **kwargs)
-        #        def __enter__(self):
-        #            set_multiplier(self.multiplier) #this feels really superfluous
-        #        def __exit__(self, exc_type, exc_val, exc_tb):
-        #            set_multiplier(0)   #this feels superfluous but shikata the nai.
-        #    #LycorisNetwork = WithLycorisNetwork #does this even work lol?
-        print("Total params:", sum(p.numel() for p in unet.parameters()))
-        #LycorisWithify()
-        #print("withifying lycorisnetwork. this probably isn't how inheritance works?")
-        network = create_lycoris(unet, 
-        1.0, #initial multiplier i think?
-        config.network.rank, #dim -> linear dim -> (linear dim, conv dim)
-        config.network.alpha, #alpha -> linear alpha -> (linear alpha, conv alpha)
-        algo="glora")
-        network.to(device, dtype=weight_dtype)
-        network.apply_to() # mandatory lycoris boilerplate
-        
-        #note: sliderify with set_multiplier(self, multiplier)
+    #lycorisized = False
+    #no more lycorisize
+    
+    # --- Option 1: Use a predefined training method ---
+    # This replicates the old behavior but correctly includes FFNs within the scope.
+    # For example, 'xattn' will now correctly target Linear layers inside 'attn2' blocks,
+    # including the FFNs if they were part of that block's naming scheme.
+    #    resolved_config = {
+    #    "lora_map": lora_config_util.get_lora_map_for_training_method(
+    #        unet, rank=64, alpha=32.0, method='full' # or 'xattn', 'selfattn', etc.
+    #    )
+    #}
 
-
-        print("lyc Params:", sum(p.numel() for p in network.parameters()))
-
-        lycorisized = True
-    else:
-        #lora branch
-        network = LoRANetwork(
+    # --- Option 2: Use custom, flexible filters (Recommended) ---
+    # This is more powerful and explicit. Let's train only the FFNs and cross-attention 'to_q' and 'to_k'.
+    resolved_config_custom = {
+        "lora_map": lora_alt.create_lora_config_map(
             unet,
             rank=config.network.rank,
-            multiplier=1.0,
             alpha=config.network.alpha,
-            train_method=config.network.training_method,
-        ).to(device, dtype=weight_dtype)
-    
+            include_substrings=['ff.net', 'attn2.to_q', 'attn2.to_k'],
+            exclude_substrings=['down_blocks.0'] # Example: exclude the first downblock
+        )
+    }
+
+    network = lora_alt.AltLoRANetwork(
+        unet, resolved_config=resolved_config_custom
+    ).to(device, dtype=weight_dtype)
+
     optimizer_module = train_util.get_optimizer(config.train.optimizer)
     #optimizer_args
     optimizer_kwargs = {}
@@ -351,52 +393,12 @@ def train(
             value = ast.literal_eval(value)
             optimizer_kwargs[key] = value
     
-    #if lycorisized: #dunno why cloneofsimo impl. uses that wrapper function.
-    #    optimizer = optimizer_module(
-    #        network.parameters(), 
-    #        lr=config.train.lr, 
-    #        **optimizer_kwargs)
-    #else: 
-
-    
-    # --- BEFORE ---
-    # This likely returns a flat list of all LoRA parameters
-    #optimizer = optimizer_module(
-    #    network.prepare_optimizer_params(lr=config.train.lr),  #... lycoris... weird compatibility...
-    #    lr=config.train.lr, 
-    #    **optimizer_kwargs)
-    
-    # --- AFTER (The Correct Way) ---
-
     # A1. Create a list to hold our new, granular parameter groups.
     optimizer_param_groups = []
 
-    # A2. Iterate through the named parameters of the network to group them.
-    #    This assumes `network` is the LoRA-wrapped model (e.g., the U-Net).
-    #    The exact naming will depend on the LoRA library (e.g., 'lora_up', 'lora_down').
-    #    We will group them by the layer they are attached to.
-
-    # A dictionary to hold parameters, keyed by their layer name
-    params_by_layer = {} 
-    for name, param in network.named_parameters():
-        if not param.requires_grad:
-            continue
-    
-        # Heuristic to find the base layer name from the LoRA parameter name
-        # e.g., "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora.up.weight"
-        # becomes "down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q"
-        base_layer_name = name.split('.lora.')[0].replace('.', '_')
-        
-        if base_layer_name not in params_by_layer:
-            params_by_layer[base_layer_name] = []
-        params_by_layer[base_layer_name].append(param)
-
-    # A3. Create a separate parameter group for each layer.
-    for layer_name, layer_params in params_by_layer.items():
-        optimizer_param_groups.append({
-            "params": layer_params,
-            "name": layer_name  # This name will be used for logging and config!
-        })
+    optimizer_param_groups = network.prepare_optimizer_params(
+        #alpha_lr=config.train.alpha_lr # (assuming you add this to your config)
+    )
 
     print(f"✅ Created {len(optimizer_param_groups)} granular parameter groups for the optimizer.")
 
@@ -433,8 +435,6 @@ def train(
 
     # cudastreams
     # Before the training loop
-    s_high = torch.cuda.Stream()
-    s_low = torch.cuda.Stream()
     s_vae = torch.cuda.Stream()
 
     #"for settings in prompts" seems to suggest u can run more than one prompt pair in a prompt config?
@@ -495,222 +495,135 @@ def train(
                 config.train.max_denoising_steps, device=device
             )
 
-            prompt_pair: PromptEmbedsPair = prompt_pairs[
-                torch.randint(0, len(prompt_pairs), (1,)).item()
-            ]
+            prompt_pair: PromptEmbedsPair = random.choice(prompt_pairs)
 
             # 1 ~ 49 からランダム
             timesteps_to = torch.randint(
                 1, config.train.max_denoising_steps, (1,)
             ).item()
 
-            # --- REPLACED a large block of code with this single line ---
-            img1, img2, target_size, scales_to_look = next(prefetcher)
-            height, width = target_size
-            sampled_ar_counts[target_size] = sampled_ar_counts.get(target_size, 0) + 1
+            # --- REVISED: Get a full batch from the prefetcher ---
+            batch = next(prefetcher)
+            height, width = batch["target_size"]
+            sampled_ar_counts[batch["target_size"]] = sampled_ar_counts.get(batch["target_size"], 0) + 1
             # -----------------------------------------------------------
 
-            # The rest of your loop continues as before, starting with torch.no_grad()
-            with torch.no_grad():
-                seed = random.randint(0,2*15)
+            # --- REVISED: Construct a single, combined batch for the GPU ---
+            # Total batch size on GPU will be BATCH_SIZE * 2
+            batched_images = batch["images_high"] + batch["images_low"]
+            scales_tensor = torch.cat([batch["scales_high"], batch["scales_low"]]).to(device)
 
-                with torch.cuda.stream(s_vae):
-                    generator = torch.manual_seed(seed)
-                    noisy_latents_low, low_noise, x0_latents_low = train_util.get_noisy_image_and_init_image(
-                        img1,
-                        vae,
-                        generator,
-                        unet,
-                        noise_scheduler,
-                        start_timesteps=0,
-                        total_timesteps=timesteps_to)
-                    noisy_latents_low = noisy_latents_low.to(device, dtype=weight_dtype)
-                    low_noise = low_noise.to(device, dtype=weight_dtype)
-                    
-                    generator = torch.manual_seed(seed)
-                    noisy_latents_high, high_noise, x0_latents_high = train_util.get_noisy_image_and_init_image(
-                        img2,
-                        vae,
-                        generator,
-                        unet,
-                        noise_scheduler,
-                        start_timesteps=0,
-                        total_timesteps=timesteps_to)
-                    noisy_latents_high = noisy_latents_high.to(device, dtype=weight_dtype)
-                    high_noise = high_noise.to(device, dtype=weight_dtype)
+            seed = random.randint(0,2*15)
 
-                # =============================== THE FIX ===============================
-                #    Wait for ALL work depending on the 50-step schedule to FINISH.
-                #    This prevents the CPU from racing ahead and changing the scheduler's state
-                #    before the GPU is done with it.
-                torch.cuda.synchronize()
+            # --- REVISED: Single pass for VAE encoding and noising ---
+            # This is much more efficient than two separate passes.
+            generator = torch.manual_seed(seed)
+            noisy_latents, noise, x0_latents = train_util.get_noisy_image_and_init_image(
+                batched_images, vae, generator, unet, noise_scheduler,
+                total_timesteps=timesteps_to
+            )
+            noisy_latents = noisy_latents.to(device, dtype=weight_dtype)
+            noise = noise.to(device, dtype=weight_dtype)
+            x0_latents = x0_latents.to(device, dtype=weight_dtype)
 
-                noise_scheduler.set_timesteps(1000)
+            noise_scheduler.set_timesteps(1000)
 
-                add_time_ids = train_util.get_add_time_ids(
-                    height,
-                    width,
-                    dynamic_crops=prompt_pair.dynamic_crops,
-                    dtype=weight_dtype,
-                ).to(device, dtype=weight_dtype)
-                kilosteps_to = int(timesteps_to * 1000 / config.train.max_denoising_steps)
-                current_timestep = noise_scheduler.timesteps[
-                    int(timesteps_to * 1000 / config.train.max_denoising_steps)
-                ]
-                assert 0 <= current_timestep < 1000, f"FATAL: Invalid timestep index calculated. Got {current_timestep} from timesteps_to={timesteps_to}"
-                # Get the sigma for the current timestep
-                current_sigma = noise_scheduler.sigmas[
-                    int(timesteps_to * 1000 / config.train.max_denoising_steps)
-                ]
-                # Calculate a loss weight. A common formulation from Karras et al.
-                # adds 1 to the denominator for stability. The squared sigma is key.
-                loss_weight = 1.0 / (current_sigma**2 + 1.0) 
-        torch.cuda.synchronize()
-            # --- HIGH PASS on stream 1 ---
+            add_time_ids = train_util.get_add_time_ids(
+                height,
+                width,
+                dynamic_crops=prompt_pair.dynamic_crops,
+                dtype=weight_dtype,
+            ).to(device, dtype=weight_dtype)
+            kilosteps_to = int(timesteps_to * 1000 / config.train.max_denoising_steps)
+            current_timestep = noise_scheduler.timesteps[
+                int(timesteps_to * 1000 / config.train.max_denoising_steps)
+            ]
+            assert 0 <= current_timestep < 1000, f"FATAL: Invalid timestep index calculated. Got {current_timestep} from timesteps_to={timesteps_to}"
+            # Get the sigma for the current timestep
+            current_sigma = noise_scheduler.sigmas[
+                int(timesteps_to * 1000 / config.train.max_denoising_steps)
+            ]
+            # Calculate a loss weight. A common formulation from Karras et al.
+            # adds 1 to the denominator for stability. The squared sigma is key.
+            loss_weight = 1.0 / (current_sigma**2 + 1.0) 
+
+            # Prepare batched embeddings
+            text_embeds_high = train_util.concat_embeddings(
+                prompt_pair.unconditional.text_embeds, prompt_pair.positive.text_embeds, BATCH_SIZE)
+            text_embeds_low = train_util.concat_embeddings(
+                prompt_pair.unconditional.text_embeds, prompt_pair.neutral.text_embeds, BATCH_SIZE)
+            
+            pooled_embeds_high = train_util.concat_embeddings(
+                prompt_pair.unconditional.pooled_embeds, prompt_pair.positive.pooled_embeds, BATCH_SIZE)
+            pooled_embeds_low = train_util.concat_embeddings(
+                prompt_pair.unconditional.pooled_embeds, prompt_pair.neutral.pooled_embeds, BATCH_SIZE)
+
+            # Combine for the single pass
+            combined_text_embeds = torch.cat([text_embeds_high, text_embeds_low])
+            combined_pooled_embeds = torch.cat([pooled_embeds_high, pooled_embeds_low])
+            
+            # add_time_ids needs to be repeated for the full hardware batch
+            # also needs to be repeated along the n_cases dimension (2 here)
+            combined_add_time_ids = add_time_ids.repeat(BATCH_SIZE * 2 * 2, 1)
+            # scales tensor also to same shape...
+            scales_tensor = torch.cat([scales_tensor, scales_tensor], dim=0)
+        #print(f"the shape of our text_embeddings,add_text_embeddings,add_time_ids:\n{combined_text_embeds.shape},{combined_pooled_embeds.shape},{combined_add_time_ids.shape}")
+        network.set_lora_scales(scales_tensor) # Set per-sample scales
+        #print(f"but also: the shape of our noisy_latents:\n{noisy_latents.shape}")
+        target_latents = train_util.predict_noise_xl(
+            unet, noise_scheduler, current_timestep, noisy_latents,
+            text_embeddings=combined_text_embeds,
+            add_text_embeddings=combined_pooled_embeds,
+            add_time_ids=combined_add_time_ids,
+            guidance_scale=1,
+        ).to(device, dtype=weight_dtype)
+
+        # --- REVISED: Split outputs and calculate losses ---
+        target_latents_high, target_latents_low = torch.chunk(target_latents, 2, dim=0)
+        high_noise, low_noise = torch.chunk(noise, 2, dim=0)
+        noisy_latents_high, noisy_latents_low = torch.chunk(noisy_latents, 2, dim=0)
+        x0_latents_high, x0_latents_low = torch.chunk(x0_latents, 2, dim=0)
+
+        # Loss calculation logic is the same, just applied to the split tensors
         aux_losses = {}
-        with torch.cuda.stream(s_high):        
-            #network.set_lora_slider(scale=scale_to_look)
-            #with network context manager makes lycorisized case assymetric
-            if lycorisized:
-                network.set_multiplier(torch.tensor(scales_to_look[-1]))
-                target_latents_high = train_util.predict_noise_xl(
-                        unet,
-                        noise_scheduler,
-                        current_timestep,
-                        noisy_latents_high,
-                        text_embeddings=train_util.concat_embeddings(
-                            prompt_pair.unconditional.text_embeds,
-                            prompt_pair.positive.text_embeds,
-                            prompt_pair.batch_size,
-                        ),
-                        add_text_embeddings=train_util.concat_embeddings(
-                            prompt_pair.unconditional.pooled_embeds,
-                            prompt_pair.positive.pooled_embeds,
-                            prompt_pair.batch_size,
-                        ),
-                        add_time_ids=train_util.concat_embeddings(
-                            add_time_ids, add_time_ids, prompt_pair.batch_size
-                        ),
-                        guidance_scale=1,
-                    ).to(device, dtype=weight_dtype)
 
-            else:
-                network.set_lora_slider(scale=scales_to_look[-1])
-                with network:
-                    target_latents_high = train_util.predict_noise_xl(
-                        unet,
-                        noise_scheduler,
-                        current_timestep,
-                        noisy_latents_high,
-                        text_embeddings=train_util.concat_embeddings(
-                            prompt_pair.unconditional.text_embeds,
-                            prompt_pair.positive.text_embeds,
-                            prompt_pair.batch_size,
-                        ),
-                        add_text_embeddings=train_util.concat_embeddings(
-                            prompt_pair.unconditional.pooled_embeds,
-                            prompt_pair.positive.pooled_embeds,
-                            prompt_pair.batch_size,
-                        ),
-                        add_time_ids=train_util.concat_embeddings(
-                            add_time_ids, add_time_ids, prompt_pair.batch_size
-                        ),
-                        guidance_scale=1,
-                    ).to(device, dtype=weight_dtype)
-            
-            # The forward pass and loss calculation are dispatched to s_high
-            loss_eps_high = criteria(target_latents_high, high_noise.to(weight_dtype))
-            # B. data prediction from eps extrapolation loss
-            pred_x0_high = train_util.get_x0_from_xt_eps(
-                    noisy_latents_high, target_latents_high, kilosteps_to, noise_scheduler
-                )
-            loss_x0_high = criteria(pred_x0_high.to(weight_dtype), x0_latents_high.to(weight_dtype))
-            loss_x0_high_karrasnormed =loss_weight*loss_x0_high
-            aux_losses["high"]=(loss_x0_high_karrasnormed.detach())
-            # C. Combine the losses
-            lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0.1)
-            lambda_std = getattr(config.train, 'lambda_std_loss', 0.1)
-            mean_loss_high, std_loss_high = train_util.statistical_matching_loss(target_latents_high)
-            loss_high = loss_eps_high + lambda_x0 * loss_x0_high_karrasnormed + lambda_std * std_loss_high
-            aux_losses["high_std"]=(std_loss_high.detach()) 
-            #Scale the loss to average the gradients, not sum them
-            loss_high = loss_high / ACCUMULATION_STEPS
-            loss_high.backward()
+        # The forward pass and loss calculation are dispatched to s_high
+        loss_eps_high = criteria(target_latents_high, high_noise.to(weight_dtype))
+        # B. data prediction from eps extrapolation loss
+        pred_x0_high = train_util.get_x0_from_xt_eps(
+                noisy_latents_high, target_latents_high, kilosteps_to, noise_scheduler
+            )
+        loss_x0_high = criteria(pred_x0_high.to(weight_dtype), x0_latents_high.to(weight_dtype))
+        loss_x0_high_karrasnormed =loss_weight*loss_x0_high
+        aux_losses["high"]=(loss_x0_high_karrasnormed.detach())
+        # C. Combine the losses
+        lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0.1)
+        lambda_std = getattr(config.train, 'lambda_std_loss', 0.1)
+        mean_loss_high, std_loss_high = train_util.statistical_matching_loss(target_latents_high)
+        loss_high = loss_eps_high + lambda_x0 * loss_x0_high_karrasnormed + lambda_std * std_loss_high
+        aux_losses["high_std"]=(std_loss_high.detach()) 
+        #Scale the loss to average the gradients, not sum them
+        loss_high = loss_high / ACCUMULATION_STEPS
         
-        # --- LOW PASS on stream 2 ---
-        with torch.cuda.stream(s_low):
-            #network.set_lora_slider(scale=-scale_to_look)
-            #with network context manager makes lycorisized case assymetric
-            if lycorisized:
-                network.set_multiplier(torch.tensor(scales_to_look[0]))
-                target_latents_low = train_util.predict_noise_xl(
-                        unet,
-                        noise_scheduler,
-                        current_timestep,
-                        noisy_latents_low,
-                        text_embeddings=train_util.concat_embeddings(
-                            prompt_pair.unconditional.text_embeds,
-                            prompt_pair.neutral.text_embeds,
-                            prompt_pair.batch_size,
-                        ),
-                        add_text_embeddings=train_util.concat_embeddings(
-                            prompt_pair.unconditional.pooled_embeds,
-                            prompt_pair.neutral.pooled_embeds,
-                            prompt_pair.batch_size,
-                        ),
-                        add_time_ids=train_util.concat_embeddings(
-                            add_time_ids, add_time_ids, prompt_pair.batch_size
-                        ),
-                        guidance_scale=1,
-                    ).to(device, dtype=weight_dtype)
-                #network.set_multiplier(0)   #similar to the exit part of 'with'.
-            else:
-                network.set_lora_slider(scale=scales_to_look[0])
-                with network:
-                    target_latents_low = train_util.predict_noise_xl(
-                        unet,
-                        noise_scheduler,
-                        current_timestep,
-                        noisy_latents_low,
-                        text_embeddings=train_util.concat_embeddings(
-                            prompt_pair.unconditional.text_embeds,
-                            prompt_pair.neutral.text_embeds,
-                            prompt_pair.batch_size,
-                        ),
-                        add_text_embeddings=train_util.concat_embeddings(
-                            prompt_pair.unconditional.pooled_embeds,
-                            prompt_pair.neutral.pooled_embeds,
-                            prompt_pair.batch_size,
-                        ),
-                        add_time_ids=train_util.concat_embeddings(
-                            add_time_ids, add_time_ids, prompt_pair.batch_size
-                        ),
-                        guidance_scale=1,
-                    ).to(device, dtype=weight_dtype)
-            
-            
-            loss_eps_low = criteria(target_latents_low, low_noise.to(weight_dtype))
-            # B. data prediction from eps extrapolation loss
-            lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0.1)
-            lambda_std = getattr(config.train, 'lambda_std_loss', 0.1)
-            pred_x0_low = train_util.get_x0_from_xt_eps(
-                    noisy_latents_low, target_latents_low, kilosteps_to, noise_scheduler
-                )
-            loss_x0_low = criteria(pred_x0_low.to(weight_dtype), x0_latents_low.to(weight_dtype))
-            loss_x0_low_karrasnormed = loss_weight*loss_x0_low
-            aux_losses["low"]=(loss_x0_low_karrasnormed.detach())
-            mean_loss_low, std_loss_low = train_util.statistical_matching_loss(target_latents_low)
-            aux_losses["low_std"]=(std_loss_high.detach()) 
-            # C. Combine the losses
-            loss_low = loss_eps_low + lambda_x0 * loss_x0_low_karrasnormed + lambda_std * std_loss_low
-            #Scale the loss to average the gradients, not sum them
-            loss_low = loss_low / ACCUMULATION_STEPS
-            loss_low.backward()
+        loss_eps_low = criteria(target_latents_low, low_noise.to(weight_dtype))
+        # B. data prediction from eps extrapolation loss
+        lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0.1)
+        lambda_std = getattr(config.train, 'lambda_std_loss', 0.1)
+        pred_x0_low = train_util.get_x0_from_xt_eps(
+                noisy_latents_low, target_latents_low, kilosteps_to, noise_scheduler
+            )
+        loss_x0_low = criteria(pred_x0_low.to(weight_dtype), x0_latents_low.to(weight_dtype))
+        loss_x0_low_karrasnormed = loss_weight*loss_x0_low
+        aux_losses["low"]=(loss_x0_low_karrasnormed.detach())
+        mean_loss_low, std_loss_low = train_util.statistical_matching_loss(target_latents_low)
+        aux_losses["low_std"]=(std_loss_low.detach()) 
+        # C. Combine the losses
+        loss_low = loss_eps_low + lambda_x0 * loss_x0_low_karrasnormed + lambda_std * std_loss_low
+        #Scale the loss to average the gradients, not sum them
+        loss_low = loss_low / ACCUMULATION_STEPS
+        total_loss = loss_high+loss_low
+        total_loss.backward()
 
-        # --- Synchronize before optimizer step ---
-        # Crucially, we must wait for both backward passes to complete
-        # before we can clip gradients or step the optimizer.
-        torch.cuda.synchronize()
         if len(aux_losses.keys()) >= 4:
             pbar.set_description(f"Loss_high/low*1k: {loss_high.item()*1000:.1f}/{loss_low.item()*1000:.1f};{aux_losses['high']*1000:.1f}/{aux_losses['low']*1000:.1f};{aux_losses['high_std']*1000:.1f}/{aux_losses['low_std']*1000:.1f}")
         else:
@@ -730,13 +643,11 @@ def train(
             lr_scheduler.step()
             optimizer.zero_grad()
         
-
         del (
             target_latents_low,
             target_latents_high,
         )
         flush()
-        
 
         ### INTERVALED LOGGING AND PERSISTENCE:
         # --- NEW: Periodically log the sampled aspect ratio distribution ---

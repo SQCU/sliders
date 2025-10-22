@@ -109,4 +109,106 @@ uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_
   0
   0
   still fried! interesting! oh the folder indexing 'error' wasn't an error but was something else...
-uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_b8' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_c1' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+  lr: 0.0005  # different semantic meaning in gluon
+  lambda_x0_loss: 0.0001
+  lambda_std_loss: 0.0001 somehow not as fried as c1! interesting!
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_c2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+  lr: 0.0001  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lambda_x0_loss: 0.001
+  lambda_std_loss: 0.001
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_c3' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C1, D1' --scales 0.8, 1.2
+#same but the image directions are untangled
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_c3alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonb.yaml' --folder_main 'datasets/immd' --folders 'C2, D2' --scales 0.8, 1.2
+  lambda_x0_loss: 0.01
+  lambda_std_loss: 0.01 # no marginal improvement
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_c4alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C2, D2' --scales 0.8, 1.2
+    fries.
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc1d1_glucli_c5alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 1, 2
+  grad_accum: 8
+  grad_clip: 0.1
+  lambda_x0_loss: 0.001
+  lambda_std_loss: 0.001
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_c6alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.8, 1.2
+# with... works not fried
+  iterations: 400
+  lr: 0.0001 
+  grad_accum: 8
+  grad_clip: 0.1
+  lambda_x0_loss: 0.001
+  lambda_std_loss: 0.001
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_d6alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.8, 1.2
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  iterations: 1600
+  lr: 0.0001  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "constant"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 8
+  grad_clip: 1.0
+  lambda_x0_loss: 0.01
+  lambda_std_loss: 0.1
+#done. melts 1600 steps, transition towards melting starts at ~800 steps.
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_d7alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.8, 1.2
+prompts_file: "trainscripts/imagesliders/data/prompts-xl-dilora-immd-ilxl1.0.yaml"
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  iterations: 1600
+  lr: 0.0001  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "constant"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 4
+  grad_clip: 1.0
+  lambda_x0_loss: 0
+  lambda_std_loss: 0.01
+# melts at 600 steps! progress!
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_d8alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.8, 1.2
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  iterations: 800
+  lr: 0.00001  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "constant"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 4
+  grad_clip: 1.0
+  lambda_x0_loss: 0
+  lambda_std_loss: 0.01
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_pre_d9alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.8, 1.2
+#adam calibration
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_d9alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.8, 1.2
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  iterations: 400
+  lr: 0.0001  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "cosine"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 4
+  grad_clip: 1.0
+  lambda_x0_loss: 0
+  lambda_std_loss: 0.01
+  #drop cudastreams
+  #interesting. adam blownt out, gluon... isn't?
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_pre_d10alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.8, 1.2
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_d10alt2' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.8, 1.2
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  iterations: 400
+  lr: 0.001  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "cosine"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 4
+  grad_clip: 1.0
+  lambda_x0_loss: 0
+  lambda_std_loss: 0
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_d10alt3' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 1, 2
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_d10alt3' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 1, 2

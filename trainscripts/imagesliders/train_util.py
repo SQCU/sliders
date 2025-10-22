@@ -369,6 +369,44 @@ def rescale_noise_cfg(
     return noise_cfg
 
 
+def predict_noise_xl_no_cfg(
+    unet: UNet2DConditionModel,
+    scheduler: SchedulerMixin,
+    timestep: int,
+    latents: torch.FloatTensor,
+    text_embeddings: torch.FloatTensor,
+    add_text_embeddings: torch.FloatTensor,
+    add_time_ids: torch.FloatTensor,
+    guidance_scale: float = 1.0, # This will be 1.0 in your new loop
+) -> torch.FloatTensor:
+    """
+    A non-CFG version of predict_noise_xl, suitable for the new batched
+    training loop where guidance is not used.
+    """
+    # No need to duplicate the latents or embeddings.
+    # The batch is already prepared by the trainer.
+    
+    # Scale the latents (if the scheduler requires it)
+    latent_model_input = scheduler.scale_model_input(latents, timestep)
+
+    # Prepare the added conditioning keyword arguments
+    added_cond_kwargs = {
+        "text_embeds": add_text_embeddings, # This is the pooled embeds
+        "time_ids": add_time_ids,
+    }
+
+    # Predict the noise residual
+    noise_pred = unet(
+        latent_model_input,
+        timestep,
+        encoder_hidden_states=text_embeddings, # This is the main text embeds
+        added_cond_kwargs=added_cond_kwargs,
+    ).sample
+    
+    # Since guidance_scale is 1, no CFG calculation is needed.
+    # We simply return the direct prediction.
+    return noise_pred
+ 
 def predict_noise_xl(
     unet: UNet2DConditionModel,
     scheduler: SchedulerMixin,
@@ -382,6 +420,7 @@ def predict_noise_xl(
 ) -> torch.FloatTensor:
     # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
     latent_model_input = torch.cat([latents] * 2)
+    #print(f"concatenated latents shape:{latent_model_input.shape}")
 
     latent_model_input = scheduler.scale_model_input(latent_model_input, timestep)
 
@@ -405,9 +444,9 @@ def predict_noise_xl(
     )
 
     # https://github.com/huggingface/diffusers/blob/7a91ea6c2b53f94da930a61ed571364022b21044/src/diffusers/pipelines/stable_diffusion_xl/pipeline_stable_diffusion_xl.py#L775
-    noise_pred = rescale_noise_cfg(
-        noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
-    )
+    #noise_pred = rescale_noise_cfg(
+    #    noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
+    #)
 
     return guided_target
 
