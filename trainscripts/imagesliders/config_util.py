@@ -43,6 +43,8 @@ class TrainConfig(BaseModel):
 
     lambda_x0_loss: float = 0.001 # This is a starting point, it will need tuning!
     lambda_std_loss: float = 0.001
+    batch_size: int = 2
+    n_tuple: int = 2
 
 class SaveConfig(BaseModel):
     name: str = "untitled"

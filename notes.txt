@@ -211,4 +211,32 @@ train:
   lambda_x0_loss: 0
   lambda_std_loss: 0
 uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_d10alt3' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 1, 2
-uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc1d1_glucli_d10alt3' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 1, 2
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", ""
+  iterations: 400
+  lr: 0.001  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "cosine"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 2 #batching achieved internally
+  grad_clip: 1.0
+  lambda_x0_loss: 0.0001
+  lambda_std_loss: 0
+  #oops these were on molk
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgluon_bracket_XI_a' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+  batch_size: 4
+  lr: 0.0001  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "cosine"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 2 #batching achieved internally
+  grad_clip: 1.0
+  lambda_x0_loss: 0.0001
+  lambda_std_loss: 0
+  #oops this was on molk too
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgluon_bracket_XI_b' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+#... keys didnt match reprofiled
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_b' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+# keys...
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_c' --rank 64 --alpha 32 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2

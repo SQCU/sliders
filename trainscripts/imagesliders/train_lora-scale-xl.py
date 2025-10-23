@@ -156,77 +156,100 @@ def create_prefetch_generator(iterable, num_prefetch=2):
 
     return consumer()
 
-def batch_generator(folder_main, folders, scales, scales_unique, buckets, k, sharpness, batch_size):
+def batch_generator(
+    folder_main: str,
+    folders: list,
+    scales: list,
+    scales_unique: list,
+    buckets: list,
+    k: int,
+    sharpness: float,
+    batch_size: int,
+    n_tuple: int,
+):
     """
-    A generator that yields a dictionary containing a full batch of processed
-    image pairs and their corresponding scales.
+    Yields packets of structured data for N-tuple contrastive training.
+    Respects the arbitrary mapping between scales and folder names.
     """
-    # Convert to numpy for easier indexing
-    folders = np.array(folders)
-    scales = np.array(scales)
+    # Create numpy arrays for efficient lookup
+    scales_array = np.array(scales)
+    folders_array = np.array(folders)
     
     while True:
         try:
-            # --- Prepare a batch ---
-            batch_imgs_high = []
-            batch_imgs_low = []
-            batch_scales_high = []
-            batch_scales_low = []
+            # --- Initialize lists for the batch ---
+            batch_images = []         # Shape: (B, N) of PILs
+            batch_scales = []         # Shape: (B, N) of floats
+            batch_orig_sizes = []     # Shape: (B, 2) of ints
+            batch_crop_boxes = []     # Shape: (B, 4) of ints
+            batch_target_sizes = []   # Shape: (B, 2) of ints
+            batch_seeds = []          # Shape: (B,) of ints
+            batch_timesteps = []
 
-            # CRITICAL: Determine the target size once for the entire batch
-            # To do this, we need a sample image to get the original aspect ratio
-            temp_scales_to_look = random.sample(list(scales_unique), 2)
-            temp_scales_to_look.sort()
-            temp_folder = folders[scales == temp_scales_to_look[-1]][0]
-            temp_ims = [im_ for im_ in os.listdir(f'{folder_main}/{temp_folder}/') if im_.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
-            if not temp_ims: continue
-            temp_image_name = random.choice(temp_ims)
-            temp_img_raw = Image.open(f'{folder_main}/{temp_folder}/{temp_image_name}').convert("RGB")
-
-            crop_box, target_size = get_transform_params(
-                original_size=temp_img_raw.size,
-                buckets=buckets,
-                k_nearest=k,
-                sharpness=sharpness,
-            )
-
-            # --- Fill the batch ---
+            # --- Build the batch of B tuples ---
             for _ in range(batch_size):
-                scales_to_look = random.sample(list(scales_unique), 2)
-                scales_to_look.sort()
-
-                folder_high = folders[scales == scales_to_look[-1]][0]
-                folder_low = folders[scales == scales_to_look[0]][0]
-
-                ims = os.listdir(f'{folder_main}/{folder_high}/')
-                ims = [im_ for im_ in ims if im_.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
-                if not ims: continue # Skip if folder is empty
+                # 1. Get a list of all available base image names
+                #    We can use any folder since names are assumed to be consistent.
+                sample_folder = folders_array[0]
+                ims_path = os.path.join(folder_main, sample_folder)
+                ims = [f for f in os.listdir(ims_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+                if not ims: continue
+                
+                # 2. Select one BaseSample (image_name) for the entire tuple
                 image_name = random.choice(ims)
+                
+                # 3. Determine a consistent crop/resize transform for this tuple
+                sample_img_path = os.path.join(ims_path, image_name)
+                with Image.open(sample_img_path) as sample_img:
+                    original_size = sample_img.size
+                
+                crop_box, target_size = get_transform_params(original_size, buckets, k_nearest=k, sharpness=sharpness)
 
-                img_high_raw = Image.open(f'{folder_main}/{folder_high}/{image_name}').convert("RGB")
-                img_low_raw = Image.open(f'{folder_main}/{folder_low}/{image_name}').convert("RGB")
+                # 4. Select N concepts (scales) for this tuple
+                sampled_scales = sorted(random.sample(scales_unique, n_tuple))
+                
+                # 5. Load the N corresponding images using the scale-to-folder map
+                images_for_tuple = []
+                for scale in sampled_scales:
+                    # Find the folder name corresponding to the current scale
+                    folder_name = folders_array[scales_array == scale][0]
+                    img_path = os.path.join(folder_main, folder_name, image_name)
+                    
+                    with Image.open(img_path) as img:
+                        processed_img = process_image(img.convert("RGB"), crop_box, target_size)
+                        images_for_tuple.append(processed_img)
+                
+                # For each tuple, sample a timestep index
+                tuple_timestep_index = random.randint(1, max_denoising_steps - 1)
+                # 6. Append all data for this tuple to the batch lists
+                batch_images.append(images_for_tuple)
+                batch_scales.append(sampled_scales)
+                batch_orig_sizes.append(original_size)
+                batch_crop_boxes.append(crop_box)
+                batch_target_sizes.append(target_size)
+                batch_seeds.append(random.randint(0, 2**32 - 1))
+                batch_timesteps.append(tuple_timestep_index)
 
-                # Process both images with the same determined crop and target size
-                img_high = process_image(img_high_raw, crop_box, target_size)
-                img_low = process_image(img_low_raw, crop_box, target_size)
+            if not batch_images: continue
 
-                batch_imgs_high.append(img_high)
-                batch_imgs_low.append(img_low)
-                batch_scales_high.append(scales_to_look[-1])
-                batch_scales_low.append(scales_to_look[0])
+            # --- Final Tensor Conversion and Broadcasting ---
+            b_dim, n_dim = len(batch_scales), len(batch_scales[0])
 
-            if not batch_imgs_high: continue
-
+            timesteps_tensor = torch.tensor(batch_timesteps, dtype=torch.int64)
+            broadcast_timesteps = timesteps_tensor.unsqueeze(1).expand(-1, n_tuple)
+            
             yield {
-                "images_high": batch_imgs_high,
-                "images_low": batch_imgs_low,
-                "scales_high": torch.tensor(batch_scales_high, dtype=torch.float32),
-                "scales_low": torch.tensor(batch_scales_low, dtype=torch.float32),
-                "target_size": target_size
+                "images":           batch_images,
+                "scales":           torch.tensor(batch_scales, dtype=torch.float32),
+                "target_sizes":     torch.tensor(batch_target_sizes, dtype=torch.int32).unsqueeze(1).expand(b_dim, n_dim, 2),
+                "original_sizes":   torch.tensor(batch_orig_sizes, dtype=torch.int32).unsqueeze(1).expand(b_dim, n_dim, 2),
+                "crop_coords":      torch.tensor(batch_crop_boxes, dtype=torch.int32).unsqueeze(1).expand(b_dim, n_dim, 4),
+                "tuple_prng_seeds": torch.tensor(batch_seeds, dtype=torch.int64).unsqueeze(1).expand(b_dim, n_dim),
+                "timesteps_to":     broadcast_timesteps
             }
             
-        except (IOError, FileNotFoundError) as e:
-            print(f"Warning: Skipping batch due to error: {e}")
+        except (IOError, FileNotFoundError, IndexError) as e:
+            print(f"Warning: Skipping batch due to error in generator: {e}")
             continue
 
 
@@ -319,15 +342,23 @@ def train(
     # ===============================================================================
     # VVVVVVVVVVVVVVVVVVVVVVVV MODIFICATION START VVVVVVVVVVVVVVVVVVVVVVVVVV
     # ===============================================================================
+    if hasattr(config.train, "n_tuple"):
+        N_TUPLE = config.train.n_tuple
+    else:
+        N_TUPLE = 2 # Or 8, 32, etc.
+        print(f"defaulted ur n_tuple to n:{N_TUPLE}")
+    if hasattr(config.train, "batch_size"):
+        BATCH_SIZE = config.train.batch_size
+    else:
+        BATCH_SIZE = 2 # Or 8, 32, etc.
+        print(f"defaulted ur batchsize to n:{BATCH_SIZE}")
 
-    # Use a real batch size now, not just for gradient accumulation
-    # This should be set based on VRAM. It's the number of PAIRS to process.
-    BATCH_SIZE = 2 # Example value, adjust as needed
-
-    # --- REVISED: Initialize the new batch-aware prefetcher ---
+    # --- Initialize the new batch-aware prefetcher ---
     data_gen = batch_generator(
         folder_main, folders, scales, scales_unique,
-        ASPECT_RATIO_BUCKETS, K_NEAREST_BUCKETS, SAMPLING_SHARPNESS, BATCH_SIZE
+        ASPECT_RATIO_BUCKETS, K_NEAREST_BUCKETS, SAMPLING_SHARPNESS,
+        batch_size=BATCH_SIZE,
+        n_tuple=N_TUPLE
     )
     prefetcher = create_prefetch_generator(data_gen, num_prefetch=2)
     # ----------------------------------------
@@ -375,8 +406,8 @@ def train(
             unet,
             rank=config.network.rank,
             alpha=config.network.alpha,
-            include_substrings=['ff.net', 'attn2.to_q', 'attn2.to_k'],
-            exclude_substrings=['down_blocks.0'] # Example: exclude the first downblock
+            include_substrings=['ff.net', 'attn2.to_q', 'attn2.to_k','attn1.to_v','attn1.to_out'],
+            exclude_substrings=[] # Example: exclude the first downblock: ['down_blocks.0']
         )
     }
 
@@ -420,7 +451,9 @@ def train(
         max_iterations=config.train.iterations,
         lr_min=config.train.lr / 100,
     )
-    criteria = torch.nn.MSELoss()
+    # Change the reduction method to 'none'.
+    # This will make criteria(pred, target) return a tensor with the same shape as the inputs.
+    criteria = torch.nn.MSELoss(reduction='none')
 
     print("Prompts")
     for settings in prompts:
@@ -433,9 +466,7 @@ def train(
     cache = PromptEmbedsCache()
     prompt_pairs: list[PromptEmbedsPair] = []
 
-    # cudastreams
-    # Before the training loop
-    s_vae = torch.cuda.Stream()
+    # no more cudastreams
 
     #"for settings in prompts" seems to suggest u can run more than one prompt pair in a prompt config?
     #i think unconditional might be about specifying the negative prompt at inference time.
@@ -494,133 +525,134 @@ def train(
             noise_scheduler.set_timesteps(
                 config.train.max_denoising_steps, device=device
             )
-
             prompt_pair: PromptEmbedsPair = random.choice(prompt_pairs)
-
             # 1 ~ 49 からランダム
             timesteps_to = torch.randint(
                 1, config.train.max_denoising_steps, (1,)
             ).item()
 
-            # --- REVISED: Get a full batch from the prefetcher ---
-            batch = next(prefetcher)
-            height, width = batch["target_size"]
-            sampled_ar_counts[batch["target_size"]] = sampled_ar_counts.get(batch["target_size"], 0) + 1
-            # -----------------------------------------------------------
-
-            # --- REVISED: Construct a single, combined batch for the GPU ---
-            # Total batch size on GPU will be BATCH_SIZE * 2
-            batched_images = batch["images_high"] + batch["images_low"]
-            scales_tensor = torch.cat([batch["scales_high"], batch["scales_low"]]).to(device)
-
-            seed = random.randint(0,2*15)
-
-            # --- REVISED: Single pass for VAE encoding and noising ---
-            # This is much more efficient than two separate passes.
-            generator = torch.manual_seed(seed)
-            noisy_latents, noise, x0_latents = train_util.get_noisy_image_and_init_image(
-                batched_images, vae, generator, unet, noise_scheduler,
-                total_timesteps=timesteps_to
+            # --- Step A: Get the structured data packet from the generator ---
+            batch_packet = next(prefetcher)
+            
+            # Update aspect ratio logging
+            # We take the size from the first tuple in the batch
+            ar_log_size = tuple(batch_packet["target_sizes"][0, 0].tolist())
+            sampled_ar_counts[ar_log_size] = sampled_ar_counts.get(ar_log_size, 0) + 1
+            
+            # --- Step B: Prepare Correlated Noisy Latents ---
+            # This single call replaces all the old manual VAE/noise logic.
+            latent_packet = train_util.prepare_correlated_noisy_latents(
+                batch_packet=batch_packet,
+                vae=vae,
+                scheduler=noise_scheduler,
+                timesteps_to=timesteps_to,
+                dtype=weight_dtype
             )
-            noisy_latents = noisy_latents.to(device, dtype=weight_dtype)
-            noise = noise.to(device, dtype=weight_dtype)
-            x0_latents = x0_latents.to(device, dtype=weight_dtype)
 
-            noise_scheduler.set_timesteps(1000)
+            # Step C: Prepare Prompt Conditioning (The "shameful" explicit call)
+            combined_text_embeds, combined_pooled_embeds = train_util.broadcast_prompts_to_n_tuple(
+                positive_text_embeds=prompt_pair.positive.text_embeds,
+                positive_pooled_embeds=prompt_pair.positive.pooled_embeds,
+                neutral_text_embeds=prompt_pair.neutral.text_embeds,
+                neutral_pooled_embeds=prompt_pair.neutral.pooled_embeds,
+                scales=batch_packet["scales"]
+            )
 
-            add_time_ids = train_util.get_add_time_ids(
-                height,
-                width,
-                dynamic_crops=prompt_pair.dynamic_crops,
+            # Step D: Prepare Time Conditioning (Fixing the SDXL API contract)
+            combined_add_time_ids = train_util.batch_add_time_ids(
+                original_sizes=batch_packet["original_sizes"],
+                crop_coords=batch_packet["crop_coords"],
+                target_sizes=batch_packet["target_sizes"],
                 dtype=weight_dtype,
-            ).to(device, dtype=weight_dtype)
-            kilosteps_to = int(timesteps_to * 1000 / config.train.max_denoising_steps)
-            current_timestep = noise_scheduler.timesteps[
-                int(timesteps_to * 1000 / config.train.max_denoising_steps)
-            ]
-            assert 0 <= current_timestep < 1000, f"FATAL: Invalid timestep index calculated. Got {current_timestep} from timesteps_to={timesteps_to}"
+                device=device
+            )
+
+            #    Shape: (B, N) -> (B,)
+            timesteps_to_indices = batch_packet["timesteps_to"][:, 0]
+            #    Shape: (B,) -> (B,)
+            kilostep_indices = (timesteps_to_indices * (1000 / config.train.max_denoising_steps)).long()
+            #    Set the scheduler to the 1000-step 'pseudocontinuous' values.
+            noise_scheduler.set_timesteps(1000)
+            #    Shape: (B,)
+            current_timesteps_per_tuple = noise_scheduler.timesteps[kilostep_indices]
             # Get the sigma for the current timestep
-            current_sigma = noise_scheduler.sigmas[
-                int(timesteps_to * 1000 / config.train.max_denoising_steps)
-            ]
+            current_sigmas_per_tuple = noise_scheduler.sigmas[kilostep_indices]
+            unet_timesteps = current_timesteps_per_tuple.unsqueeze(1).expand(-1, N_TUPLE).reshape(-1)
             # Calculate a loss weight. A common formulation from Karras et al.
-            # adds 1 to the denominator for stability. The squared sigma is key.
-            loss_weight = 1.0 / (current_sigma**2 + 1.0) 
+            # Shape: (B,) -> (B, 1) -> (B, N) -> (B*N, 1, 1, 1) for broadcasting with latents
+            loss_weights = (1.0 / (current_sigmas_per_tuple**2 + 1.0))
+            loss_weights = loss_weights.unsqueeze(1).expand(-1, N_TUPLE).reshape(-1, 1, 1, 1)
 
-            # Prepare batched embeddings
-            text_embeds_high = train_util.concat_embeddings(
-                prompt_pair.unconditional.text_embeds, prompt_pair.positive.text_embeds, BATCH_SIZE)
-            text_embeds_low = train_util.concat_embeddings(
-                prompt_pair.unconditional.text_embeds, prompt_pair.neutral.text_embeds, BATCH_SIZE)
-            
-            pooled_embeds_high = train_util.concat_embeddings(
-                prompt_pair.unconditional.pooled_embeds, prompt_pair.positive.pooled_embeds, BATCH_SIZE)
-            pooled_embeds_low = train_util.concat_embeddings(
-                prompt_pair.unconditional.pooled_embeds, prompt_pair.neutral.pooled_embeds, BATCH_SIZE)
+                # Assemble all UNet inputs in one final, clean call
+            unet_args, unet_kwargs = train_util.sdxl_condnet_batchjoin(
+                noisy_latents=latent_packet["noisy_latents"],
+                text_embeddings=combined_text_embeds,
+                pooled_embeddings=combined_pooled_embeds,
+                time_ids=combined_add_time_ids,
+                scheduler=noise_scheduler,
+                timestep=unet_timesteps # Pass the 1000-step-schedule timestep
+            )
 
-            # Combine for the single pass
-            combined_text_embeds = torch.cat([text_embeds_high, text_embeds_low])
-            combined_pooled_embeds = torch.cat([pooled_embeds_high, pooled_embeds_low])
-            
-            # add_time_ids needs to be repeated for the full hardware batch
-            # also needs to be repeated along the n_cases dimension (2 here)
-            combined_add_time_ids = add_time_ids.repeat(BATCH_SIZE * 2 * 2, 1)
-            # scales tensor also to same shape...
-            scales_tensor = torch.cat([scales_tensor, scales_tensor], dim=0)
-        #print(f"the shape of our text_embeddings,add_text_embeddings,add_time_ids:\n{combined_text_embeds.shape},{combined_pooled_embeds.shape},{combined_add_time_ids.shape}")
-        network.set_lora_scales(scales_tensor) # Set per-sample scales
-        #print(f"but also: the shape of our noisy_latents:\n{noisy_latents.shape}")
-        target_latents = train_util.predict_noise_xl(
-            unet, noise_scheduler, current_timestep, noisy_latents,
-            text_embeddings=combined_text_embeds,
-            add_text_embeddings=combined_pooled_embeds,
-            add_time_ids=combined_add_time_ids,
-            guidance_scale=1,
-        ).to(device, dtype=weight_dtype)
+        network.set_lora_scales(torch.flatten(batch_packet["scales"]).to(device)) # Set per-sample scales
+        # Call the UNet directly and explicitly
+        target_latents = unet(*unet_args, **unet_kwargs).sample.to(device, dtype=weight_dtype)
 
-        # --- REVISED: Split outputs and calculate losses ---
-        target_latents_high, target_latents_low = torch.chunk(target_latents, 2, dim=0)
-        high_noise, low_noise = torch.chunk(noise, 2, dim=0)
-        noisy_latents_high, noisy_latents_low = torch.chunk(noisy_latents, 2, dim=0)
-        x0_latents_high, x0_latents_low = torch.chunk(x0_latents, 2, dim=0)
+        # --- 4. LOSS CALCULATION & BACKWARD PASS ---
+        # Split the outputs to calculate high/low losses separately.
+        # This is where N_TUPLE=2 is still hardcoded, which is fine for now.
+        target_latents_high, target_latents_low = torch.chunk(target_latents, N_TUPLE, dim=0)
+        
+        # We need to split all ground truth tensors from the latent_packet as well.
+        noise_high, noise_low = torch.chunk(latent_packet["ground_truth_noise"], N_TUPLE, dim=0)
+        noisy_latents_high, noisy_latents_low = torch.chunk(latent_packet["noisy_latents"], N_TUPLE, dim=0)
+        x0_latents_high, x0_latents_low = torch.chunk(latent_packet["x0_latents"], N_TUPLE, dim=0)
+        # You will need to split the `loss_weights` tensor just like the others:
+        loss_weights_high, loss_weights_low = torch.chunk(loss_weights, N_TUPLE, dim=0)
 
         # Loss calculation logic is the same, just applied to the split tensors
         aux_losses = {}
 
         # The forward pass and loss calculation are dispatched to s_high
         loss_eps_high = criteria(target_latents_high, high_noise.to(weight_dtype))
+        # 2. Mean reduce over spatial and channel dims. Shape: (B,)
+        # loss_weights_high has shape (B, 1, 1, 1), so we squeeze it to (B,)
+        loss_eps_high = loss_weights_high.squeeze() * loss_eps_high.mean(dim=(1, 2, 3))
         # B. data prediction from eps extrapolation loss
         pred_x0_high = train_util.get_x0_from_xt_eps(
                 noisy_latents_high, target_latents_high, kilosteps_to, noise_scheduler
             )
         loss_x0_high = criteria(pred_x0_high.to(weight_dtype), x0_latents_high.to(weight_dtype))
-        loss_x0_high_karrasnormed =loss_weight*loss_x0_high
-        aux_losses["high"]=(loss_x0_high_karrasnormed.detach())
+        loss_x0_high_karrasnormed = loss_weights_high.squeeze()*loss_x0_high.mean(dim=(1, 2, 3))
+        aux_losses["high"]=(loss_x0_high_karrasnormed.detach().mean())
         # C. Combine the losses
-        lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0.1)
-        lambda_std = getattr(config.train, 'lambda_std_loss', 0.1)
+        lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0)
+        lambda_std = getattr(config.train, 'lambda_std_loss', 0)
         mean_loss_high, std_loss_high = train_util.statistical_matching_loss(target_latents_high)
-        loss_high = loss_eps_high + lambda_x0 * loss_x0_high_karrasnormed + lambda_std * std_loss_high
         aux_losses["high_std"]=(std_loss_high.detach()) 
-        #Scale the loss to average the gradients, not sum them
-        loss_high = loss_high / ACCUMULATION_STEPS
+        #(Shape: B,)
+        loss_high = loss_eps_high + lambda_x0 * loss_x0_high_karrasnormed + lambda_std * std_loss_high
+        #(shape: 1)
+        loss_high = loss_high.mean() / ACCUMULATION_STEPS
         
         loss_eps_low = criteria(target_latents_low, low_noise.to(weight_dtype))
+        # 2. Mean reduce over spatial and channel dims. Shape: (B,)
+        # loss_weights_high has shape (B, 1, 1, 1), so we squeeze it to (B,)
+        loss_eps_low = loss_weights_low.squeeze() * loss_eps_low.mean(dim=(1, 2, 3))
         # B. data prediction from eps extrapolation loss
-        lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0.1)
-        lambda_std = getattr(config.train, 'lambda_std_loss', 0.1)
+        lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0)
+        lambda_std = getattr(config.train, 'lambda_std_loss', 0)
         pred_x0_low = train_util.get_x0_from_xt_eps(
                 noisy_latents_low, target_latents_low, kilosteps_to, noise_scheduler
             )
         loss_x0_low = criteria(pred_x0_low.to(weight_dtype), x0_latents_low.to(weight_dtype))
-        loss_x0_low_karrasnormed = loss_weight*loss_x0_low
-        aux_losses["low"]=(loss_x0_low_karrasnormed.detach())
+        loss_x0_low_karrasnormed = loss_weights_low.squeeze()*loss_x0_low.mean(dim=(1, 2, 3))
+        aux_losses["low"]=(loss_x0_low_karrasnormed.detach().mean())
         mean_loss_low, std_loss_low = train_util.statistical_matching_loss(target_latents_low)
         aux_losses["low_std"]=(std_loss_low.detach()) 
         # C. Combine the losses
         loss_low = loss_eps_low + lambda_x0 * loss_x0_low_karrasnormed + lambda_std * std_loss_low
-        #Scale the loss to average the gradients, not sum them
-        loss_low = loss_low / ACCUMULATION_STEPS
+        loss_low = loss_low.mean() / ACCUMULATION_STEPS
+
         total_loss = loss_high+loss_low
         total_loss.backward()
 
@@ -647,7 +679,7 @@ def train(
             target_latents_low,
             target_latents_high,
         )
-        flush()
+        #flush()
 
         ### INTERVALED LOGGING AND PERSISTENCE:
         # --- NEW: Periodically log the sampled aspect ratio distribution ---

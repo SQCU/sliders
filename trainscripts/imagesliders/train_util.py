@@ -1,6 +1,7 @@
 from typing import Optional, Union
 
 import torch
+import torch.nn as nn  # <--- ADD THIS LINE
 
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers import UNet2DConditionModel, SchedulerMixin
@@ -269,7 +270,90 @@ def get_noisy_image_and_init_image(
     # get latents
     noisy_latents = scheduler.add_noise(init_latents, noise, timestep)
     
-    return init_latents, noise, init_latents
+    return noisy_latents, noise, init_latents
+
+@torch.no_grad()
+def prepare_correlated_noisy_latents(
+    batch_packet: dict,
+    vae: nn.Module,
+    # nope we don't pass the processor in, don't recreate it
+    scheduler: SchedulerMixin,
+    timesteps_to: int, # This is an INDEX (e.g., 20)
+    dtype: torch.dtype
+):
+    """
+    Handles batch image processing, VAE encoding, and correlated noise generation.
+    Takes a structured batch packet and returns the core tensors for the UNet.
+    """
+    # --- Unpack data and get shapes ---
+    images = batch_packet["images"]
+    tuple_prng_seeds = batch_packet["tuple_prng_seeds"]
+    batch_size, n_tuple = tuple_prng_seeds.shape
+
+    # --- Image Preprocessing & Tensorization ---
+    # Flatten the (B, N) list of lists into a single list of (B * N) images
+    flat_images = [img for tpl in images for img in tpl]
+    
+    # Preprocess the entire batch of images. The VaeImageProcessor handles this.
+    # The result is a single tensor of shape (B*N, 3, H, W)
+    vae_preprocess_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_preprocess_scale_factor,do_convert_rgb=True)
+    image_tensor = image_processor.preprocess(flat_images).to(device=vae.device, dtype=dtype)
+
+    # Encode the whole batch in one go for maximum efficiency.
+    x0_latents_flat = vae.encode(image_tensor).latent_dist.sample(None)
+
+    # Apply the required VAE scaling factor.
+    x0_latents_flat = vae.config.scaling_factor * x0_latents_flat
+
+    # --- Correlated Noise Generation & Application ---
+    # Reshape the clean latents into their logical tuple structure
+    C, H, W = x0_latents_flat.shape[1:]
+    x0_latents = x0_latents_flat.view(batch_size, n_tuple, C, H, W)
+
+    # We only need one unique seed per tuple from our broadcasted tensor
+    unique_tuple_seeds = tuple_prng_seeds[:, 0] # Shape: (B,)
+    
+    # Generate one unique noise mask for each tuple in the batch
+    noise_masks = torch.stack([
+        torch.randn(
+            (C, H, W), 
+            generator=torch.Generator(device=vae.device).manual_seed(seed.item()), 
+            device=vae.device,
+            dtype=dtype
+        ) for seed in unique_tuple_seeds
+    ]) # Final shape: (B, C, H, W)
+
+    expanded_noise = noise_masks.unsqueeze(1).expand(-1, n_tuple, -1, -1, -1)
+    # The `expanded_noise` tensor now has shape (B, N, C, H, W), exactly matching `x0_latents`.
+    # Get the per-tuple timestep indices from the packet
+    timesteps_indices = batch_packet["timesteps_to"] # Shape: (B, N)
+    # We only need one index per tuple for the lookup
+    unique_indices = timesteps_indices[:, 0] # Shape: (B,)
+    # Look up the actual timestep VALUES from the scheduler's array
+    timestep_values = scheduler.timesteps[unique_indices] # Shape: (B,)
+    # The scheduler.add_noise function expects one timestep per batch item.
+    # We need to broadcast our per-tuple values to the per-item N dimension.
+    # Shape: (B,) -> (B, 1) -> (B, N)
+    broadcast_timestep_values = timestep_values.unsqueeze(1).expand(-1, n_tuple)
+
+    # Apply the SAME noise mask to all N items within each tuple via broadcasting.
+    # The scheduler's add_noise handles this if we give it latents of (B, N, ...)
+    # and noise of (B, 1, ...). We unsqueeze the noise to enable this.
+    noisy_latents = scheduler.add_noise(
+        x0_latents, 
+        expanded_noise,
+        broadcast_timestep_values.view(-1) # Shape: (B*N,) 
+    )
+
+    # --- 5. Return Flattened Tensors ready for the U-Net ---
+    total_batch_size = batch_size * n_tuple     # B * N
+    
+    return {
+        "noisy_latents": noisy_latents.view(total_batch_size, C, H, W),
+        "ground_truth_noise": expanded_noise.view(total_batch_size, C, H, W), # Use the same expanded tensor
+        "x0_latents": x0_latents_flat
+    }
 
 def get_x0_from_xt_eps(
     xt_latents: torch.Tensor,
@@ -295,17 +379,16 @@ def statistical_matching_loss(eps_pred: torch.Tensor) -> torch.Tensor:
     Calculates a loss based on how well the statistics of the predicted noise
     match the target statistics of a standard normal distribution (mean=0, std=1).
     """
-    # Calculate the mean of the predicted noise across all dimensions (batch, channel, h, w)
-    mean_pred = eps_pred.mean()
+    # To calculate the statistic for each item, we reduce over the
+    # channel, height, and width dimensions (1, 2, and 3).
+    mean_pred_per_item = eps_pred.mean(dim=(1, 2, 3))
+    std_pred_per_item = eps_pred.std(dim=(1, 2, 3))
     
-    # Calculate the standard deviation of the predicted noise
-    std_pred = eps_pred.std()
+    # Calculate the squared error from the target values (0 for mean, 1 for std)
+    loss_mean = mean_pred_per_item**2
+    loss_std = (std_pred_per_item - 1)**2
     
-    # The loss is the squared error from the target values
-    loss_mean = mean_pred**2  # Target mean is 0
-    loss_std = (std_pred - 1)**2  # Target std is 1
-    
-    # Combine them into a single statistical loss
+    # Return two tensors of shape (B,)
     return loss_mean, loss_std
 
 def get_latent_statistics(tensor: torch.Tensor) -> dict:
@@ -368,43 +451,98 @@ def rescale_noise_cfg(
 
     return noise_cfg
 
+# =========================================================================
+# VVVVVVVVVVVVVVVVVV NEW, CLEAN NON-CFG HELPER FUNCTIONS VVVVVVVVVVVVVVVVVV
+# =========================================================================
 
-def predict_noise_xl_no_cfg(
-    unet: UNet2DConditionModel,
-    scheduler: SchedulerMixin,
+def prepare_non_cfg_embeddings(
+    positive_text_embeds: torch.FloatTensor,
+    positive_pooled_embeds: torch.FloatTensor,
+    neutral_text_embeds: torch.FloatTensor,
+    neutral_pooled_embeds: torch.FloatTensor,
+    batch_size_high: int,
+    batch_size_low: int
+) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    """
+    Prepares separate, non-CFG text and pooled embeddings for a mixed batch.
+    This version is decoupled from PromptEmbedsPair and accepts raw tensors.
+    """
+    # High pass uses the 'positive' prompt
+    text_embeds_high = positive_text_embeds.repeat(batch_size_high, 1, 1)
+    pooled_embeds_high = positive_pooled_embeds.repeat(batch_size_high, 1)
+
+    # Low pass uses the 'neutral' prompt
+    text_embeds_low = neutral_text_embeds.repeat(batch_size_low, 1, 1)
+    pooled_embeds_low = neutral_pooled_embeds.repeat(batch_size_low, 1)
+    
+    # Combine into a single batch
+    combined_text_embeds = torch.cat([text_embeds_high, text_embeds_low], dim=0)
+    combined_pooled_embeds = torch.cat([pooled_embeds_high, pooled_embeds_low], dim=0)
+    
+    return combined_text_embeds, combined_pooled_embeds
+
+# To be placed in train_util.py
+
+def sdxl_condnet_batchjoin(
+    noisy_latents: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    pooled_embeddings: torch.Tensor,
+    time_ids: torch.Tensor,
+    scheduler: "SchedulerMixin",
+    timestep: int
+) -> tuple[list, dict]:
+    """
+    Assembles the exact *args and **kwargs required for the SDXL UNet's
+    forward pass in a non-CFG, batched training context.
+    
+    This function is the single point of truth for the UNet's API contract.
+    """
+    total_batch_size = noisy_latents.shape[0]
+    
+    # --- 1. Prepare Positional Args for `unet.forward()` ---
+    scaled_latents = scheduler.scale_model_input(noisy_latents, timestep)
+    timestep_tensor = torch.tensor([timestep] * total_batch_size, device=noisy_latents.device)
+    unet_args = [scaled_latents, timestep_tensor]
+    
+    # --- 2. Prepare Keyword Args for `unet.forward()` ---
+    added_cond_kwargs = {
+        "text_embeds": pooled_embeddings,
+        "time_ids": time_ids
+    }
+    unet_kwargs = {
+        "encoder_hidden_states": text_embeddings,
+        "added_cond_kwargs": added_cond_kwargs
+    }
+    # --- 3. Return the final structure for splatting ---
+    return (unet_args, unet_kwargs)
+
+def predict_noise_non_cfg(
+    unet: nn.Module,
+    scheduler: nn.Module,
     timestep: int,
     latents: torch.FloatTensor,
     text_embeddings: torch.FloatTensor,
-    add_text_embeddings: torch.FloatTensor,
-    add_time_ids: torch.FloatTensor,
-    guidance_scale: float = 1.0, # This will be 1.0 in your new loop
+    pooled_embeddings: torch.FloatTensor,
+    time_ids: torch.FloatTensor,
 ) -> torch.FloatTensor:
     """
-    A non-CFG version of predict_noise_xl, suitable for the new batched
-    training loop where guidance is not used.
+    Performs a single, direct U-Net forward pass without any CFG logic.
+    Expects all input tensors to have the same batch dimension.
     """
-    # No need to duplicate the latents or embeddings.
-    # The batch is already prepared by the trainer.
-    
-    # Scale the latents (if the scheduler requires it)
     latent_model_input = scheduler.scale_model_input(latents, timestep)
 
-    # Prepare the added conditioning keyword arguments
     added_cond_kwargs = {
-        "text_embeds": add_text_embeddings, # This is the pooled embeds
-        "time_ids": add_time_ids,
+        "text_embeds": pooled_embeddings,
+        "time_ids": time_ids,
     }
 
-    # Predict the noise residual
     noise_pred = unet(
         latent_model_input,
         timestep,
-        encoder_hidden_states=text_embeddings, # This is the main text embeds
+        encoder_hidden_states=text_embeddings,
         added_cond_kwargs=added_cond_kwargs,
     ).sample
     
-    # Since guidance_scale is 1, no CFG calculation is needed.
-    # We simply return the direct prediction.
     return noise_pred
  
 def predict_noise_xl(
@@ -523,6 +661,32 @@ def get_add_time_ids(
     add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
     return add_time_ids
 
+def batch_add_time_ids(
+    original_sizes: torch.Tensor, # Shape: (B, N, 2)
+    crop_coords: torch.Tensor,    # Shape: (B, N, 4)
+    target_sizes: torch.Tensor,   # Shape: (B, N, 2)
+    dtype: torch.dtype,
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Creates the SDXL time conditioning vectors for an entire batch.
+    Vectorized for efficiency.
+    """
+    batch_size, n_tuple = original_sizes.shape[:2]
+    total_batch_size = batch_size * n_tuple
+
+    # The crop_coords tensor is (left, top, right, bottom). We need (top, left).
+    crop_coords_top_left = crop_coords[:, :, [1, 0]] # Re-order to (top, left)
+
+    # Concatenate all components along a new final dimension
+    # Shapes: (B,N,2) + (B,N,2) + (B,N,2) -> (B,N,6)
+    combined_ids = torch.cat([original_sizes, crop_coords_top_left, target_sizes], dim=2)
+    
+    # Flatten to the final shape required by the U-Net
+    # Shape: (B,N,6) -> (B*N, 6)
+    flat_time_ids = combined_ids.view(total_batch_size, 6)
+    
+    return flat_time_ids.to(device, dtype=dtype)
 
 def get_optimizer(name: str):
     name = name.lower()
@@ -611,3 +775,65 @@ def get_random_resolution_in_bucket(bucket_resolution: int = 512) -> tuple[int, 
     width = torch.randint(min_step, max_step, (1,)).item() * step
 
     return height, width
+
+def broadcast_prompts_to_n_tuple(
+    positive_text_embeds: torch.FloatTensor,
+    positive_pooled_embeds: torch.FloatTensor,
+    neutral_text_embeds: torch.FloatTensor,
+    neutral_pooled_embeds: torch.FloatTensor,
+    scales: torch.Tensor
+) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+    """
+    Broadcasts a binary (high/low) prompt pair to an N-tuple of scales
+    based on a set of logical rules.
+
+    Args:
+        positive_text_embeds (torch.FloatTensor): The 'high' text embeddings, shape (1, 77, D).
+        positive_pooled_embeds (torch.FloatTensor): The 'high' pooled embeddings, shape (1, P).
+        neutral_text_embeds (torch.FloatTensor): The 'low' text embeddings, shape (1, 77, D).
+        neutral_pooled_embeds (torch.FloatTensor): The 'low' pooled embeddings, shape (1, P).
+        scales (torch.Tensor): The tensor of scales for the batch, shape (BATCH_SIZE, N_tuple).
+
+    Returns:
+        A tuple of (combined_text_embeds, combined_pooled_embeds) ready for the U-Net.
+    """
+    batch_size, n_tuple = scales.shape
+    
+    # --- 1. Determine the prompt labels for each scale in the batch ---
+    
+    # Find min/max values and indices for each tuple in the batch
+    min_scales, min_indices = torch.min(scales, dim=1)
+    max_scales, max_indices = torch.max(scales, dim=1)
+    
+    # Calculate the mean of the edges for each tuple
+    # Unsqueeze to make it broadcastable: shape (BATCH_SIZE, 1)
+    cardinal_edge_mean = ((min_scales + max_scales) / 2).unsqueeze(1)
+    
+    # Apply Rule 3: All scales >= mean are 'high' (1), others are 'low' (0)
+    # This creates a boolean mask of shape (BATCH_SIZE, N_tuple)
+    labels = (scales >= cardinal_edge_mean).long() # Convert boolean to long (0s and 1s)
+
+    # Apply Rules 1 & 2: Explicitly set the lowest to 'low' and highest to 'high'
+    # This ensures the absolute edges always get the correct label.
+    # We use a one-hot encoding trick to create indices for scatter_
+    row_indices = torch.arange(batch_size).unsqueeze(1)
+    labels[row_indices, min_indices.unsqueeze(1)] = 0 # Rule 1: Set min to 'low'
+    labels[row_indices, max_indices.unsqueeze(1)] = 1 # Rule 2: Set max to 'high'
+    
+    # --- 2. Assemble the embedding tensors using the labels ---
+
+    # Stack the base high/low embeddings for easy indexing
+    # Shape: (2, 77, D) and (2, P)
+    base_text_embeds = torch.cat([neutral_text_embeds, positive_text_embeds], dim=0)
+    base_pooled_embeds = torch.cat([neutral_pooled_embeds, positive_pooled_embeds], dim=0)
+
+    # Flatten the labels to create a 1D index tensor
+    # Shape: (BATCH_SIZE * N_tuple)
+    flat_labels = labels.view(-1)
+    
+    # Use the labels to gather the correct embeddings
+    # This is a highly efficient way to build the final tensors
+    combined_text_embeds = base_text_embeds[flat_labels]
+    combined_pooled_embeds = base_pooled_embeds[flat_labels]
+    
+    return combined_text_embeds, combined_pooled_embeds

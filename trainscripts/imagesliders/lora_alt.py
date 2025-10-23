@@ -222,34 +222,36 @@ class AltLoRANetwork(nn.Module):
         for lora_module in self.unet_loras.values():
             lora_module.multiplier = torch.tensor(0.0)
     
-    
-    def save_weights(self, file, dtype= torch.bfloat16, metadata= None):
+    def save_weights(self, file, dtype=torch.bfloat16, metadata=None):
         """
-        Saves the state dictionary with keys matching the standard LoRA format.
-        This version translates the internal, "dirty" keys to "clean" standard keys on the fly.
+        Saves the state dictionary with keys matching the standard PEFT LoRA format
+        (e.g., 'lora_unet_down_blocks_0... .lora_down.weight').
         """
         state_to_save = {}
-        
-        # Get the internal state dict, which has the "dirty" keys we need to clean.
-        # Example dirty key: unet_loras.lora_unet___orig_mod_... .lora_down.weight
-        internal_state_dict = self.state_dict()
-        
-        prefix_to_remove = "unet_loras."
-        
-        for dirty_key, value in internal_state_dict.items():
-            if not dirty_key.startswith(prefix_to_remove):
-                continue
-            # Remove the 'unet_loras.' part
-            key_without_prefix = dirty_key[len(prefix_to_remove):] 
-            # replace the unwanted wrapper artifact to match the standard LoRA naming convention.
-            clean_key = key_without_prefix.replace('__orig_mod_', '_') 
-            if "lora_down" in clean_key or "lora_up" in clean_key or "alpha" in clean_key:
-                 state_to_save[clean_key] = value.to("cpu", dtype=dtype)
+
+        # Iterate through the named LoRA modules we are managing.
+        # The 'lora_name' is the clean key we want to use as the base.
+        for lora_name, lora_module in self.unet_loras.items():
+            
+            # For each LoRA module, iterate through its own parameters.
+            # This will give us 'lora_down.weight', 'lora_up.weight', 'alpha', etc.
+            for param_name, value in lora_module.named_parameters():
+                if not value.requires_grad:
+                    continue
+
+                # Construct the final key by combining the module's LoRA name
+                # with the parameter's local name.
+                # This is the crucial step that ensures PEFT compatibility.
+                final_key = f"{lora_name}.{param_name}"
+                
+                # Save the parameter in the desired dtype.
+                state_to_save[final_key] = value.to("cpu", dtype=dtype)
 
         if not state_to_save:
-            print("WARNING: No LoRA parameters found to save. Check network structure and key prefixes.")
+            print("WARNING: No LoRA parameters found to save. Check network structure.")
             return
 
+        # Standard saving logic
         if os.path.splitext(file)[1] == ".safetensors":
             save_file(state_to_save, file, metadata=metadata)
         else:
@@ -315,7 +317,8 @@ def create_lora_config_map(
                 continue
 
             # This module passes all filters, so we add it to the map.
-            lora_name_key = name.replace('.', '_')
+            base_name = name.replace('.', '_')
+            lora_name_key = f"{LORA_PREFIX_UNET}_{base_name}"
             lora_map[name] = {
                 'lora_name': lora_name_key,
                 'rank': rank,
