@@ -166,6 +166,7 @@ def batch_generator(
     sharpness: float,
     batch_size: int,
     n_tuple: int,
+    max_denoising_steps: int,
 ):
     """
     Yields packets of structured data for N-tuple contrastive training.
@@ -251,6 +252,30 @@ def batch_generator(
         except (IOError, FileNotFoundError, IndexError) as e:
             print(f"Warning: Skipping batch due to error in generator: {e}")
             continue
+
+def unflatten_and_split(
+        flat_tensor: torch.Tensor, 
+        batch_size: int, 
+        n_tuple: int
+    ) -> tuple[torch.Tensor, ...]:
+        """
+        Takes a flat tensor of shape (B*N, ...) and splits it into a tuple
+        of N tensors, each of shape (B, ...).
+        """
+        # 1. Get the shape of the trailing dimensions (...)
+        trailing_dims = flat_tensor.shape[1:]
+        
+        # 2. Reshape the flat tensor back to its logical (B, N, ...) structure
+        logical_shape = (batch_size, n_tuple) + trailing_dims
+        logical_tensor = flat_tensor.view(logical_shape)
+        
+        # 3. Split along the N_TUPLE dimension (dim=1)
+        # This returns a tuple of N tensors, each of shape (B, 1, ...)
+        split_tensors = torch.split(logical_tensor, 1, dim=1)
+        
+        # 4. Squeeze to remove the leftover 'N' dimension from each tensor
+        # The final result is a tuple of N tensors, each of shape (B, ...)
+        return tuple(tensor.squeeze(1) for tensor in split_tensors)
 
 
 def flush():
@@ -358,7 +383,8 @@ def train(
         folder_main, folders, scales, scales_unique,
         ASPECT_RATIO_BUCKETS, K_NEAREST_BUCKETS, SAMPLING_SHARPNESS,
         batch_size=BATCH_SIZE,
-        n_tuple=N_TUPLE
+        n_tuple=N_TUPLE,
+        max_denoising_steps = config.train.max_denoising_steps
     )
     prefetcher = create_prefetch_generator(data_gen, num_prefetch=2)
     # ----------------------------------------
@@ -379,7 +405,7 @@ def train(
     unet.requires_grad_(False)
     unet.eval()
     
-    vae.to(device)
+    vae.to(device, dtype=weight_dtype)
     vae.requires_grad_(False)
     vae.eval()
 
@@ -527,12 +553,15 @@ def train(
             )
             prompt_pair: PromptEmbedsPair = random.choice(prompt_pairs)
             # 1 ~ 49 からランダム
-            timesteps_to = torch.randint(
-                1, config.train.max_denoising_steps, (1,)
-            ).item()
+            #timesteps_to = torch.randint(
+            #    1, config.train.max_denoising_steps, (1,)
+            #).item()
 
             # --- Step A: Get the structured data packet from the generator ---
             batch_packet = next(prefetcher)
+
+            #    Shape: (B, N) -> (B,)
+            timesteps_to_indices = batch_packet["timesteps_to"][:, 0]
             
             # Update aspect ratio logging
             # We take the size from the first tuple in the batch
@@ -545,7 +574,7 @@ def train(
                 batch_packet=batch_packet,
                 vae=vae,
                 scheduler=noise_scheduler,
-                timesteps_to=timesteps_to,
+                timesteps_to=timesteps_to_indices,
                 dtype=weight_dtype
             )
 
@@ -567,8 +596,6 @@ def train(
                 device=device
             )
 
-            #    Shape: (B, N) -> (B,)
-            timesteps_to_indices = batch_packet["timesteps_to"][:, 0]
             #    Shape: (B,) -> (B,)
             kilostep_indices = (timesteps_to_indices * (1000 / config.train.max_denoising_steps)).long()
             #    Set the scheduler to the 1000-step 'pseudocontinuous' values.
@@ -578,6 +605,7 @@ def train(
             # Get the sigma for the current timestep
             current_sigmas_per_tuple = noise_scheduler.sigmas[kilostep_indices]
             unet_timesteps = current_timesteps_per_tuple.unsqueeze(1).expand(-1, N_TUPLE).reshape(-1)
+            kilostep_indices = kilostep_indices.unsqueeze(1).expand(-1, N_TUPLE).reshape(-1)
             # Calculate a loss weight. A common formulation from Karras et al.
             # Shape: (B,) -> (B, 1) -> (B, N) -> (B*N, 1, 1, 1) for broadcasting with latents
             loss_weights = (1.0 / (current_sigmas_per_tuple**2 + 1.0))
@@ -596,18 +624,18 @@ def train(
         network.set_lora_scales(torch.flatten(batch_packet["scales"]).to(device)) # Set per-sample scales
         # Call the UNet directly and explicitly
         target_latents = unet(*unet_args, **unet_kwargs).sample.to(device, dtype=weight_dtype)
-
+        
+        # C, H, W = latent_packet["noisy_latents"].shape[1:]
         # --- 4. LOSS CALCULATION & BACKWARD PASS ---
-        # Split the outputs to calculate high/low losses separately.
-        # This is where N_TUPLE=2 is still hardcoded, which is fine for now.
-        target_latents_high, target_latents_low = torch.chunk(target_latents, N_TUPLE, dim=0)
+        target_latents_high, target_latents_low = unflatten_and_split(target_latents, BATCH_SIZE, N_TUPLE)
         
         # We need to split all ground truth tensors from the latent_packet as well.
-        noise_high, noise_low = torch.chunk(latent_packet["ground_truth_noise"], N_TUPLE, dim=0)
-        noisy_latents_high, noisy_latents_low = torch.chunk(latent_packet["noisy_latents"], N_TUPLE, dim=0)
-        x0_latents_high, x0_latents_low = torch.chunk(latent_packet["x0_latents"], N_TUPLE, dim=0)
+        high_noise, low_noise = unflatten_and_split(latent_packet["ground_truth_noise"], BATCH_SIZE, N_TUPLE)
+        noisy_latents_high, noisy_latents_low = unflatten_and_split(latent_packet["noisy_latents"], BATCH_SIZE, N_TUPLE)
+        x0_latents_high, x0_latents_low = unflatten_and_split(latent_packet["x0_latents"], BATCH_SIZE, N_TUPLE)
         # You will need to split the `loss_weights` tensor just like the others:
-        loss_weights_high, loss_weights_low = torch.chunk(loss_weights, N_TUPLE, dim=0)
+        loss_weights_high, loss_weights_low = unflatten_and_split(loss_weights, BATCH_SIZE, N_TUPLE)
+        kilostep_indices_high, kilostep_indices_low = unflatten_and_split(kilostep_indices, BATCH_SIZE, N_TUPLE)
 
         # Loss calculation logic is the same, just applied to the split tensors
         aux_losses = {}
@@ -619,7 +647,7 @@ def train(
         loss_eps_high = loss_weights_high.squeeze() * loss_eps_high.mean(dim=(1, 2, 3))
         # B. data prediction from eps extrapolation loss
         pred_x0_high = train_util.get_x0_from_xt_eps(
-                noisy_latents_high, target_latents_high, kilosteps_to, noise_scheduler
+                noisy_latents_high, target_latents_high, kilostep_indices_high, noise_scheduler
             )
         loss_x0_high = criteria(pred_x0_high.to(weight_dtype), x0_latents_high.to(weight_dtype))
         loss_x0_high_karrasnormed = loss_weights_high.squeeze()*loss_x0_high.mean(dim=(1, 2, 3))
@@ -628,7 +656,7 @@ def train(
         lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0)
         lambda_std = getattr(config.train, 'lambda_std_loss', 0)
         mean_loss_high, std_loss_high = train_util.statistical_matching_loss(target_latents_high)
-        aux_losses["high_std"]=(std_loss_high.detach()) 
+        aux_losses["high_std"]=(std_loss_high.detach().mean()) 
         #(Shape: B,)
         loss_high = loss_eps_high + lambda_x0 * loss_x0_high_karrasnormed + lambda_std * std_loss_high
         #(shape: 1)
@@ -642,13 +670,13 @@ def train(
         lambda_x0 = getattr(config.train, 'lambda_x0_loss', 0)
         lambda_std = getattr(config.train, 'lambda_std_loss', 0)
         pred_x0_low = train_util.get_x0_from_xt_eps(
-                noisy_latents_low, target_latents_low, kilosteps_to, noise_scheduler
+                noisy_latents_low, target_latents_low, kilostep_indices_low, noise_scheduler
             )
         loss_x0_low = criteria(pred_x0_low.to(weight_dtype), x0_latents_low.to(weight_dtype))
         loss_x0_low_karrasnormed = loss_weights_low.squeeze()*loss_x0_low.mean(dim=(1, 2, 3))
         aux_losses["low"]=(loss_x0_low_karrasnormed.detach().mean())
         mean_loss_low, std_loss_low = train_util.statistical_matching_loss(target_latents_low)
-        aux_losses["low_std"]=(std_loss_low.detach()) 
+        aux_losses["low_std"]=(std_loss_low.detach().mean()) 
         # C. Combine the losses
         loss_low = loss_eps_low + lambda_x0 * loss_x0_low_karrasnormed + lambda_std * std_loss_low
         loss_low = loss_low.mean() / ACCUMULATION_STEPS
@@ -657,7 +685,7 @@ def train(
         total_loss.backward()
 
         if len(aux_losses.keys()) >= 4:
-            pbar.set_description(f"Loss_high/low*1k: {loss_high.item()*1000:.1f}/{loss_low.item()*1000:.1f};{aux_losses['high']*1000:.1f}/{aux_losses['low']*1000:.1f};{aux_losses['high_std']*1000:.1f}/{aux_losses['low_std']*1000:.1f}")
+            pbar.set_description(f"Loss_high/low*1k: {loss_high.item()*1000:.1f}/{loss_low.item()*1000:.1f};{aux_losses['high'].item()*1000:.1f}/{aux_losses['low'].item()*1000:.1f};{aux_losses['high_std'].item()*1000:.1f}/{aux_losses['low_std'].item()*1000:.1f}")
         else:
             pbar.set_description(f"Loss_high/low*1k: {loss_high.item()*1000:.1f}/{loss_low.item()*1000:.1f}")
         aux_losses = {}

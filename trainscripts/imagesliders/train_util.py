@@ -301,15 +301,15 @@ def prepare_correlated_noisy_latents(
     image_tensor = image_processor.preprocess(flat_images).to(device=vae.device, dtype=dtype)
 
     # Encode the whole batch in one go for maximum efficiency.
-    x0_latents_flat = vae.encode(image_tensor).latent_dist.sample(None)
+    x0_latents = vae.encode(image_tensor).latent_dist.sample(None)
 
     # Apply the required VAE scaling factor.
-    x0_latents_flat = vae.config.scaling_factor * x0_latents_flat
+    x0_latents = vae.config.scaling_factor * x0_latents
 
     # --- Correlated Noise Generation & Application ---
     # Reshape the clean latents into their logical tuple structure
-    C, H, W = x0_latents_flat.shape[1:]
-    x0_latents = x0_latents_flat.view(batch_size, n_tuple, C, H, W)
+    C, H, W = x0_latents.shape[1:]
+    x0_latents = x0_latents.view(batch_size, n_tuple, C, H, W)
 
     # We only need one unique seed per tuple from our broadcasted tensor
     unique_tuple_seeds = tuple_prng_seeds[:, 0] # Shape: (B,)
@@ -337,28 +337,21 @@ def prepare_correlated_noisy_latents(
     # Shape: (B,) -> (B, 1) -> (B, N)
     broadcast_timestep_values = timestep_values.unsqueeze(1).expand(-1, n_tuple)
 
-    # Apply the SAME noise mask to all N items within each tuple via broadcasting.
-    # The scheduler's add_noise handles this if we give it latents of (B, N, ...)
-    # and noise of (B, 1, ...). We unsqueeze the noise to enable this.
-    noisy_latents = scheduler.add_noise(
-        x0_latents, 
-        expanded_noise,
-        broadcast_timestep_values.view(-1) # Shape: (B*N,) 
-    )
-
-    # --- 5. Return Flattened Tensors ready for the U-Net ---
-    total_batch_size = batch_size * n_tuple     # B * N
+    flat_timestep_values = broadcast_timestep_values.reshape(-1)
+    flat_x0_latents = x0_latents.reshape(batch_size * n_tuple, C, H, W)
+    flat_expanded_noise = expanded_noise.reshape(batch_size * n_tuple, C, H, W)
+    flat_noisy_latents = scheduler.add_noise(flat_x0_latents, flat_expanded_noise, flat_timestep_values)
     
     return {
-        "noisy_latents": noisy_latents.view(total_batch_size, C, H, W),
-        "ground_truth_noise": expanded_noise.view(total_batch_size, C, H, W), # Use the same expanded tensor
-        "x0_latents": x0_latents_flat
+        "noisy_latents": flat_noisy_latents,
+        "ground_truth_noise": flat_expanded_noise, # Use the same expanded tensor
+        "x0_latents": flat_x0_latents
     }
 
 def get_x0_from_xt_eps(
     xt_latents: torch.Tensor,
     eps_theta: torch.Tensor,
-    timestep_t: int,
+    timestep_indices: torch.Tensor, # <-- Now accepts a tensor of indices
     scheduler: SchedulerMixin,
 ) -> torch.Tensor:
     """
@@ -368,7 +361,12 @@ def get_x0_from_xt_eps(
     Formula: x_hat_0 = (xt - sqrt(1-alpha_t) * eps_theta) / sqrt(alpha_t)
     """
     # Get the scheduler constants for the current timestep
-    alpha_prod_t = scheduler.alphas_cumprod[timestep_t]
+    alpha_prod_t = scheduler.alphas_cumprod.to(xt_latents.device)[timestep_indices]
+
+    #    Reshape for broadcasting against the (B, C, H, W) latents.
+    #    (B,) -> (B, 1, 1, 1)
+    view_shape = (-1, 1, 1, 1)
+    alpha_prod_t = alpha_prod_t.view(view_shape)
     
     # Perform the calculation
     predicted_x0 = (xt_latents - (1 - alpha_prod_t).sqrt() * eps_theta) / alpha_prod_t.sqrt()
@@ -489,7 +487,7 @@ def sdxl_condnet_batchjoin(
     pooled_embeddings: torch.Tensor,
     time_ids: torch.Tensor,
     scheduler: "SchedulerMixin",
-    timestep: int
+    timestep: torch.Tensor
 ) -> tuple[list, dict]:
     """
     Assembles the exact *args and **kwargs required for the SDXL UNet's
@@ -497,20 +495,23 @@ def sdxl_condnet_batchjoin(
     
     This function is the single point of truth for the UNet's API contract.
     """
-    total_batch_size = noisy_latents.shape[0]
+    #total_batch_size = noisy_latents.shape[0]
+    target_device = noisy_latents.device
+    target_dtype = noisy_latents.dtype
     
     # --- 1. Prepare Positional Args for `unet.forward()` ---
     scaled_latents = scheduler.scale_model_input(noisy_latents, timestep)
-    timestep_tensor = torch.tensor([timestep] * total_batch_size, device=noisy_latents.device)
-    unet_args = [scaled_latents, timestep_tensor]
+    timestep = timestep.to(target_device, dtype=torch.long)
+    unet_args = [scaled_latents, timestep]
     
     # --- 2. Prepare Keyword Args for `unet.forward()` ---
+    # enjoy wrapping tensors with .to() ... :)
     added_cond_kwargs = {
-        "text_embeds": pooled_embeddings,
-        "time_ids": time_ids
+        "text_embeds": pooled_embeddings.to(target_device, dtype=target_dtype),
+        "time_ids": time_ids.to(target_device, dtype=target_dtype)
     }
     unet_kwargs = {
-        "encoder_hidden_states": text_embeddings,
+        "encoder_hidden_states": text_embeddings.to(target_device, dtype=target_dtype),
         "added_cond_kwargs": added_cond_kwargs
     }
     # --- 3. Return the final structure for splatting ---
