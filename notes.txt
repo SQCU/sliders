@@ -258,3 +258,35 @@ uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracke
 uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_d2' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
 # patch errors invalidating contrastive training objective
 uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_pre_bracket_XI_d3' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+# warmed up
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_d3' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+  lr: 0.001  # different semantic meaning in gluon
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_d3.1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+#force a milder gradient
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", ""
+  iterations: 400
+  batch_size: 4
+  n_tuple: 2
+  lr: 0.00001  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "constant"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 2 #batching achieved internally
+  grad_clip: 1.0
+  lambda_x0_loss: 0
+  lambda_std_loss: 0
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_pre_bracket_XI_d4' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales -1, 1, 2
+# hope for a smoother gradient landscape
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_pre_bracket_XI_e1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales 0.15, 1, 2
+  lr: 0.01  # different semantic meaning in gluon
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_e2' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales 0.15, 1, 2
+# override gluonconfig to normalize high values towards less than 10
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_e3' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales 0.15, 1, 2
+  lr: 1.0  # different semantic meaning in gluon
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_e4' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales 0.15, 1, 2
+  #dtype change in optim
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_e5' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales 0.15, 1, 2
+  #disable weight decay in script
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgluon_bracket_XI_e6' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora.yaml' --folder_main 'datasets/bracket' --folders '0, 1, 2' --scales 0.15, 1, 2

@@ -457,6 +457,9 @@ def train(
         #alpha_lr=config.train.alpha_lr # (assuming you add this to your config)
     )
 
+
+    optimizer_kwargs['weight_decay'] = 0.0
+
     print(f"✅ Created {len(optimizer_param_groups)} granular parameter groups for the optimizer.")
 
     #trivial optimization over naive adamw
