@@ -8,7 +8,7 @@ import torch
 from lora import TRAINING_METHODS
 
 PRECISION_TYPES = Literal["fp32", "fp16", "bf16", "float32", "float16", "bfloat16"]
-NETWORK_TYPES = Literal["lierla", "c3lier"]
+NETWORK_TYPES = Literal["lora", "glora"]
 
 
 class PretrainedModelConfig(BaseModel):
@@ -20,7 +20,7 @@ class PretrainedModelConfig(BaseModel):
 
 
 class NetworkConfig(BaseModel):
-    type: NETWORK_TYPES = "lierla"
+    type: NETWORK_TYPES = "lora"
     rank: int = 4
     alpha: float = 1.0
 

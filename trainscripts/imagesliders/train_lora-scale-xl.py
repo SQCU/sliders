@@ -303,9 +303,9 @@ def train(
     save_path = Path(config.save.path)
 
     #obsolete module selection code!
-    modules = DEFAULT_TARGET_REPLACE
-    if config.network.type == "c3lier":
-        modules += UNET_TARGET_REPLACE_MODULE_CONV
+    #modules = DEFAULT_TARGET_REPLACE
+    #if config.network.type == "c3lier":
+    #    modules += UNET_TARGET_REPLACE_MODULE_CONV
 
     if config.logging.verbose:
         print(metadata)
@@ -432,6 +432,7 @@ def train(
             unet,
             rank=config.network.rank,
             alpha=config.network.alpha,
+            lora_type=config.network.type,  # <-- SPECIFY THE ADAPTER TYPE HERE: 'lora', 'glora'
             include_substrings=['ff.net', 'attn2.to_q', 'attn2.to_k','attn1.to_v','attn1.to_out'],
             exclude_substrings=[] # Example: exclude the first downblock: ['down_blocks.0']
         )

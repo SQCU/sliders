@@ -46,28 +46,69 @@ class AltLoRAModule(nn.Module):
     """A flexible LoRA module that acts as a simple data container."""
     def __init__(self,
     lora_name: str,
-     org_module, rank, alpha, train_alpha, init_scheme):
+     org_module, rank, alpha,
+     lora_type,  # <-- NEW: Receive the type
+     train_alpha, init_scheme):
         super().__init__()
         self.lora_name = lora_name
         self.lora_dim = rank
+        self.lora_type = lora_type
         self.register_buffer("multiplier", torch.tensor(1.0))
         self.org_module = org_module        
 
+        # Determine input/output dimensions
         if isinstance(org_module, nn.Linear):
+            self.is_conv = False
             in_dim, out_dim = org_module.in_features, org_module.out_features
-            self.lora_down = nn.Linear(in_dim, rank, bias=False)
-            self.lora_up = nn.Linear(rank, out_dim, bias=False)
+            #self.lora_down = nn.Linear(in_dim, rank, bias=False)
+            #self.lora_up = nn.Linear(rank, out_dim, bias=False)
         elif isinstance(org_module, nn.Conv2d):
+            self.is_conv = True
             in_c, out_c = org_module.in_channels, org_module.out_channels
             ks = org_module.kernel_size
-            self.lora_down = nn.Conv2d(in_c, rank, kernel_size=ks, padding=org_module.padding, stride=org_module.stride, bias=False)
-            self.lora_up = nn.Conv2d(rank, out_c, kernel_size=(1,1), stride=(1,1), padding=0, bias=False)
+            #self.lora_down = nn.Conv2d(in_c, rank, kernel_size=ks, padding=org_module.padding, stride=org_module.stride, bias=False)
+            #self.lora_up = nn.Conv2d(rank, out_c, kernel_size=(1,1), stride=(1,1), padding=0, bias=False)
         else:
             print(f"wait what? you tried to lora a \"{org_module}\"")
             raise NotImplementedError
 
+        if self.lora_type == 'lora':
+            if self.is_conv:
+                # Standard LoRA for Conv2d
+                self.lora_down = nn.Conv2d(in_dim, rank, kernel_size=ks, padding=org_module.padding, stride=org_module.stride, bias=False)
+                self.lora_up = nn.Conv2d(rank, out_dim, kernel_size=(1,1), stride=(1,1), padding=0, bias=False)
+            else:
+                # Standard LoRA for Linear
+                self.lora_down = nn.Linear(in_dim, rank, bias=False)
+                self.lora_up = nn.Linear(rank, out_dim, bias=False)
+            
+            # Initialize standard LoRA weights
+            get_initializer(init_scheme)(self.lora_down, self.lora_up)
+
+        elif self.lora_type == 'glora':
+            in_channels = org_module.in_channels if self.is_conv else org_module.in_features
+            out_channels = org_module.out_channels if self.is_conv else org_module.out_features
+            # Create the four CUI-GLoRA matrices for Linear layers
+            # Their weights will be used directly, not applied to activations.
+            self.glora_a1 = nn.Linear(rank, in_channels, bias=False)
+            self.glora_a2 = nn.Linear(in_channels, rank, bias=False)
+            self.glora_b1 = nn.Linear(rank, out_channels, bias=False)
+            self.glora_b2 = nn.Linear(in_channels, rank, bias=False)
+            
+            # Initialization logic...
+            # Note: The patcher math is B1@B2 and W@A1@A2, so the init logic should reflect that.
+            nn.init.kaiming_uniform_(self.glora_b2.weight, a=math.sqrt(5)) # Like lora_down
+            nn.init.zeros_(self.glora_b1.weight)                         # Like lora_up
+            nn.init.kaiming_uniform_(self.glora_a1.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.glora_a2.weight)
+
+            if train_alpha:
+                self.alpha = nn.Parameter(torch.tensor(float(alpha)))
+            else:
+                self.register_buffer("alpha", torch.tensor(float(alpha)))
+
         # Initialize the weights using the specified scheme
-        get_initializer(init_scheme)(self.lora_down, self.lora_up)
+        #get_initializer(init_scheme)(self.lora_down, self.lora_up)
 
         # Handle alpha as either a trainable parameter or a fixed buffer
         if train_alpha:
@@ -79,20 +120,50 @@ class AltLoRAModule(nn.Module):
         # 1. Get the output from the original, frozen module.
         # Pass through any extra args for compatibility with different layers.
         original_output = self.org_module(x, *args, **kwargs)
-        lora_output = self.lora_up(self.lora_down(x))
-        multiplier = self.multiplier
         current_alpha = self.alpha
-        current_scale = (current_alpha / self.lora_dim).to(lora_output.device, dtype=lora_output.dtype)
-        # 5. Reshape the multiplier for broadcasting
+        multiplier = self.multiplier
+        current_scale = (current_alpha / self.lora_dim).to(x.device, dtype=x.dtype)
+        # 2. Conditionally compute the adapter's contribution to the activation
+        if self.lora_type == 'lora':
+            lora_output = self.lora_up(self.lora_down(x))
+        
+        elif self.lora_type == 'glora':
+            W = self.org_module.weight
+            a1_w = self.glora_a1.weight # (r, in)
+            a2_w = self.glora_a2.weight # (in, r)
+            # --- "B-Term": A standard, factorized LoRA-like operation ---
+            # This computes (B1 @ B2) @ x as B1 @ (B2 @ x)
+            lora_output_B = self.glora_b1(self.glora_b2(x))
+            # --- "A-Term": The non-factorizable, weight-dependent part ---
+            if self.is_conv:
+                # W is (o, i, k, h). a1_w is now (i, j). a2_w is now (j, i).
+                # First einsum: NO transpose on a1_w
+                w_a1 = torch.einsum("o i k h, i j -> o j k h", W, a1_w)
+                # Second einsum: NO transpose on a2_w
+                delta_W_A = torch.einsum("o j k h, j i -> o i k h", w_a1, a2_w)
+                lora_output_A = torch.nn.functional.conv2d(
+                    x, delta_W_A,
+                    stride=self.org_module.stride,
+                    padding=self.org_module.padding,
+                )
+            else: # Linear
+                # W is (O, I). a1_w is (I, r). a2_w is (r, I).
+                delta_W_A = (W @ a1_w) @ a2_w
+                lora_output_A = torch.nn.functional.linear(x, delta_W_A)
+            lora_output = lora_output_A + lora_output_B
+        else:
+            # Fallback for unknown types
+            return original_output
+        # 3. Reshape the multiplier for broadcasting
         # This ensures each item in the batch gets its own scale applied.
         if multiplier.ndim == 0 or multiplier.numel() == 1:
             # Scalar multiplier applies to the whole batch
             reshaped_multiplier = multiplier.to(x.device, dtype=x.dtype)
         else:
             reshaped_multiplier = multiplier.view(
-                lora_output.shape[0], *([1] * (lora_output.ndim - 1))
-            ).to(lora_output.device, dtype=lora_output.dtype)
-        # 6. Combine everything for the final output
+                lora_output.shape[0], *([1] * (x.ndim - 1))
+            ).to(x.device, dtype=x.dtype)
+        # 4. Combine original output with the scaled adapter output
         return original_output + (lora_output * reshaped_multiplier * current_scale)
         
 class AltLoRANetwork(nn.Module):
@@ -238,11 +309,19 @@ class AltLoRANetwork(nn.Module):
             for param_name, value in lora_module.named_parameters():
                 if not value.requires_grad:
                     continue
+                
+                # --- MODIFIED: Remap names for GLoRA ---
+                if lora_module.lora_type == 'glora':
+                    # Convert 'glora_a1.weight' -> 'a1.weight'
+                    save_param_name = param_name.replace('glora_', '')
+                else:
+                    # Standard LoRA names like 'lora_down.weight'
+                    save_param_name = param_name
 
                 # Construct the final key by combining the module's LoRA name
                 # with the parameter's local name.
                 # This is the crucial step that ensures PEFT compatibility.
-                final_key = f"{lora_name}.{param_name}"
+                final_key = f"{lora_name}.{save_param_name}"
                 
                 # Save the parameter in the desired dtype.
                 state_to_save[final_key] = value.to("cpu", dtype=dtype)
@@ -276,6 +355,7 @@ def create_lora_config_map(
     unet: nn.Module,
     rank: int = 4,
     alpha: float = 1.0,
+    lora_type: str = 'lora',  # <-- NEW: Default to standard LoRA
     train_alpha: bool = False,
     init_scheme: str = 'default',
     target_modules: List[str] = ['Linear', 'Conv2d'],
@@ -323,6 +403,7 @@ def create_lora_config_map(
                 'lora_name': lora_name_key,
                 'rank': rank,
                 'alpha': alpha,
+                'lora_type': lora_type,  # <-- NEW: Pass the type into the config
                 'train_alpha': train_alpha,
                 'init_scheme': init_scheme
             }
