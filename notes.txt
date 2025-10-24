@@ -391,6 +391,8 @@ train:
   lambda_x0_loss: 0
   lambda_std_loss: 0
 #warmup
+#aspect ratio error!!!
 uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc4d4_glucli_pre_f1.1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 0.75, 1.25
   lr: 1.0
+#aspect ratio error!!!
 uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc4d4_glucli_f1.1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 0.75, 1.25

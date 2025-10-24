@@ -45,6 +45,107 @@ import torch._dynamo
 torch._dynamo.config.recompile_limit = 16 # Optional: Increase the limit
 
 
+def select_target_bucket(
+    original_size: tuple[int, int],
+    buckets: list[tuple[int, int]],
+    k_nearest: int = 3,
+    sharpness: float = 1.0,
+) -> tuple[int, int]:
+    """
+    Selects a target aspect ratio bucket for an entire batch based on a
+    representative image's dimensions.
+    """
+    original_w, original_h = original_size
+    original_ar = original_w / original_h
+
+    # --- Calculate distance to each bucket's aspect ratio ---
+    bucket_distances = []
+    for bucket_w, bucket_h in buckets:
+        bucket_ar = bucket_w / bucket_h
+        distance = abs(math.log(original_ar) - math.log(bucket_ar))
+        bucket_distances.append((distance, (bucket_w, bucket_h)))
+
+    # --- Probabilistically sample a target bucket ---
+    bucket_distances.sort(key=lambda x: x[0])
+    nearest_buckets = bucket_distances[:k_nearest]
+    distances = np.array([-d for d, _ in nearest_buckets])
+    probabilities = np.exp((distances - np.max(distances)) * sharpness)
+    probabilities /= probabilities.sum()
+    chosen_idx = np.random.choice(len(nearest_buckets), p=probabilities)
+    _, target_size = nearest_buckets[chosen_idx]
+    
+    return target_size
+
+def determine_transform_params(
+    original_size: tuple[int, int],
+    target_size: tuple[int, int], # This is now a fixed input
+    prescale_perc: float = 0.2,
+) -> tuple[tuple, tuple, tuple]:
+    """
+    Determines the full transformation parameters for a single tuple, respecting
+    the locked batch target size. It correctly prescales to circumscribe the target.
+    
+    Returns:
+        prescale_size (tuple or None)
+        crop_box (tuple)
+        reported_original_size (tuple)
+    """
+    original_w, original_h = original_size
+    target_w, target_h = target_size
+
+    
+    # --- NEW: Safeguard for small images ---
+    is_too_small = original_w < target_w or original_h < target_h
+    
+    if is_too_small or (random.random() < prescale_perc):
+        # --- MODE A: Prescale-then-Crop (Global View) ---
+        # 1. Correctly determine the scale factor to make the image *larger* than the target crop.
+        #    The goal is to make the smaller dimension of the prescaled image match the target.
+        scale_factor = max(target_w / original_w, target_h / original_h)
+        prescale_w = int(original_w * scale_factor)
+        prescale_h = int(original_h * scale_factor)
+        prescale_size = (prescale_w, prescale_h)
+        
+        # 2. Jitter the crop window within this new, larger prescaled image.
+        max_left = prescale_w - target_w
+        max_top = prescale_h - target_h
+        crop_left = random.randint(0, max_left)
+        crop_top = random.randint(0, max_top)
+        
+        crop_box = (crop_left, crop_top, crop_left + target_w, crop_top + target_h)
+        
+        # 3. Report the prescaled size to the model.
+        reported_original_size = prescale_size
+        
+    else:
+        # --- MODE B: Crop-from-Original (Detail View) ---
+        # 1. No prescaling is done.
+        prescale_size = None
+        
+        # 2. Determine the crop window that has the target aspect ratio.
+        target_ar = target_w / target_h
+        original_ar = original_w / original_h
+        
+        if original_ar > target_ar: # Original is wider than target AR
+            crop_h = original_h
+            crop_w = int(target_ar * crop_h)
+        else: # Original is taller or same
+            crop_w = original_w
+            crop_h = int(crop_w / target_ar)
+
+        # 3. Jitter the crop window within the original image.
+        max_left = original_w - crop_w
+        max_top = original_h - crop_h
+        crop_left = random.randint(0, max_left)
+        crop_top = random.randint(0, max_top)
+        
+        crop_box = (crop_left, crop_top, crop_left + crop_w, crop_top + crop_h)
+        
+        # 4. Report the true original size to the model.
+        reported_original_size = original_size
+        
+    return prescale_size, crop_box, reported_original_size
+
 def generate_ar_buckets(target_area: int, step: int = 64, max_ratio: float = 4.0):
     """
     Generates a list of (width, height) buckets with a target area, where dimensions
@@ -75,14 +176,17 @@ def get_transform_params(
     buckets: list[tuple[int, int]],
     k_nearest: int = 3,
     sharpness: float = 1.0,
+    prescale_perc: float = 0.2, # The new hyperparameter for global (downscaled) views vs superresolution cropped views of data
 ):
     """
-    Determines the target resolution and crop box for an image based on
-    probabilistic aspect ratio bucketing.
+    Determines a full set of transformation parameters for an image, choosing between
+    a "global view" (prescale-then-crop) and a "detail view" (crop-from-original).
 
     Returns:
-        crop_box (tuple[int, int, int, int]): The box to crop the original image.
-        target_size (tuple[int, int]): The final resolution to resize to.
+        prescale_size (tuple or None): The size for the initial resize.
+        crop_box (tuple): The box to crop from the (potentially prescaled) image.
+        target_size (tuple): The final resolution to resize to.
+        reported_original_size (tuple): The "original size" to report to add_time_ids.
     """
     original_w, original_h = original_size
     original_ar = original_w / original_h
@@ -125,10 +229,32 @@ def get_transform_params(
     return crop_box, target_size
 
 
-def process_image(image: Image.Image, crop_box: tuple, target_size: tuple):
-    """Applies a crop and resize transformation to a PIL Image."""
-    cropped_image = image.crop(crop_box)
-    return cropped_image.resize(target_size, Image.LANCZOS)
+def process_image(
+    image: Image.Image, 
+    prescale_size: Optional[tuple], 
+    crop_box: tuple, 
+    target_size: tuple
+):
+    """
+    Applies an optional prescale, a crop, and a final resize, handling both
+    "global view" (prescale-then-crop) and "detail view" (crop-then-resize) modes.
+    """
+    # --- MODE A: Prescale-then-Crop (Global View) ---
+    if prescale_size is not None:
+        # 1. First, resize the entire image to the calculated prescale size.
+        image = image.resize(prescale_size, Image.LANCZOS)
+        
+        # 2. Then, crop the target window from the prescaled image.
+        # The result of this crop is already at the target_size, so no final resize is needed.
+        return image.crop(crop_box)
+        
+    # --- MODE B: Crop-from-Original (Detail View) ---
+    else:
+        # 1. First, crop the detail window from the full-resolution original image.
+        cropped_image = image.crop(crop_box)
+        
+        # 2. Then, resize that (potentially large) crop down to the target bucket size.
+        return cropped_image.resize(target_size, Image.LANCZOS)
 
 def create_prefetch_generator(iterable, num_prefetch=2):
     """
@@ -167,6 +293,7 @@ def batch_generator(
     batch_size: int,
     n_tuple: int,
     max_denoising_steps: int,
+    lock_target_size:bool = True,
 ):
     """
     Yields packets of structured data for N-tuple contrastive training.
@@ -187,37 +314,59 @@ def batch_generator(
             batch_seeds = []          # Shape: (B,) of ints
             batch_timesteps = []
 
-            # --- Build the batch of B tuples ---
-            for _ in range(batch_size):
-                # 1. Get a list of all available base image names
-                #    We can use any folder since names are assumed to be consistent.
+            if lock_target_size:
+                # === BATCH-LEVEL SETUP ===
+                # 1. Select a representative image to decide the AR for the whole batch.
+                # (This logic to get a random image can be optimized, but is clear for now)
                 sample_folder = folders_array[0]
                 ims_path = os.path.join(folder_main, sample_folder)
                 ims = [f for f in os.listdir(ims_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
                 if not ims: continue
-                
-                # 2. Select one BaseSample (image_name) for the entire tuple
+                rep_image_name = random.choice(ims)
+                rep_img_path = os.path.join(ims_path, rep_image_name)
+                with Image.open(rep_img_path) as rep_img:
+                    rep_original_size = rep_img.size
+
+                # 2. Lock the target size for this entire microbatch.
+                target_size = select_target_bucket(
+                    rep_original_size, buckets, k_nearest=k, sharpness=sharpness
+                )
+            else:
+                print(f"bro u need to lock target sizes... or implement a batching semantics like paged attention supporting mixed tensor shapes as inputs...") 
+                raise NotImplementedError 
+
+            # === TUPLE-LEVEL PROCESSING ===
+            for _ in range(batch_size):
+                # 1. Select the image name for this specific tuple.
                 image_name = random.choice(ims)
                 
-                # 3. Determine a consistent crop/resize transform for this tuple
-                sample_img_path = os.path.join(ims_path, image_name)
-                with Image.open(sample_img_path) as sample_img:
-                    original_size = sample_img.size
-                
-                crop_box, target_size = get_transform_params(original_size, buckets, k_nearest=k, sharpness=sharpness)
+                # 2. Get its true original size.
+                img_path_for_size = os.path.join(ims_path, image_name)
+                with Image.open(img_path_for_size) as img_for_size:
+                    original_size = img_for_size.size
 
+                # 3. Determine the transform for this tuple using the locked target size.
+                # The transform applied to all N images in this tuple will be identical.
+                (
+                    prescale_size, 
+                    crop_box, 
+                    reported_original_size
+                ) = determine_transform_params(
+                    original_size, target_size, prescale_perc=0.2
+                )
                 # 4. Select N concepts (scales) for this tuple
                 sampled_scales = sorted(random.sample(scales_unique, n_tuple))
                 
                 # 5. Load the N corresponding images using the scale-to-folder map
                 images_for_tuple = []
+                # 4. Load the N images for the tuple and apply the *exact same transform* to all.
                 for scale in sampled_scales:
-                    # Find the folder name corresponding to the current scale
                     folder_name = folders_array[scales_array == scale][0]
                     img_path = os.path.join(folder_main, folder_name, image_name)
-                    
                     with Image.open(img_path) as img:
-                        processed_img = process_image(img.convert("RGB"), crop_box, target_size)
+                        processed_img = process_image(
+                            img.convert("RGB"), prescale_size, crop_box, target_size
+                        )
                         images_for_tuple.append(processed_img)
                 
                 # For each tuple, sample a timestep index
@@ -225,7 +374,7 @@ def batch_generator(
                 # 6. Append all data for this tuple to the batch lists
                 batch_images.append(images_for_tuple)
                 batch_scales.append(sampled_scales)
-                batch_orig_sizes.append(original_size)
+                batch_orig_sizes.append(reported_original_size)
                 batch_crop_boxes.append(crop_box)
                 batch_target_sizes.append(target_size)
                 batch_seeds.append(random.randint(0, 2**32 - 1))
