@@ -102,8 +102,8 @@ def determine_transform_params(
         # 1. Correctly determine the scale factor to make the image *larger* than the target crop.
         #    The goal is to make the smaller dimension of the prescaled image match the target.
         scale_factor = max(target_w / original_w, target_h / original_h)
-        prescale_w = int(original_w * scale_factor)
-        prescale_h = int(original_h * scale_factor)
+        prescale_w = int(math.ceil(original_w * scale_factor))
+        prescale_h = int(math.ceil(original_h * scale_factor))
         prescale_size = (prescale_w, prescale_h)
         
         # 2. Jitter the crop window within this new, larger prescaled image.
@@ -171,6 +171,7 @@ def generate_ar_buckets(target_area: int, step: int = 64, max_ratio: float = 4.0
         
     return sorted(list(buckets))
 
+#hopefully deprecated
 def get_transform_params(
     original_size: tuple[int, int],
     buckets: list[tuple[int, int]],
