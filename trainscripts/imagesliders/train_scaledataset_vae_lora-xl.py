@@ -140,6 +140,19 @@ def train_denoiser_guided_vae(
     network = AltLoRANetwork(vae.decoder, resolved_config={"lora_map": vae_decoder_config})
     network.to(device, dtype=weight_dtype).train()
 
+    # Debug: print actual shapes
+    for name, module in network.unet_loras.items():
+        if hasattr(module, 'glora_a1'):
+            print(f"{name}:")
+            print(f"  a1: {module.glora_a1.weight.shape}")
+            print(f"  a2: {module.glora_a2.weight.shape}")
+            print(f"  b1: {module.glora_b1.weight.shape}")
+            print(f"  b2: {module.glora_b2.weight.shape}")
+            print(f"  org_module: {type(module.org_module)}")
+            if isinstance(module.org_module, nn.Conv2d):
+                print(f"    in_channels: {module.org_module.in_channels}")
+                print(f"    out_channels: {module.org_module.out_channels}")
+
     apply_gradient_checkpointing_to_vae_decoder(vae.decoder)
 
     # --- 4. Setup Optimizer ---
@@ -302,10 +315,10 @@ def train_denoiser_guided_vae(
 
         # F. Calculate the weighted loss against the ORIGINAL clean image
         pixel_loss = criteria(reconstructed_pixels, image_tensor_target)
-        weighted_pixel_loss = pixel_loss * loss_weights
+        pixel_loss = pixel_loss * loss_weights
         # 4 logging 4 the claudes
-        per_sample_loss = weighted_pixel_loss.detach().mean(dim=(1,2,3))
-        loss = weighted_pixel_loss.mean()/ ACCUMULATION_STEPS
+        per_sample_loss = pixel_loss.detach().mean(dim=(1,2,3))
+        loss = pixel_loss.mean()/ ACCUMULATION_STEPS
 
         # Log to stratified tracker
         loss_tracker.log(
@@ -362,12 +375,13 @@ def train_denoiser_guided_vae(
             loss_tracker.plot_stratified_learning_curves(
                 save_path=save_path / f"{config.save.name}_loss_analysis_iter{i}.png"
             )
-        del reconstructed_pixels, latent_packet, latents_prev_step, noisy_latents, loss, per_sample_loss
+        del reconstructed_pixels, latent_packet, latents_prev_step, noisy_latents, loss, per_sample_loss, pixel_loss
     print("Final VAE LoRA save...")
     save_path.mkdir(parents=True, exist_ok=True)
     network.save_weights(
-        save_path / f"{config.save.name}_denoiser_guided_vae_last.safenetensors",
-        dtype=weight_dtype
+        save_path / f"{config.save.name}_denoiser_guided_vae_last.safetensors",
+        dtype=weight_dtype,
+        metadata=None,
     )
     print("Done.")
 
@@ -396,7 +410,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     
+
     config = config_util.load_config_from_yaml(args.config_file)
+    if args.alpha:
+    config.network.alpha = args.alpha
+    if args.rank:
+    config.network.rank = args.rank
     if args.name:
         config.save.name = args.name
 

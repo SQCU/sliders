@@ -34,6 +34,7 @@ import debug_util
 import config_util
 from config_util import RootConfig
 
+from logging_utils import TimestepStratifiedLossTracker
 import wandb
 
 NUM_IMAGES_PER_PROMPT = 1
@@ -555,6 +556,12 @@ def train(
     prefetcher = create_prefetch_generator(data_gen, num_prefetch=2)
     # ----------------------------------------
 
+    # Initialize tracker
+    loss_tracker = TimestepStratifiedLossTracker(
+    max_timesteps=config.train.max_denoising_steps,
+    n_buckets=10
+    )
+
     for text_encoder in text_encoders:
         text_encoder.to(device, dtype=weight_dtype)
         text_encoder.requires_grad_(False)
@@ -850,7 +857,12 @@ def train(
         # C. Combine the losses
         loss_low = loss_eps_low + lambda_x0 * loss_x0_low_karrasnormed + lambda_std * std_loss_low
         loss_low = loss_low.mean() / ACCUMULATION_STEPS
-
+        per_sample_loss = torch.cat((loss_eps_low.detach(),loss_eps_high.detach()), 0)
+        loss_tracker.log(
+            losses=per_sample_loss,
+            timesteps=unet_timesteps,
+            iteration=i
+        )
         total_loss = loss_high+loss_low
         total_loss.backward()
 
@@ -876,6 +888,17 @@ def train(
         del (
             target_latents_low,
             target_latents_high,
+            per_sample_loss, 
+            total_loss,
+            mean_loss_low, std_loss_low,
+            mean_loss_high, std_loss_high,
+            loss_eps_high, loss_eps_low,
+            loss_x0_low, loss_x0_low_karrasnormed,
+            loss_x0_high, loss_x0_high_karrasnormed, 
+            pred_x0_high, pred_x0_low,
+            high_noise, low_noise, 
+            noisy_latents_high, noisy_latents_low,
+            x0_latents_high, x0_latents_low,
         )
         #flush()
 
@@ -896,6 +919,29 @@ def train(
                 print(f"({w}, {h}){'':<6} | {aspect_ratio:.2f}:1{'':<3} | {count:<7} | {percentage:.2f}%")
             print("-" * 50)
         # -----------------------------------------------------------------
+                    # Periodic analysis
+        if i == 100:
+            # Fit difficulty curve from early training
+            loss_tracker.fit_difficulty_curve(iterations_range=(0, 100))
+            print("\n=== Difficulty Curve Fitted ===")
+            for bucket_data in loss_tracker.difficulty_curve:
+                print(f"Bucket {bucket_data['bucket']}: "
+                    f"difficulty={bucket_data['difficulty']:.4f}, "
+                    f"std={bucket_data['std']:.4f}")
+        
+        if i % 500 == 0 and i > 100:
+            # Analyze progress
+            progress = loss_tracker.compute_difficulty_adjusted_progress(i)
+            print(f"\n=== Progress Report (Iteration {i}) ===")
+            for p in progress:
+                print(f"Bucket {p['bucket']}: "
+                    f"{p['relative_improvement']*100:.1f}% improvement "
+                    f"({p['baseline_loss']:.4f} → {p['current_loss']:.4f})")
+            
+            # Generate plots
+            loss_tracker.plot_stratified_learning_curves(
+                save_path=save_path / f"{config.save.name}_loss_analysis_iter{i}.png"
+            )
         if (
             i % config.save.per_steps == 0
             and i != 0
