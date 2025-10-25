@@ -37,6 +37,7 @@ class TrainConfig(BaseModel):
     optimizer_args: str = ""
     lr_scheduler: str = "constant"
 
+    train_resolution: int = 512
     max_denoising_steps: int = 50
     grad_accum: int = 16
     grad_clip: float = 0.1

@@ -392,7 +392,39 @@ train:
   lambda_std_loss: 0
 #warmup
 #aspect ratio error!!!
-uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc4d4_glucli_pre_f1.1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 0.75, 1.25
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc4d4_glucli_pre_f2.1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 0.75, 1.25
   lr: 1.0
 #aspect ratio error!!!
-uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc4d4_glucli_f1.1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 0.75, 1.25
+# we really machine learned a whole lot about preprocessing from that one
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc4d4_glucli_f2.1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 0.75, 1.25
+train:
+  precision: "bfloat16"
+  noise_scheduler: "ddim" # or "ddpm", "lms", "euler_a", "ddim"
+  iterations: 800
+  batch_size: 2
+  n_tuple: 2
+  lr: 0.1  # different semantic meaning in gluon
+  optimizer: "gluondist"
+  lr_scheduler: "cosine"  #or "constant" or "cosine"
+  max_denoising_steps: 50
+  grad_accum: 4
+  grad_clip: 1.0
+  lambda_x0_loss: 0
+  lambda_std_loss: 0
+# drop 'masterpiece', reduce step size marginally
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc4d4_glucli_f2.2' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C4, D4' --scales 0.75, 1.25
+# works!
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc3d3_glucli_f2.2' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.75, 1.25
+# second pass over the same dataset with a SECOND ADAPTER WOOOOO!
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc3d3_glucli_f2.2.1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc-re.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.75, 1.25 --base_adapters models\ilxlgl_immdc3d3_glucli_f2.2_alpha16.0_rank32_noxattn\ilxlgl_immdc3d3_glucli_f2.2_alpha16.0_rank32_noxattn_last.safetensors:0.75
+#skiptrain
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc3d3_glucli_f2.2.2' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.75, 1.25
+# invert skip ratio to 'mostly pre-scaled then cropped'
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'ilxlgl_immdc3d3_glucli_f2.2.3' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.75, 1.25
+# molk
+  lr: 0.01  # different semantic meaning in gluon
+uv run trainscripts/imagesliders/train_lora-scale-xl.py --name 'molkgl_immdc3d3_pre_glucli_f2.2.3' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.75, 1.25
+# train vae lol
+# too much rank, oom.
+uv run trainscripts/imagesliders/train_scaledataset_vae_lora-xl.py --name 'molkgl_immdc3d3_pre_vae_a1.1' --rank 32 --alpha 16 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.75, 1.25 --unet_base_adapters models\molkgl_immdc3d3_pre_glucli_f2.2.3_alpha16.0_rank32_noxattn\molkgl_immdc3d3_pre_glucli_f2.2.3_alpha16.0_rank32_noxattn_last.safetensors:0.75
+uv run trainscripts/imagesliders/train_scaledataset_vae_lora-xl.py --name 'molkgl_immdc3d3_pre_vae_a1.1' --rank 4 --alpha 4 --config_file 'trainscripts/imagesliders/data/config-xl-dilora-immd-gluonc.yaml' --folder_main 'datasets/immd' --folders 'C3, D3' --scales 0.75, 1.25 --unet_base_adapters models\molkgl_immdc3d3_pre_glucli_f2.2.3_alpha16.0_rank32_noxattn\molkgl_immdc3d3_pre_glucli_f2.2.3_alpha16.0_rank32_noxattn_last.safetensors:0.75
