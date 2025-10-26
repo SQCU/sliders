@@ -61,28 +61,25 @@ class ModuleNode:
     def __repr__(self):
         return f"ModuleNode(key='{self.raw_key}', signature={self.signature}, shape={self.shape})"
 
+
 def intelligent_parse(key: str, known_tokens: List[str]) -> List[str]:
     """
-    A greedy, separator-aware tokenizer. It splits a key into components
-    without destroying names that contain underscores (like 'norm_out').
-    
-    1. It prioritizes matching longer, known multi-word tokens (e.g., 'up_blocks').
-    2. It treats '.' and '_' as potential separators.
+    A robust tokenizer that correctly identifies multi-word tokens and tokens
+    containing underscores (like 'attn_1' and 'norm_out').
     """
     components = []
     remaining_key = key
-
-    # Known tokens should be sorted by length, descending, for greedy matching
     sorted_tokens = sorted(known_tokens, key=len, reverse=True)
 
     while remaining_key:
         found_match = False
 
-        # Rule 1: Try to match a known multi-word token first
+        # Rule 1: Greedily match the longest known multi-word token first.
         for token in sorted_tokens:
             if remaining_key.startswith(token):
                 components.append(token)
                 remaining_key = remaining_key[len(token):]
+                # Consume the separator after the token
                 if remaining_key and (remaining_key.startswith('_') or remaining_key.startswith('.')):
                     remaining_key = remaining_key[1:]
                 found_match = True
@@ -91,22 +88,19 @@ def intelligent_parse(key: str, known_tokens: List[str]) -> List[str]:
         if found_match:
             continue
 
-        # Rule 2: If no known token, find the next segment up to a separator
-        # --- THIS IS THE CORRECTED REGEX ---
+        # Rule 2: If no known token, match the next segment of characters
+        # that are NOT separators. This correctly captures 'attn_1', 'conv1', etc.
         match = re.match(r"([^._]+)", remaining_key)
         if match:
             segment = match.group(1)
             components.append(segment)
             remaining_key = remaining_key[len(segment):]
+            # Consume the separator after the segment
             if remaining_key and (remaining_key.startswith('_') or remaining_key.startswith('.')):
                 remaining_key = remaining_key[1:]
         else:
-            # This can happen if a key starts with a separator, just consume it
-            if remaining_key and (remaining_key.startswith('_') or remaining_key.startswith('.')):
-                 remaining_key = remaining_key[1:]
-            else:
-                 # End of string or malformed key
-                 break
+            # End of string or malformed key (e.g., trailing separator)
+            break
             
     return components
 
@@ -114,33 +108,67 @@ def intelligent_parse(key: str, known_tokens: List[str]) -> List[str]:
 # == Graph Building Functions
 # =================================================================================
 
-def ordinal_transform_graph(input_graph: Dict[str, ModuleNode], transform_map: Dict[str, Dict]) -> Dict[str, ModuleNode]:
+
+def apply_structural_simplification(signature: Tuple, simplification_map: Dict[Tuple, Tuple]) -> Tuple:
     """
-    Applies ordinal transformations to a graph, returning a new, transformed graph.
-    This handles architectural inversions (e.g., CompVis vs. Diffusers decoders).
+    Applies find-and-replace rules to a signature tuple to remove vestigial components.
     """
-    print("Applying ordinal graph transformation...")
+    new_signature_list = []
+    i = 0
+    sig_len = len(signature)
+    while i < sig_len:
+        found_match = False
+        # Greedily check for the longest possible match starting at i
+        for k in range(min(sig_len - i, 5), 0, -1): # Check for sequences up to length 5
+            sub_sequence = signature[i:i+k]
+            if sub_sequence in simplification_map:
+                replacement = simplification_map[sub_sequence]
+                new_signature_list.extend(replacement)
+                i += k
+                found_match = True
+                break
+        if not found_match:
+            new_signature_list.append(signature[i])
+            i += 1
+    return tuple(new_signature_list)
+
+def transform_graph(
+    input_graph: Dict[str, ModuleNode],
+    ordinal_map: Dict[Tuple, Dict]
+) -> Dict[str, ModuleNode]:
+    """
+    Applies ordinal transformations to a graph using context-aware rules.
+    This version uses a simple, robust loop that is guaranteed to work.
+    """
+    print("Applying architectural graph transformations...")
     transformed_graph = {}
     for original_key, node in input_graph.items():
+        # Start with the original signature
         transformed_signature_list = list(node.signature)
-        
-        for i, (comp_type, comp_value) in enumerate(transformed_signature_list):
-            if comp_type == 'name' and comp_value in transform_map:
-                transform_info = transform_map[comp_value]
-                # Find the next component, which should be the ordinal to transform
-                if (i + 1) < len(transformed_signature_list) and transformed_signature_list[i + 1][0] == 'ordinal':
-                    ordinal_to_transform = transformed_signature_list[i + 1][1]
-                    new_ordinal = transform_info["transform_fn"](ordinal_to_transform)
-                    transformed_signature_list[i + 1] = ('ordinal', new_ordinal)
 
-        # Create a new node with the transformed signature
-        new_node = copy.copy(node) # Shallow copy is sufficient
+        # Iterate through the transformation rules directly
+        for context_key, transform_info in ordinal_map.items():
+            context_len = len(context_key)
+            # Search for the rule's context in the signature
+            for i in range(len(transformed_signature_list) - context_len):
+                sub_sequence = tuple(transformed_signature_list[i : i + context_len])
+                if sub_sequence == context_key:
+                    # If context is found, check if the next component is an ordinal
+                    ordinal_idx = i + context_len
+                    if ordinal_idx < len(transformed_signature_list) and transformed_signature_list[ordinal_idx][0] == 'ordinal':
+                        old_ordinal = transformed_signature_list[ordinal_idx][1]
+                        new_ordinal = transform_info["transform_fn"](old_ordinal)
+                        transformed_signature_list[ordinal_idx] = ('ordinal', new_ordinal)
+                        # Rule applied, no need to search further for this context
+                        break 
+        
+        new_node = copy.copy(node)
         new_node.signature = tuple(transformed_signature_list)
         transformed_graph[original_key] = new_node
 
     return transformed_graph
 
-def build_base_graph(base_vae_state_dict: Dict[str, torch.Tensor]) -> Dict[str, ModuleNode]:
+def build_base_graph(base_vae_state_dict: Dict[str, torch.Tensor], known_tokens: List[str]) -> Dict[str, ModuleNode]:
     """
     Builds an abstract graph for a standard model state_dict (like a VAE).
     Base model keys are considered canonical, so no name mapping is needed.
@@ -161,7 +189,7 @@ def build_base_graph(base_vae_state_dict: Dict[str, torch.Tensor]) -> Dict[str, 
 
         if shape != (0, 0):
             # Base model keys are already clean, so pass an empty map and token list.
-            base_graph[module_key] = ModuleNode(module_key, {}, [], shape)
+            base_graph[module_key] = ModuleNode(module_key, {}, known_tokens, shape)
     
     print(f"✅ Successfully built base graph with {len(base_graph)} nodes.")
     return base_graph
@@ -208,29 +236,71 @@ def remap_graphs(adapter_graph: Dict[str, ModuleNode], base_graph: Dict[str, Mod
     """
     Maps nodes from the adapter graph to the base graph by finding an
     isomorphism between their normalized signatures.
+
+    Crucially, it now reports on unmapped nodes from BOTH graphs to provide a
+    complete diagnostic of any mismatches.
     """
     print("🧠 Performing semantic graph-based remapping...")
     
+    # --- Setup ---
+    final_mapping = {}
+    adapter_error_reports = []
+    
+    # Use sets for efficient tracking of which keys remain unmapped.
+    unmapped_adapter_keys = set(adapter_graph.keys())
+    unmapped_base_keys = set(base_graph.keys())
+
+    # Group base model nodes by their signature for efficient lookup.
     base_groups = defaultdict(list)
     for key, node in base_graph.items():
         base_groups[node.signature].append(key)
 
-    final_mapping = {}
-    unmapped_nodes = []
-    for adapter_key, adapter_node in adapter_graph.items():
+    # --- Mapping Loop ---
+    # Iterate through a copy of the keys to allow safe removal from the set
+    for adapter_key in list(unmapped_adapter_keys):
+        adapter_node = adapter_graph[adapter_key]
+        
         if adapter_node.signature in base_groups:
             possible_matches = base_groups[adapter_node.signature]
-            if len(possible_matches) == 1:
-                final_mapping[adapter_key] = possible_matches[0]
-            else:
-                unmapped_nodes.append(f"Ambiguous match for {adapter_key}: maps to {len(possible_matches)} base modules.")
-        else:
-            unmapped_nodes.append(f"No match for {adapter_key} (Signature: {adapter_node.signature})")
+            
+            # Find a match that hasn't already been claimed
+            unclaimed_matches = [match for match in possible_matches if match in unmapped_base_keys]
 
-    if unmapped_nodes:
-        print(f"\n⚠️  Could not map {len(unmapped_nodes)} adapter modules:")
-        for info in unmapped_nodes[:10]:
-            print(f"  - {info}")
+            if len(unclaimed_matches) == 1:
+                base_key = unclaimed_matches[0]
+                final_mapping[adapter_key] = base_key
+                
+                # Mark both keys as mapped
+                unmapped_adapter_keys.remove(adapter_key)
+                unmapped_base_keys.remove(base_key)
+
+            elif len(unclaimed_matches) > 1:
+                adapter_error_reports.append(f"Ambiguous match for '{adapter_key}': Signature {adapter_node.signature} matches {len(unclaimed_matches)} unclaimed base modules.")
+            else:
+                # This case happens if all possible matches were already claimed by other adapters
+                adapter_error_reports.append(f"No available match for '{adapter_key}': All base modules with signature {adapter_node.signature} were already mapped.")
+        else:
+            adapter_error_reports.append(f"No match for '{adapter_key}' (Signature: {adapter_node.signature})")
+
+    # --- Comprehensive Reporting ---
+    if unmapped_adapter_keys or unmapped_base_keys:
+        print("\n" + "="*40)
+        print("--- MAPPING DIAGNOSTIC REPORT ---")
+        
+        if adapter_error_reports:
+            print(f"\n⚠️  Could not map {len(adapter_error_reports)} adapter modules:")
+            for info in adapter_error_reports[:15]: # Print up to 15 detailed errors
+                print(f"  - {info}")
+        
+        # This is the crucial new block you requested.
+        if unmapped_base_keys:
+            print(f"\n⚠️  Found {len(unmapped_base_keys)} unclaimed base model modules:")
+            for base_key in sorted(list(unmapped_base_keys))[:15]: # Print up to 15 unclaimed keys
+                node = base_graph[base_key]
+                print(f"  - Unclaimed: '{base_key}' (Signature: {node.signature})")
+        
+        print("="*40 + "\n")
+
     
     print(f"✅ Successfully generated a definitive map for {len(final_mapping)} modules.")
     return final_mapping
@@ -330,38 +400,36 @@ def fuse_vae_lora(
     # Maps naming conventions from the training framework (keys) to the
     # standard diffusers VAE naming (values).
     SEMANTIC_NAME_MAP = {
-        # General
-        "mid_block": "mid",
-        # Blocks
+        "attentions_0": "attn_1",
+        "upsamplers_0": "upsample", # Corrected name and absorbs index
         "up_blocks": "up",
-        "down_blocks": "down",
+        "mid_block": "mid",
         "resnets": "block",
-        # Attention
-        "attentions": "attn_1", # Assuming a single attention block per level
-        "to_q": "q",
-        "to_k": "k",
-        "to_v": "v",
-        "to_out_0": "proj_out",
-        # Other
-        "upsamplers": "upsampler",
-        "conv_shortcut": "nin_shortcut"
+        "to_q": "q", "to_k": "k", "to_v": "v", "to_out_0": "proj_out",
+        "conv_shortcut": "nin_shortcut",
     }
     # This is crucial for the parser to prioritize longer matches
-    KNOWN_ADAPTER_TOKENS = list(SEMANTIC_NAME_MAP.keys())
+    KNOWN_ADAPTER_TOKENS = list(SEMANTIC_NAME_MAP.keys()) + ["conv_in", "conv_out"]
  
+    # NEW: A list of base-model tokens that contain separators but are indivisible.
+    # This is the key to fixing the parser bug.
+    KNOWN_BASE_TOKENS = ["attn_1", "proj_out", "nin_shortcut", "conv_in", "conv_out"]
+
     # This map defines the "unnatural, bestial" architectural transformations.
     PREDEFINED_ORDINAL_TRANSFORMS = {
         "compvis2hface": {
-            # In CompVis, `up` block 0 is near the bottleneck (high channels).
-            # In Diffusers/HF, `up` block 0 is near the output (low channels).
-            # This lambda reverses the 4-block index (0->3, 1->2, etc.)
-            "up": {"transform_fn": lambda x: 3 - x}
+            "ordinal_map": {
+                # Rule for up-blocks (context is just 'up')
+                (('name', 'up'),): {"transform_fn": lambda x: 3 - x},
+                # Rule for mid-blocks (context is 'mid' followed by 'block')
+                (('name', 'mid'), ('name', 'block')): {"transform_fn": lambda x: 2 - x},
+            }
         }
-        # New transformations can be added here, e.g., "hface2diffusers_v2"
     }
+    
     # --- 1. Load Models & Build Graphs ---
     base_vae_state_dict = extract_vae_state_dict(base_model_path, device=device)
-    base_graph = build_base_graph(base_vae_state_dict)
+    base_graph = build_base_graph(base_vae_state_dict, KNOWN_BASE_TOKENS)
 
     if pickletensor:
         adapter_state_dict = torch.load(vae_adapter_path, map_location=device)
@@ -371,15 +439,16 @@ def fuse_vae_lora(
     adapter_graph, adapter_shapes = build_adapter_graph(adapter_state_dict, SEMANTIC_NAME_MAP, KNOWN_ADAPTER_TOKENS)
 
     # --- 2. Apply Architectural Transformation (if requested) ---
-    if ordinal_transform:
-        if ordinal_transform in PREDEFINED_ORDINAL_TRANSFORMS:
-            print(f"Applying architectural transformation: '{ordinal_transform}' to adapter graph.")
-            transform_map = PREDEFINED_ORDINAL_TRANSFORMS[ordinal_transform]
-            adapter_graph = ordinal_transform_graph(adapter_graph, transform_map)
-        else:
-            print(f"⚠️ WARNING: Unknown ordinal transform '{ordinal_transform}'. Proceeding without transformation.")
+    # --- 2. Apply Architectural Transformation (if requested) ---
+    if ordinal_transform and ordinal_transform in PREDEFINED_ORDINAL_TRANSFORMS:
+        print(f"Applying architectural transformation set: '{ordinal_transform}' to adapter graph.")
+        transform_set = PREDEFINED_ORDINAL_TRANSFORMS[ordinal_transform]
+        adapter_graph = transform_graph(
+            adapter_graph,
+            transform_set.get("ordinal_map", {})
+        )
 
-    # --- 2. Generate the Definitive Mapping ---
+    # --- 3. Generate the Definitive Mapping ---
     final_adapter_to_base_map = remap_graphs(adapter_graph, base_graph)
 
     if debug_keys:
