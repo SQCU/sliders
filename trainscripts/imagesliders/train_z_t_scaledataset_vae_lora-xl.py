@@ -131,16 +131,8 @@ def train_denoiser_guided_vae(
 
     # --- 2. Freeze Models & Set Modes ---
     unet.to(device, dtype=weight_dtype).eval().requires_grad_(False)
-    #skip_compiling_module_type(vae.encoder, torch.nn.Conv2d)
-    #skip_compiling_module_type(vae.decoder, torch.nn.Conv2d)
-    #skip_compiling_module_type(unet, torch.nn.Conv2d)
-    #unet = torch.compile(unet, mode="reduce-overhead")
-    # --- CRITICAL FIX: Cast the ENTIRE VAE to the correct dtype ---
     vae.eval().requires_grad_(False).to(device, dtype=weight_dtype)
-    #vae.decoder = torch.compile(vae.decoder, mode="reduce-overhead")
-    #vae.encoder = torch.compile(vae.encoder, mode="reduce-overhead")
-    # --- END FIX ---
-    # The encoder will be used in no_grad mode, so we can set its state here
+
     for te in text_encoders:
         te.to(device, dtype=weight_dtype).eval().requires_grad_(False)
     print("Models loaded and frozen.")
@@ -160,21 +152,6 @@ def train_denoiser_guided_vae(
     network = AltLoRANetwork(vae.decoder, resolved_config={"lora_map": vae_decoder_config})
     network.to(device, dtype=weight_dtype).train()
 
-    """
-    # Debug: print actual shapes
-    for name, module in network.unet_loras.items():
-        if hasattr(module, 'glora_a1'):
-            print(f"{name}:")
-            print(f"  a1: {module.glora_a1.weight.shape}")
-            print(f"  a2: {module.glora_a2.weight.shape}")
-            print(f"  b1: {module.glora_b1.weight.shape}")
-            print(f"  b2: {module.glora_b2.weight.shape}")
-            print(f"  org_module: {type(module.org_module)}")
-            if isinstance(module.org_module, torch.nn.Conv2d):
-                print(f"    in_channels: {module.org_module.in_channels}")
-                print(f"    out_channels: {module.org_module.out_channels}")
-    """
-
     apply_gradient_checkpointing_to_vae_decoder(vae.decoder)
 
     # --- 4. Setup Optimizer ---
@@ -189,41 +166,9 @@ def train_denoiser_guided_vae(
     cache = PromptEmbedsCache()
     prompt_pairs: list[PromptEmbedsPair] = []
     
-    with torch.no_grad():
-        for settings in prompts:
-            print(settings)
-            for prompt in [
-                settings.target,
-                settings.positive,
-                settings.neutral,
-                settings.unconditional,
-            ]:
-                if cache[prompt] == None:
-                    tex_embs, pool_embs = train_util.encode_prompts_xl(
-                            tokenizers,
-                            text_encoders,
-                            [prompt],
-                            num_images_per_prompt=NUM_IMAGES_PER_PROMPT,
-                        )
-                    cache[prompt] = PromptEmbedsXL(
-                        tex_embs,
-                        pool_embs
-                    )
-
-            prompt_pairs.append(
-                PromptEmbedsPair(
-                    criteria,
-                    cache[settings.target],
-                    cache[settings.positive],
-                    cache[settings.unconditional],
-                    cache[settings.neutral],
-                    settings,
-                )
-            )
-
     for tokenizer, text_encoder in zip(tokenizers, text_encoders):
         del tokenizer, text_encoder
-
+    del unet # we aren't using it this time
     flush()
 
     if hasattr(config.train, "grad_accum"):
@@ -279,7 +224,7 @@ def train_denoiser_guided_vae(
             flat_images = [img for tpl in batch_packet["images"] for img in tpl]
             image_processor = train_util.VaeImageProcessor(vae_scale_factor=8)
             image_tensor_target = image_processor.preprocess(flat_images).to(device=device, dtype=weight_dtype)
-            prompt_pair: PromptEmbedsPair = random.choice(prompt_pairs)
+            #prompt_pair: PromptEmbedsPair = random.choice(prompt_pairs)
             # A. Get noisy latents (zt) and clean latents (x0) using the robust utility
             t_indices = batch_packet["timesteps_to"][:, 0].to(dtype=torch.int32) # Shape: (B,)
             latent_packet = train_util.prepare_correlated_noisy_latents(
@@ -299,40 +244,41 @@ def train_denoiser_guided_vae(
             flat_t_values = t_values.unsqueeze(1).expand(-1, n_dim).reshape(-1)
             # --- END ---
 
-            time_ids = train_util.batch_add_time_ids(batch_packet["original_sizes"], batch_packet["crop_coords"], batch_packet["target_sizes"], dtype=weight_dtype, device=device)
-            text_embeds, pooled_embeds = train_util.broadcast_prompts_to_n_tuple(prompt_pair.positive.text_embeds, prompt_pair.positive.pooled_embeds, prompt_pair.neutral.text_embeds, prompt_pair.neutral.pooled_embeds, batch_packet["scales"])
+            #time_ids = train_util.batch_add_time_ids(batch_packet["original_sizes"], batch_packet["crop_coords"], batch_packet["target_sizes"], dtype=weight_dtype, device=device)
+            #text_embeds, pooled_embeds = train_util.broadcast_prompts_to_n_tuple(prompt_pair.positive.text_embeds, prompt_pair.positive.pooled_embeds, prompt_pair.neutral.text_embeds, prompt_pair.neutral.pooled_embeds, batch_packet["scales"])
             
-            unet_args, unet_kwargs = train_util.sdxl_condnet_batchjoin(noisy_latents, text_embeds, pooled_embeds, time_ids, noise_scheduler, flat_t_values)
-            predicted_noise = unet(*unet_args, **unet_kwargs).sample
+            #unet_args, unet_kwargs = train_util.sdxl_condnet_batchjoin(noisy_latents, text_embeds, pooled_embeds, time_ids, noise_scheduler, flat_t_values)
+            #predicted_noise = unet(*unet_args, **unet_kwargs).sample
 
             # C. Calculate the STABLE target for the decoder: z_{t-1}
             # We pass the VALUE of the timestep to the step function.
             # --- CRITICAL REVISION: Loop over unique timesteps ---
-            latents_prev_step = torch.zeros_like(noisy_latents)
-            unique_timesteps = torch.unique(flat_t_values).to(dtype=torch.int32)
+            #latents_prev_step = torch.zeros_like(noisy_latents)
+            #unique_timesteps = torch.unique(flat_t_values).to(dtype=torch.int32)
 
-            for t in unique_timesteps:
-                mask = (flat_t_values == t)
-                
-                noise_slice = predicted_noise[mask]
-                latents_slice = noisy_latents[mask]
-                
-                # Call step with a scalar timestep for the slice
-                prev_sample_slice = noise_scheduler.step(noise_slice, t.item(), latents_slice).prev_sample
-                
-                # Place the results back into the full tensor
-                latents_prev_step[mask] = prev_sample_slice
+            #for t in unique_timesteps:
+            #    mask = (flat_t_values == t)
+            #    
+            #    noise_slice = predicted_noise[mask]
+            #    latents_slice = noisy_latents[mask]
+            #    
+            #    # Call step with a scalar timestep for the slice
+            #    prev_sample_slice = noise_scheduler.step(noise_slice, t.item(), latents_slice).prev_sample
+            #    
+            #    # Place the results back into the full tensor
+            #    latents_prev_step[mask] = prev_sample_slice
             # --- END REVISION ---
             
             # D. Calculate SNR-based loss weight based on the ORIGINAL timestep t's index
             flat_t_indices = t_indices.unsqueeze(1).expand(-1, n_dim).reshape(-1)
             sigmas = noise_scheduler.sigmas.to(device)[flat_t_indices]
             loss_weights = (1.0 / (sigmas**2 + 1.0)).view(-1, 1, 1, 1)
-            alpha_t = (1.0 / (sigmas**2 + 1.0)**0.5).view(-1, 1, 1, 1).to(dtype=predicted_noise.dtype)
+            #oops
+            alpha_t = ((1.0 - sigmas**2)**0.5).view(-1, 1, 1, 1).to(dtype=weight_dtype)
 
-        LAMBDA_WEIGHT = 0.75 # A configurable hyperparameter
-        # E. Forward pass: Decode the stable, one-step-denoised latent z_{t-1}
-        reconstructed_pixels = vae.decoder(latents_prev_step / vae.config.scaling_factor)
+        LAMBDA_WEIGHT = 0.85 # A configurable hyperparameter
+        # E. Forward pass: Decode the forwards-noising process latent z_{t}
+        reconstructed_pixels = vae.decoder(noisy_latents / vae.config.scaling_factor)
         # F. Calculate the weighted loss against the ORIGINAL clean image
         # reduce expected magnitude of output image by magical denoising equation 
         # z_t = (signal_scale * z_0) + (noise_scale * ε)
@@ -366,7 +312,7 @@ def train_denoiser_guided_vae(
         pixel_loss_passthru.backward()
         del pixel_loss_passthru, reconstructed_pixels_passthru, image_tensor_target
         #has to be split for memory reasons
-        del latent_packet, latents_prev_step, noisy_latents, loss_weights, sigmas, flat_t_indices
+        del latent_packet, noisy_latents, loss_weights, sigmas, flat_t_indices
         if (i + 1) % ACCUMULATION_STEPS == 0:
             # The profiler's step method is called here, seeing the accumulated grad
             GRAD_CLIP_MAX_NORM = getattr(config.train, 'grad_clip', 0.1)

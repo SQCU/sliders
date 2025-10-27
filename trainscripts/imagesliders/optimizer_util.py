@@ -9,51 +9,72 @@ from gluon_experiment import GlazyGloptimizer
 def setup_vae_optimizer(
     lora_vae_network: nn.Module,
     lr: float = 1e-4,
+    alpha_lr: float = 1e-1, # For trainable alphas
     **adamw_kwargs,
 ) -> Optimizer:
     """
-    Sets up a hybrid optimizer for a LoRA-adapted VAE, now with CORRECTED logic.
+    Sets up a hybrid optimizer for a LoRA-adapted VAE with CORRECT, per-module
+    granularity for GlazyGloptimizer.
+
+    This function iterates through each LoRA module in the network and creates
+    a dedicated parameter group for it, correctly naming the group. It also
+    separates trainable alpha parameters into their own group.
     
-    It creates two parameter groups:
-    1. 'vae_2d_params_gluon': For all weights of nn.Linear layers (2D tensors) 
-       in the LoRA network. GlazyGloptimizer will target this group with Gluon.
-    2. 'vae_other_params_adamw': For all other parameters (Conv2d, biases, etc.).
-       GlazyGloptimizer will use its AdamW fallback for this group.
-
-    Args:
-        lora_vae_network: The LoRA network wrapping the VAE decoder.
-        lr: The base learning rate.
-        **adamw_kwargs: Additional arguments for the AdamW fallback.
-
-    Returns:
-        An instance of GlazyGloptimizer configured with the specified groups.
+    The GlazyGloptimizer will then automatically determine whether to apply Gluon
+    (for 2D nn.Linear layers) or AdamW (for others) to each individual group.
     """
-    params_2d_gluon = []
-    params_other_adamw = []
-
-    # Iterate through the LoRA modules to find the original wrapped modules
-    for lora_module in lora_vae_network.unet_loras.values():
-        original_module = lora_module.org_module
-        
-        # --- REVISED LOGIC ---
-        if isinstance(original_module, nn.Linear):
-            # This is a 2D matrix, the target for Gluon.
-            params_2d_gluon.extend([p for p in lora_module.parameters() if p.requires_grad])
-        else:
-            # This is a Conv2d (4D), bias (1D), or something else. Use AdamW.
-            params_other_adamw.extend([p for p in lora_module.parameters() if p.requires_grad])
-
-    optimizer_param_groups = [
-        {'params': params_2d_gluon, 'name': 'vae_2d_params_gluon', 'lr': lr},
-        {'params': params_other_adamw, 'name': 'vae_other_params_adamw', 'lr': lr},
-    ]
+    optimizer_param_groups = []
+    all_alpha_params = []
     
-    print(f"✅ Created VAE optimizer groups:")
-    print(f"   - 'vae_2d_params_gluon': {len(params_2d_gluon)} tensors (Targeted by Gluon)")
-    print(f"   - 'vae_other_params_adamw': {len(params_other_adamw)} tensors (Fallback to AdamW)")
+    gluon_group_count = 0
+    adamw_group_count = 0
 
-    # The GlazyGloptimizer is smart enough to see the .dim()==2 and apply Gluon,
-    # and will use the fallback for the other group.
+    # The keys of lora_vae_network.unet_loras are the clean module names (e.g., 'lora_vae_decoder_...')
+    for lora_name, lora_module in lora_vae_network.unet_loras.items():
+        # 1. Collect the main parameters for this specific module.
+        module_params = [
+            p for name, p in lora_module.named_parameters() 
+            if 'alpha' not in name and p.requires_grad
+        ]
+        
+        # 2. Collect this module's alpha parameters separately.
+        alpha_params = [
+            p for name, p in lora_module.named_parameters() 
+            if 'alpha' in name and p.requires_grad
+        ]
+        all_alpha_params.extend(alpha_params)
+
+        # 3. If this module has trainable main parameters, create a dedicated group.
+        if module_params:
+            optimizer_param_groups.append({
+                "params": module_params,
+                "name": lora_name,  # CRITICAL: Use the unique per-module name
+                "lr": lr
+            })
+            
+            # Keep track for logging
+            if isinstance(lora_module.org_module, nn.Linear):
+                gluon_group_count += 1
+            else:
+                adamw_group_count += 1
+
+    # 4. After iterating, create one final group for all alpha parameters.
+    if all_alpha_params:
+        optimizer_param_groups.append({
+            "params": all_alpha_params,
+            "name": "lora_alphas",
+            "lr": alpha_lr
+        })
+        adamw_group_count += 1 # Alphas are 1D, so they will use AdamW
+
+    if not optimizer_param_groups:
+        raise ValueError("No trainable parameters were found in the VAE LoRA network.")
+
+    print(f"✅ Created {len(optimizer_param_groups)} granular VAE optimizer groups:")
+    print(f"   - {gluon_group_count} groups targeted by Gluon (2D Linear layers)")
+    print(f"   - {adamw_group_count} groups falling back to AdamW (Conv2d, Alphas, etc.)")
+
+    # Now, GlazyGloptimizer can profile each group individually.
     optimizer = GlazyGloptimizer(optimizer_param_groups, **adamw_kwargs)
     
     return optimizer

@@ -501,7 +501,7 @@ def sdxl_condnet_batchjoin(
     
     # --- 1. Prepare Positional Args for `unet.forward()` ---
     scaled_latents = scheduler.scale_model_input(noisy_latents, timestep)
-    timestep = timestep.to(target_device, dtype=torch.long)
+    timestep = timestep.to(target_device, dtype=torch.int32)
     unet_args = [scaled_latents, timestep]
     
     # --- 2. Prepare Keyword Args for `unet.forward()` ---
@@ -812,7 +812,7 @@ def broadcast_prompts_to_n_tuple(
     
     # Apply Rule 3: All scales >= mean are 'high' (1), others are 'low' (0)
     # This creates a boolean mask of shape (BATCH_SIZE, N_tuple)
-    labels = (scales >= cardinal_edge_mean).long() # Convert boolean to long (0s and 1s)
+    labels = (scales >= cardinal_edge_mean).to(dtype=torch.int32) # Convert boolean to long (0s and 1s)
 
     # Apply Rules 1 & 2: Explicitly set the lowest to 'low' and highest to 'high'
     # This ensures the absolute edges always get the correct label.

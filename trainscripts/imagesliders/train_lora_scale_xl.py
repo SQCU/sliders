@@ -774,7 +774,7 @@ def train(
             )
 
             #    Shape: (B,) -> (B,)
-            kilostep_indices = (timesteps_to_indices * (1000 / config.train.max_denoising_steps)).long()
+            kilostep_indices = (timesteps_to_indices * (1000 / config.train.max_denoising_steps)).to(dtype=torch.int32)
             #    Set the scheduler to the 1000-step 'pseudocontinuous' values.
             noise_scheduler.set_timesteps(1000)
             #    Shape: (B,)
